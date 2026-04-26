@@ -4,6 +4,7 @@ import {
   recomputeHourlyAgg, getSensors, getHistory, getHistoryAll,
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
+  getSensorPrimaryGateway,
 } from '../db.js';
 
 function makeDb() {
@@ -551,6 +552,89 @@ describe('gateways', () => {
     const rows = db.prepare(`SELECT polled_at FROM gateway_status`).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].polled_at).toBe(NOW - 100);
+  });
+});
+
+describe('per-sample gateway + dewpoint/vpd capture', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+
+  it('insertReadings stores gateway_id, dewpoint, vpd from sample', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    insertReadings(db, 's1', [{
+      observed: new Date((NOW - 60) * 1000).toISOString(),
+      temperature: 70, humidity: 50, barometric_pressure: 1013, battery_voltage: 2.9,
+      gateways: 'gw1;gw2', dewpoint: 50.1, vpd: 1.05,
+    }]);
+    const row = db.prepare('SELECT gateway_id, dewpoint, vpd FROM readings WHERE sensor_id=?').get('s1');
+    expect(row.gateway_id).toBe('gw1;gw2');
+    expect(row.dewpoint).toBeCloseTo(50.1);
+    expect(row.vpd).toBeCloseTo(1.05);
+  });
+
+  it('recomputeHourlyAgg includes dewpoint_avg and vpd_avg', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's2', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    const hour = NOW - (NOW % 3600);
+    insertReadings(db, 's2', [
+      { observed: new Date((hour + 60) * 1000).toISOString(),  temperature: 70, humidity: 50, dewpoint: 50, vpd: 1.0 },
+      { observed: new Date((hour + 120) * 1000).toISOString(), temperature: 72, humidity: 52, dewpoint: 52, vpd: 1.1 },
+    ]);
+    recomputeHourlyAgg(db, 's2', hour);
+    const row = db.prepare('SELECT dewpoint_avg, vpd_avg FROM hourly_agg WHERE sensor_id=? AND hour_ts=?').get('s2', hour);
+    expect(row.dewpoint_avg).toBeCloseTo(51);
+    expect(row.vpd_avg).toBeCloseTo(1.05);
+  });
+
+  describe('getSensorPrimaryGateway', () => {
+    it('returns null when no readings have gateway_id', () => {
+      const db = makeDb();
+      upsertSensors(db, [{ id: 's3', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+      insertReadings(db, 's3', [{
+        observed: new Date((NOW - 60) * 1000).toISOString(),
+        temperature: 70, humidity: 50,
+      }]);
+      expect(getSensorPrimaryGateway(db, 's3')).toBeNull();
+    });
+
+    it('returns the most-frequent first segment of gateway_id', () => {
+      const db = makeDb();
+      upsertSensors(db, [{ id: 's4', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+      const samples = [
+        { gw: 'gw_A;gw_B', t: NOW - 600 },
+        { gw: 'gw_A',      t: NOW - 500 },
+        { gw: 'gw_A;gw_B', t: NOW - 400 },
+        { gw: 'gw_B',      t: NOW - 300 },
+      ];
+      insertReadings(db, 's4', samples.map(s => ({
+        observed: new Date(s.t * 1000).toISOString(),
+        temperature: 70, humidity: 50, gateways: s.gw,
+      })));
+      expect(getSensorPrimaryGateway(db, 's4')).toBe('gw_A');
+    });
+
+    it('ignores readings older than the window', () => {
+      const db = makeDb();
+      upsertSensors(db, [{ id: 's5', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+      insertReadings(db, 's5', [
+        { observed: new Date((NOW - 30 * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, gateways: 'gw_old' },
+        { observed: new Date((NOW - 60) * 1000).toISOString(),         temperature: 70, humidity: 50, gateways: 'gw_new' },
+      ]);
+      expect(getSensorPrimaryGateway(db, 's5', 7 * 86400)).toBe('gw_new');
+    });
+  });
+
+  it('gatewayOnlineDuringWindow filters by gateway_id when provided', () => {
+    const db = makeDb();
+    // gwA stale, gwB fresh, both polled inside window
+    recordGatewayStatus(db, [
+      { id: 'gwA', lastSeen: NOW - 1800 },
+      { id: 'gwB', lastSeen: NOW - 60 },
+    ], NOW);
+    expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100, 'gwA')).toBe(false);
+    expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100, 'gwB')).toBe(true);
+    // No filter → any gateway online
+    expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100)).toBe(true);
   });
 });
 

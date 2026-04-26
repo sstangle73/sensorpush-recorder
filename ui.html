@@ -666,10 +666,11 @@ function renderAnalytics() {
       gapDetail = `<div class="an-section"><h2>Gaps — ${name}</h2>
         <div style="color:var(--text2);font-size:12px">No gaps or sparse hours detected.</div></div>`;
     } else {
+      const gwLabel = d.primaryGatewayName ? esc(d.primaryGatewayName) : 'gw';
       const gRows = d.gaps.map(g => {
-        const gw = g.gatewayOnline === true  ? `<span style="color:var(--warn)" title="Gateway was online during this gap — sensor likely lost radio contact">gw online</span>`
-                : g.gatewayOnline === false ? `<span style="color:var(--excl)" title="Gateway was offline — data is genuinely missing upstream">gw offline</span>`
-                :                             `<span style="color:var(--text2)" title="No gateway poll data covers this window">gw ?</span>`;
+        const gw = g.gatewayOnline === true  ? `<span style="color:var(--warn)" title="${gwLabel} was online during this gap — sensor likely lost radio contact (weak RSSI, range, interference)">${gwLabel} online</span>`
+                : g.gatewayOnline === false ? `<span style="color:var(--excl)" title="${gwLabel} was offline during this gap — data is genuinely missing upstream and won't backfill">${gwLabel} offline</span>`
+                :                             `<span style="color:var(--text2)" title="No gateway poll data covers this window — predates tracking">${gwLabel} ?</span>`;
         return `<tr>
           <td>${fmtTs(g.startTs*1000)}</td><td>${fmtTs(g.endTs*1000)}</td>
           <td>${fmtDuration(g.durationSecs)}</td>

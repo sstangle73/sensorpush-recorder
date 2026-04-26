@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 
@@ -192,11 +192,17 @@ export function createApp(db, config = null) {
     const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).json({ ok: false, error: 'Sensor not found' });
     const result = getGaps(db, sensorId, range);
-    // Annotate each gap with whether any gateway was online during the window.
-    // null = no gateway poll history covers this window (e.g. older than tracking).
+    // Annotate each gap with whether the sensor's primary gateway was online
+    // during the window. Falls back to "any gateway" when the sensor has no
+    // gateway attribution yet (readings predate the gateway_id column).
+    const primaryId   = getSensorPrimaryGateway(db, sensorId);
+    const gateways    = getGateways(db);
+    const primaryName = primaryId ? (gateways.find(g => g.id === primaryId)?.name ?? null) : null;
+    result.primaryGatewayId   = primaryId;
+    result.primaryGatewayName = primaryName;
     result.gaps = result.gaps.map(g => ({
       ...g,
-      gatewayOnline: gatewayOnlineDuringWindow(db, g.startTs, g.endTs),
+      gatewayOnline: gatewayOnlineDuringWindow(db, g.startTs, g.endTs, primaryId),
     }));
     res.json({ ok: true, sensorId, range, ...result });
   });

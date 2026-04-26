@@ -83,6 +83,20 @@ export function openDb(path) {
     if (!cols.includes('address'))   db.exec(`ALTER TABLE sensors ADD COLUMN address   TEXT`);
     if (!cols.includes('device_id')) db.exec(`ALTER TABLE sensors ADD COLUMN device_id TEXT`);
   }
+  // Migrate: per-sample gateway attribution + derived metrics (dewpoint, VPD)
+  // exposed by /samples. Stored raw — gateway_id is the API's value, which is
+  // ";"-separated when multiple gateways heard the same sample.
+  {
+    const cols = db.prepare(`PRAGMA table_info(readings)`).all().map(r => r.name);
+    if (!cols.includes('gateway_id')) db.exec(`ALTER TABLE readings ADD COLUMN gateway_id TEXT`);
+    if (!cols.includes('dewpoint'))   db.exec(`ALTER TABLE readings ADD COLUMN dewpoint   REAL`);
+    if (!cols.includes('vpd'))        db.exec(`ALTER TABLE readings ADD COLUMN vpd        REAL`);
+  }
+  {
+    const cols = db.prepare(`PRAGMA table_info(hourly_agg)`).all().map(r => r.name);
+    if (!cols.includes('dewpoint_avg')) db.exec(`ALTER TABLE hourly_agg ADD COLUMN dewpoint_avg REAL`);
+    if (!cols.includes('vpd_avg'))      db.exec(`ALTER TABLE hourly_agg ADD COLUMN vpd_avg      REAL`);
+  }
   return db;
 }
 
@@ -172,23 +186,44 @@ export function getGateways(db) {
   return db.prepare(`SELECT id, name, last_seen, last_alert, version, paired, message, last_synced FROM gateways ORDER BY name`).all();
 }
 
-// For a [startTs, endTs] window, return whether any gateway was "fresh"
-// (polled with last_seen within FRESH_THRESHOLD of polled_at) at any point
-// during that window.
-//   true  → at least one gateway was online during the window
-//   false → polled during the window, all gateways stale
+// For a [startTs, endTs] window, return whether a gateway was "fresh" (polled
+// with last_seen within FRESH_THRESHOLD of polled_at) at any point during the
+// window. If gatewayId is provided, only that gateway counts; otherwise any.
+//   true  → was online during the window
+//   false → polled during the window, stale every time
 //   null  → no poll data within the window (can't tell)
 const FRESH_THRESHOLD = 600; // 10 minutes
-export function gatewayOnlineDuringWindow(db, startTs, endTs) {
-  const rows = db.prepare(`
-    SELECT polled_at, last_seen FROM gateway_status
-    WHERE polled_at >= ? AND polled_at <= ?
-  `).all(startTs, endTs);
+export function gatewayOnlineDuringWindow(db, startTs, endTs, gatewayId = null) {
+  const rows = gatewayId
+    ? db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ? AND gateway_id = ?`).all(startTs, endTs, gatewayId)
+    : db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ?`).all(startTs, endTs);
   if (!rows.length) return null;
   for (const r of rows) {
     if (r.last_seen != null && (r.polled_at - r.last_seen) <= FRESH_THRESHOLD) return true;
   }
   return false;
+}
+
+// The sensor's "primary" gateway — the most-frequent first-segment of the
+// readings.gateway_id field over the last `windowSecs` seconds. Returns
+// null when no gateway-tagged readings exist (e.g. older readings predate
+// the gateway_id column).
+export function getSensorPrimaryGateway(db, sensorId, windowSecs = 7 * 86400) {
+  const since = Math.floor(Date.now() / 1000) - windowSecs;
+  const rows = db.prepare(`
+    SELECT gateway_id FROM readings
+    WHERE sensor_id = ? AND ts >= ? AND gateway_id IS NOT NULL
+  `).all(sensorId, since);
+  if (!rows.length) return null;
+  const counts = new Map();
+  for (const r of rows) {
+    const first = r.gateway_id.split(';')[0];
+    if (!first) continue;
+    counts.set(first, (counts.get(first) ?? 0) + 1);
+  }
+  let best = null, bestN = 0;
+  for (const [id, n] of counts) if (n > bestN) { best = id; bestN = n; }
+  return best;
 }
 
 export function getLatestTs(db, sensorId) {
@@ -199,8 +234,8 @@ export function getLatestTs(db, sensorId) {
 // Returns array of { ts } for each newly inserted row.
 export function insertReadings(db, sensorId, samples) {
   const stmt = db.prepare(`
-    INSERT OR IGNORE INTO readings (sensor_id, ts, temperature, humidity, baro_pressure, battery_voltage)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO readings (sensor_id, ts, temperature, humidity, baro_pressure, battery_voltage, gateway_id, dewpoint, vpd)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const inserted = [];
   db.exec('BEGIN');
@@ -213,6 +248,9 @@ export function insertReadings(db, sensorId, samples) {
         s.humidity            ?? null,
         s.barometric_pressure ?? null,
         s.battery_voltage     ?? null,
+        s.gateways            ?? null,
+        s.dewpoint            ?? null,
+        s.vpd                 ?? null,
       );
       if (result.changes > 0) inserted.push({ ts });
     }
@@ -227,11 +265,13 @@ export function insertReadings(db, sensorId, samples) {
 export function recomputeHourlyAgg(db, sensorId, hourTs) {
   db.prepare(`
     INSERT OR REPLACE INTO hourly_agg
-      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count)
+      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, sample_count)
     SELECT ?, ?,
       AVG(temperature), MIN(temperature), MAX(temperature),
       AVG(humidity),    MIN(humidity),    MAX(humidity),
       AVG(baro_pressure),
+      AVG(dewpoint),
+      AVG(vpd),
       COUNT(*)
     FROM readings
     WHERE sensor_id = ? AND ts >= ? AND ts < ? AND excluded = 0
@@ -271,7 +311,7 @@ export function getHistory(db, sensorId, range) {
 
   if (unit === 'h') {
     return db.prepare(`
-      SELECT ts, temperature, humidity, baro_pressure AS baroPressure,
+      SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax
       FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0
       ORDER BY ts
@@ -280,6 +320,7 @@ export function getHistory(db, sensorId, range) {
   if (unit === 'd') {
     return db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
+             dewpoint_avg AS dewpoint, vpd_avg AS vpd,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax
       FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
       ORDER BY hour_ts
@@ -290,7 +331,8 @@ export function getHistory(db, sensorId, range) {
     SELECT (hour_ts / 86400 * 86400) AS ts,
            AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
-           AVG(baro_avg) AS baroPressure
+           AVG(baro_avg) AS baroPressure,
+           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd
     FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
@@ -305,7 +347,7 @@ export function getHistoryAll(db, sensorId, range) {
 
   if (unit === 'h') {
     return db.prepare(`
-      SELECT ts, temperature, humidity, baro_pressure AS baroPressure,
+      SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax, excluded
       FROM readings WHERE sensor_id = ? AND ts >= ?
       ORDER BY ts
@@ -314,6 +356,7 @@ export function getHistoryAll(db, sensorId, range) {
   if (unit === 'd') {
     return db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
+             dewpoint_avg AS dewpoint, vpd_avg AS vpd,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax, excluded
       FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ?
       ORDER BY hour_ts
@@ -324,7 +367,8 @@ export function getHistoryAll(db, sensorId, range) {
     SELECT (hour_ts / 86400 * 86400) AS ts,
            AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
-           AVG(baro_avg) AS baroPressure, 0 AS excluded
+           AVG(baro_avg) AS baroPressure,
+           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd, 0 AS excluded
     FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
