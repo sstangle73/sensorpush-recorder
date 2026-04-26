@@ -1,7 +1,7 @@
 services:
-  sensor-api:
+  sensorpush-recorder:
     build: .
-    container_name: sensor-api
+    container_name: sensorpush-recorder
     restart: unless-stopped
     init: true
     ports:
