@@ -3,6 +3,7 @@ import {
   openDb, upsertSensors, getLatestTs, insertReadings,
   recomputeHourlyAgg, getSensors, getHistory, getHistoryAll,
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
+  upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
 } from '../db.js';
 
 function makeDb() {
@@ -483,5 +484,87 @@ describe('getGaps', () => {
     expect(rangeEndTs).toBeGreaterThanOrEqual(before);
     expect(rangeEndTs).toBeLessThanOrEqual(after + 1);
     expect(rangeEndTs - rangeStartTs).toBeCloseTo(86400, -2);
+  });
+});
+
+describe('gateways', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+
+  function gw(id, lastSeen) {
+    return { id, name: id, lastSeen, lastAlert: null, version: '1.0', paired: true, message: null };
+  }
+
+  it('upsertGateways inserts then updates fields on conflict', () => {
+    const db = makeDb();
+    upsertGateways(db, [gw('g1', NOW - 60)]);
+    upsertGateways(db, [{ ...gw('g1', NOW - 30), version: '2.0' }]);
+    const rows = getGateways(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].last_seen).toBe(NOW - 30);
+    expect(rows[0].version).toBe('2.0');
+  });
+
+  it('recordGatewayStatus appends one row per gateway per call', () => {
+    const db = makeDb();
+    recordGatewayStatus(db, [gw('g1', NOW - 60), gw('g2', NOW - 90)], NOW);
+    recordGatewayStatus(db, [gw('g1', NOW - 30)], NOW + 300);
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM gateway_status`).get().n;
+    expect(n).toBe(3);
+  });
+
+  describe('gatewayOnlineDuringWindow', () => {
+    it('returns true when a poll inside the window saw a fresh gateway', () => {
+      const db = makeDb();
+      // Polled at T, last_seen at T-60 → fresh (within 600s)
+      recordGatewayStatus(db, [gw('g1', NOW - 60)], NOW);
+      expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100)).toBe(true);
+    });
+
+    it('returns false when polls inside the window all show stale gateway', () => {
+      const db = makeDb();
+      // Polled at T, last_seen at T-1800 → stale (>600s)
+      recordGatewayStatus(db, [gw('g1', NOW - 1800)], NOW);
+      expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100)).toBe(false);
+    });
+
+    it('returns null when no poll data covers the window', () => {
+      const db = makeDb();
+      recordGatewayStatus(db, [gw('g1', NOW)], NOW);
+      // window entirely before any recorded poll
+      expect(gatewayOnlineDuringWindow(db, NOW - 1000, NOW - 500)).toBeNull();
+    });
+
+    it('returns true if any of multiple gateways was fresh in the window', () => {
+      const db = makeDb();
+      recordGatewayStatus(db, [gw('g1', NOW - 1800), gw('g2', NOW - 60)], NOW);
+      expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100)).toBe(true);
+    });
+  });
+
+  it('pruneGatewayStatus removes rows older than the cutoff', () => {
+    const db = makeDb();
+    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, ?)`)
+      .run('g1', NOW - 31 * 86400, NOW - 31 * 86400);
+    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, ?)`)
+      .run('g1', NOW - 100, NOW - 100);
+    pruneGatewayStatus(db, 30 * 86400);
+    const rows = db.prepare(`SELECT polled_at FROM gateway_status`).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].polled_at).toBe(NOW - 100);
+  });
+});
+
+describe('sensor migration columns', () => {
+  it('upsertSensors stores rssi/address/device_id and getSensors returns them', () => {
+    const db = makeDb();
+    upsertSensors(db, [{
+      id: 's1', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9,
+      rssi: -75, address: 'AA:BB:CC', deviceId: '512345', alerts: null,
+    }]);
+    const rows = getSensors(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].rssi).toBe(-75);
+    expect(rows[0].address).toBe('AA:BB:CC');
+    expect(rows[0].device_id).toBe('512345');
   });
 });

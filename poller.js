@@ -1,5 +1,5 @@
-import { getToken, fetchSensors, fetchSamples } from './sensorpush.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps } from './db.js';
+import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus } from './db.js';
 
 let _lastPollError = null;
 let _lastPollTime  = null;
@@ -29,6 +29,19 @@ async function _poll(db, config) {
   if (!sensors.length) return;
 
   upsertSensors(db, sensors);
+
+  // Record gateway status alongside the sensor poll. Failures here should not
+  // break sample ingestion — log and continue.
+  try {
+    const gateways = await fetchGateways(token);
+    if (gateways.length) {
+      upsertGateways(db, gateways);
+      recordGatewayStatus(db, gateways, Math.floor(Date.now() / 1000));
+      pruneGatewayStatus(db);
+    }
+  } catch (err) {
+    console.error('[poller] gateway fetch failed:', err.message);
+  }
 
   for (const sensor of sensors) {
     const latestTs = getLatestTs(db, sensor.id);

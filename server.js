@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 
@@ -151,6 +151,9 @@ export function createApp(db, config = null) {
         humidity:       row.humidity,
         baroPressure:   row.baro_pressure,
         batteryVoltage: row.battery_voltage,
+        rssi:           row.rssi,
+        address:        row.address,
+        deviceId:       row.device_id,
         lastSeen:       row.last_ts ? new Date(row.last_ts * 1000).toISOString() : null,
         alerts:         row.alerts ? JSON.parse(row.alerts) : null,
       };
@@ -188,7 +191,31 @@ export function createApp(db, config = null) {
       return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 2h, 24h, 7d, 30d, 1yr.' });
     const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).json({ ok: false, error: 'Sensor not found' });
-    res.json({ ok: true, sensorId, range, ...getGaps(db, sensorId, range) });
+    const result = getGaps(db, sensorId, range);
+    // Annotate each gap with whether any gateway was online during the window.
+    // null = no gateway poll history covers this window (e.g. older than tracking).
+    result.gaps = result.gaps.map(g => ({
+      ...g,
+      gatewayOnline: gatewayOnlineDuringWindow(db, g.startTs, g.endTs),
+    }));
+    res.json({ ok: true, sensorId, range, ...result });
+  });
+
+  app.get('/gateways', (_req, res) => {
+    const rows = getGateways(db);
+    res.json({
+      ok: true,
+      gateways: rows.map(r => ({
+        id:         r.id,
+        name:       r.name,
+        lastSeen:   r.last_seen   ? new Date(r.last_seen   * 1000).toISOString() : null,
+        lastAlert:  r.last_alert  ? new Date(r.last_alert  * 1000).toISOString() : null,
+        version:    r.version,
+        paired:     !!r.paired,
+        message:    r.message,
+        lastSynced: r.last_synced ? new Date(r.last_synced * 1000).toISOString() : null,
+      })),
+    });
   });
 
   app.patch('/:id/readings/exclude', (req, res) => {

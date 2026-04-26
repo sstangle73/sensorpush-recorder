@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../sensorpush.js', () => ({
-  getToken:     vi.fn(),
-  fetchSensors: vi.fn(),
-  fetchSamples: vi.fn(),
+  getToken:      vi.fn(),
+  fetchSensors:  vi.fn(),
+  fetchSamples:  vi.fn(),
+  fetchGateways: vi.fn(),
 }));
 
-import { getToken, fetchSensors, fetchSamples } from '../sensorpush.js';
+import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
 import { triggerPoll, getPollStatus, triggerGapBackfill, getBackfillStatus, _resetPollerState } from '../poller.js';
 
@@ -32,6 +33,8 @@ function sample(tsOffset = 3600) {
 beforeEach(() => {
   vi.clearAllMocks();
   _resetPollerState();
+  // Default: no gateways. Tests that care override this.
+  fetchGateways.mockResolvedValue([]);
 });
 
 describe('triggerPoll — credential guards', () => {
@@ -243,6 +246,37 @@ describe('triggerGapBackfill', () => {
   it('throws when auth fails', async () => {
     getToken.mockResolvedValue(null);
     await expect(triggerGapBackfill(makeDb(), CREDS, { range: '24h' })).rejects.toThrow('SensorPush auth failed');
+  });
+});
+
+describe('triggerPoll — gateway recording', () => {
+  it('upserts gateways and appends a gateway_status row each poll', async () => {
+    const db = makeDb();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor()]);
+    fetchSamples.mockResolvedValue([]);
+    fetchGateways.mockResolvedValue([
+      { id: 'gw1', name: 'Downstairs', lastSeen: Math.floor(Date.now()/1000) - 60, lastAlert: null, version: '1.0', paired: true, message: null },
+    ]);
+
+    await triggerPoll(db, CREDS);
+
+    const gws = db.prepare(`SELECT id, name FROM gateways`).all();
+    expect(gws).toEqual([{ id: 'gw1', name: 'Downstairs' }]);
+    const status = db.prepare(`SELECT COUNT(*) AS n FROM gateway_status WHERE gateway_id = ?`).get('gw1');
+    expect(status.n).toBe(1);
+  });
+
+  it('does not break sample ingestion when gateway fetch fails', async () => {
+    const db = makeDb();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('s_ok')]);
+    fetchSamples.mockResolvedValue([]);
+    fetchGateways.mockRejectedValue(new Error('nope'));
+
+    await triggerPoll(db, CREDS);
+
+    expect(getPollStatus().lastPollError).toBeNull();
   });
 });
 

@@ -39,7 +39,7 @@ export async function getToken(email, password) {
   }
 }
 
-// Returns array of { id, name, type, active, batteryVoltage }.
+// Returns array of { id, name, type, active, batteryVoltage, rssi, address, deviceId, alerts }.
 export async function fetchSensors(token) {
   const r = await fetch(`${SP_BASE}/devices/sensors`, {
     method:  'POST',
@@ -51,11 +51,37 @@ export async function fetchSensors(token) {
   const data = await r.json();
   return Object.entries(data).map(([id, s]) => ({
     id,
-    name:           s.name           || id,
-    type:           s.type           || null,
-    active:         s.active         !== false,
+    name:           s.name            || id,
+    type:           s.type            || null,
+    active:         s.active          !== false,
     batteryVoltage: s.battery_voltage ?? null,
-    alerts:         s.alerts         ?? null,
+    rssi:           s.rssi            ?? null,
+    address:        s.address         ?? null,
+    deviceId:       s.deviceId        ?? null,
+    alerts:         s.alerts          ?? null,
+  }));
+}
+
+// Returns array of { id, name, lastSeen (epoch sec), lastAlert (epoch sec),
+// version, paired, message }.
+export async function fetchGateways(token) {
+  const r = await fetch(`${SP_BASE}/devices/gateways`, {
+    method:  'POST',
+    headers: { 'Authorization': token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body:    '{}',
+    signal:  AbortSignal.timeout(12000),
+  });
+  if (!r.ok) throw new Error(`gateways HTTP ${r.status}`);
+  const data = await r.json();
+  const toEpoch = iso => iso ? Math.floor(new Date(iso).getTime() / 1000) : null;
+  return Object.entries(data).map(([key, g]) => ({
+    id:        g.id      ?? key,
+    name:      g.name    || key,
+    lastSeen:  toEpoch(g.last_seen),
+    lastAlert: toEpoch(g.last_alert),
+    version:   g.version ?? null,
+    paired:    g.paired  !== false,
+    message:   g.message ?? null,
   }));
 }
 

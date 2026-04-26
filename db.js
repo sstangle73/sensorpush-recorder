@@ -47,6 +47,27 @@ export function openDb(path) {
       key   TEXT PRIMARY KEY,
       value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS gateways (
+      id           TEXT PRIMARY KEY,
+      name         TEXT,
+      last_seen    INTEGER,
+      last_alert   INTEGER,
+      version      TEXT,
+      paired       INTEGER NOT NULL DEFAULT 1,
+      message      TEXT,
+      last_synced  INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- One row appended per poll per gateway; lets us answer "was the gateway
+    -- online during this gap window?" by inspecting (polled_at, last_seen) pairs.
+    CREATE TABLE IF NOT EXISTS gateway_status (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      gateway_id  TEXT NOT NULL,
+      polled_at   INTEGER NOT NULL,
+      last_seen   INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_gw_status_polled ON gateway_status(polled_at);
   `);
   // Migrate existing DBs that predate the excluded columns.
   for (const [table, col] of [['readings', 'excluded'], ['hourly_agg', 'excluded']]) {
@@ -54,36 +75,120 @@ export function openDb(path) {
     if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
   }
   // Migrate: alerts column on sensors (added when SensorPush alert thresholds were surfaced).
+  // Then rssi/address/device_id (added with the gateway-status feature).
   {
     const cols = db.prepare(`PRAGMA table_info(sensors)`).all().map(r => r.name);
-    if (!cols.includes('alerts')) db.exec(`ALTER TABLE sensors ADD COLUMN alerts TEXT`);
+    if (!cols.includes('alerts'))    db.exec(`ALTER TABLE sensors ADD COLUMN alerts    TEXT`);
+    if (!cols.includes('rssi'))      db.exec(`ALTER TABLE sensors ADD COLUMN rssi      INTEGER`);
+    if (!cols.includes('address'))   db.exec(`ALTER TABLE sensors ADD COLUMN address   TEXT`);
+    if (!cols.includes('device_id')) db.exec(`ALTER TABLE sensors ADD COLUMN device_id TEXT`);
   }
   return db;
 }
 
 export function upsertSensors(db, sensors) {
   const stmt = db.prepare(`
-    INSERT INTO sensors (id, name, type, active, battery_voltage, last_updated, alerts)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sensors (id, name, type, active, battery_voltage, last_updated, alerts, rssi, address, device_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name            = excluded.name,
       type            = excluded.type,
       active          = excluded.active,
       battery_voltage = excluded.battery_voltage,
       last_updated    = excluded.last_updated,
-      alerts          = excluded.alerts
+      alerts          = excluded.alerts,
+      rssi            = excluded.rssi,
+      address         = excluded.address,
+      device_id       = excluded.device_id
   `);
   const now = Math.floor(Date.now() / 1000);
   db.exec('BEGIN');
   try {
     for (const s of sensors) {
-      stmt.run(s.id, s.name, s.type ?? null, s.active ? 1 : 0, s.batteryVoltage ?? null, now, s.alerts ? JSON.stringify(s.alerts) : null);
+      stmt.run(
+        s.id, s.name, s.type ?? null, s.active ? 1 : 0,
+        s.batteryVoltage ?? null, now,
+        s.alerts ? JSON.stringify(s.alerts) : null,
+        s.rssi ?? null, s.address ?? null, s.deviceId ?? null,
+      );
     }
     db.exec('COMMIT');
   } catch(e) {
     db.exec('ROLLBACK');
     throw e;
   }
+}
+
+export function upsertGateways(db, gateways) {
+  const stmt = db.prepare(`
+    INSERT INTO gateways (id, name, last_seen, last_alert, version, paired, message, last_synced)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name        = excluded.name,
+      last_seen   = excluded.last_seen,
+      last_alert  = excluded.last_alert,
+      version     = excluded.version,
+      paired      = excluded.paired,
+      message     = excluded.message,
+      last_synced = excluded.last_synced
+  `);
+  const now = Math.floor(Date.now() / 1000);
+  db.exec('BEGIN');
+  try {
+    for (const g of gateways) {
+      stmt.run(
+        g.id, g.name, g.lastSeen ?? null, g.lastAlert ?? null,
+        g.version ?? null, g.paired ? 1 : 0, g.message ?? null, now,
+      );
+    }
+    db.exec('COMMIT');
+  } catch(e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// Append one (gateway_id, polled_at, last_seen) row per gateway. Used at every
+// poll so we can later determine whether a gateway was online during a gap.
+export function recordGatewayStatus(db, gateways, polledAt) {
+  const stmt = db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, ?)`);
+  db.exec('BEGIN');
+  try {
+    for (const g of gateways) stmt.run(g.id, polledAt, g.lastSeen ?? null);
+    db.exec('COMMIT');
+  } catch(e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// Drop gateway_status rows older than `olderThanSecs` to keep the table bounded.
+export function pruneGatewayStatus(db, olderThanSecs = 30 * 86400) {
+  const cutoff = Math.floor(Date.now() / 1000) - olderThanSecs;
+  db.prepare(`DELETE FROM gateway_status WHERE polled_at < ?`).run(cutoff);
+}
+
+export function getGateways(db) {
+  return db.prepare(`SELECT id, name, last_seen, last_alert, version, paired, message, last_synced FROM gateways ORDER BY name`).all();
+}
+
+// For a [startTs, endTs] window, return whether any gateway was "fresh"
+// (polled with last_seen within FRESH_THRESHOLD of polled_at) at any point
+// during that window.
+//   true  → at least one gateway was online during the window
+//   false → polled during the window, all gateways stale
+//   null  → no poll data within the window (can't tell)
+const FRESH_THRESHOLD = 600; // 10 minutes
+export function gatewayOnlineDuringWindow(db, startTs, endTs) {
+  const rows = db.prepare(`
+    SELECT polled_at, last_seen FROM gateway_status
+    WHERE polled_at >= ? AND polled_at <= ?
+  `).all(startTs, endTs);
+  if (!rows.length) return null;
+  for (const r of rows) {
+    if (r.last_seen != null && (r.polled_at - r.last_seen) <= FRESH_THRESHOLD) return true;
+  }
+  return false;
 }
 
 export function getLatestTs(db, sensorId) {
@@ -136,6 +241,7 @@ export function recomputeHourlyAgg(db, sensorId, hourTs) {
 export function getSensors(db) {
   return db.prepare(`
     SELECT s.id, s.name, s.type, s.active, s.battery_voltage, s.alerts,
+           s.rssi, s.address, s.device_id,
            r.temperature, r.humidity, r.baro_pressure, r.ts AS last_ts
     FROM sensors s
     LEFT JOIN readings r ON r.sensor_id = s.id

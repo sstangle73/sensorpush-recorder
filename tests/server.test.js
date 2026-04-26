@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import { createApp } from '../server.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus } from '../db.js';
 import { vi } from 'vitest';
 
 let server, baseUrl, db;
@@ -343,5 +343,42 @@ describe('GET /:id/gaps', () => {
     const { body } = await get('/gaptest4/gaps?range=30d');
     expect(body.sensorId).toBe('gaptest4');
     expect(body.range).toBe('30d');
+  });
+
+  it('annotates each gap with gatewayOnline = true|false|null', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [{ id: 'gw_gap', name: 'GwGap', type: 'HT1', active: true, batteryVoltage: null }]);
+    // Two readings 2h apart in the last 24h → one gap window
+    insertReadings(db, 'gw_gap', [
+      { observed: new Date((now - 23 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 21 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+    ]);
+    // Gateway poll inside the gap window with fresh last_seen
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: now - 22 * 3600 - 60 }], now - 22 * 3600);
+
+    const { body } = await get('/gw_gap/gaps?range=24h');
+    expect(body.gaps.length).toBeGreaterThan(0);
+    expect(body.gaps[0].gatewayOnline).toBe(true);
+  });
+});
+
+describe('GET /gateways', () => {
+  it('returns empty array when no gateways recorded', async () => {
+    const { status, body } = await get('/gateways');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(Array.isArray(body.gateways)).toBe(true);
+  });
+
+  it('returns recorded gateways with ISO timestamps', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    upsertGateways(db, [{ id: 'gw_route', name: 'Test', lastSeen: now - 60, lastAlert: null, version: '1.0', paired: true, message: null }]);
+    const { body } = await get('/gateways');
+    const gw = body.gateways.find(g => g.id === 'gw_route');
+    expect(gw).toBeDefined();
+    expect(gw.name).toBe('Test');
+    expect(gw.lastSeen).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(gw.version).toBe('1.0');
+    expect(gw.paired).toBe(true);
   });
 });

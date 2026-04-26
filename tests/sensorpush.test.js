@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('node-fetch', () => ({ default: vi.fn() }));
 import fetch from 'node-fetch';
 
-import { getToken, fetchSensors, fetchSamples, _resetTokenCache } from '../sensorpush.js';
+import { getToken, fetchSensors, fetchSamples, fetchGateways, _resetTokenCache } from '../sensorpush.js';
 
 function jsonResp(data, status = 200) {
   return {
@@ -78,21 +78,63 @@ describe('getToken', () => {
 describe('fetchSensors', () => {
   it('maps API response to array of sensor objects', async () => {
     const apiData = {
-      'id1': { name: 'Living Room', type: 'HT1',    active: true,  battery_voltage: 2.85 },
+      'id1': { name: 'Living Room', type: 'HT1',    active: true,  battery_voltage: 2.85, rssi: -77, address: 'AA:BB', deviceId: '511601' },
       'id2': { name: 'Outside',     type: 'HTP.xw', active: false, battery_voltage: 2.70 },
     };
     fetch.mockResolvedValueOnce(jsonResp(apiData));
     const sensors = await fetchSensors('tok');
     expect(sensors).toHaveLength(2);
     const s1 = sensors.find(s => s.id === 'id1');
-    expect(s1).toMatchObject({ id: 'id1', name: 'Living Room', type: 'HT1', active: true, batteryVoltage: 2.85 });
+    expect(s1).toMatchObject({ id: 'id1', name: 'Living Room', type: 'HT1', active: true, batteryVoltage: 2.85, rssi: -77, address: 'AA:BB', deviceId: '511601' });
     const s2 = sensors.find(s => s.id === 'id2');
     expect(s2.active).toBe(false);
+    expect(s2.rssi).toBeNull();
   });
 
   it('throws on non-OK response', async () => {
     fetch.mockResolvedValueOnce(jsonResp({}, 403));
     await expect(fetchSensors('tok')).rejects.toThrow('sensors HTTP 403');
+  });
+});
+
+describe('fetchGateways', () => {
+  it('maps API response, converting ISO timestamps to epoch seconds', async () => {
+    const apiData = {
+      'Downstairs': {
+        name: 'Downstairs', id: 'gw1',
+        last_seen:  '2026-04-26T13:31:46.000Z',
+        last_alert: '2026-04-26T06:23:12.000Z',
+        version: '1.3.1(39)', paired: true, message: null,
+      },
+      'Attic': {
+        name: 'Attic', id: 'gw2',
+        last_seen: '2026-04-26T13:34:03.000Z',
+        last_alert: null, version: '1.3.1(39)', paired: true, message: null,
+      },
+    };
+    fetch.mockResolvedValueOnce(jsonResp(apiData));
+    const gws = await fetchGateways('tok');
+    expect(gws).toHaveLength(2);
+    const ds = gws.find(g => g.id === 'gw1');
+    expect(ds.name).toBe('Downstairs');
+    expect(ds.lastSeen).toBe(Math.floor(new Date('2026-04-26T13:31:46.000Z').getTime() / 1000));
+    expect(ds.lastAlert).toBe(Math.floor(new Date('2026-04-26T06:23:12.000Z').getTime() / 1000));
+    expect(ds.version).toBe('1.3.1(39)');
+    expect(ds.paired).toBe(true);
+    const at = gws.find(g => g.id === 'gw2');
+    expect(at.lastAlert).toBeNull();
+  });
+
+  it('falls back to map key when id field is missing', async () => {
+    fetch.mockResolvedValueOnce(jsonResp({ 'OnlyName': { name: 'OnlyName', last_seen: null } }));
+    const gws = await fetchGateways('tok');
+    expect(gws[0].id).toBe('OnlyName');
+    expect(gws[0].lastSeen).toBeNull();
+  });
+
+  it('throws on non-OK response', async () => {
+    fetch.mockResolvedValueOnce(jsonResp({}, 500));
+    await expect(fetchGateways('tok')).rejects.toThrow('gateways HTTP 500');
   });
 });
 
