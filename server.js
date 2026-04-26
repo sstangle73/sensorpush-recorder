@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings } from './db.js';
-import { startPoller, getPollStatus, triggerPoll, triggerBackfill, getBackfillStatus } from './poller.js';
+import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -225,6 +225,17 @@ export function createApp(db, config = null) {
     if (getBackfillStatus().status === 'running')
       return res.status(409).json({ ok: false, error: 'Backfill already running' });
     triggerBackfill(db, config, fromTs).catch(err => console.error('[backfill]', err.message));
+    res.json({ ok: true, status: 'started' });
+  });
+
+  app.post('/backfill-gaps', (req, res) => {
+    if (!config) return res.status(503).json({ ok: false, error: 'No config available' });
+    const { range = '7d' } = req.body ?? {};
+    if (!rangeToSeconds(range))
+      return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 24h, 7d, 30d, 1yr.' });
+    if (getBackfillStatus().status === 'running')
+      return res.status(409).json({ ok: false, error: 'Backfill already running' });
+    triggerGapBackfill(db, config, { range }).catch(err => console.error('[gap-backfill]', err.message));
     res.json({ ok: true, status: 'started' });
   });
 

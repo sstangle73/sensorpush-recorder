@@ -7,8 +7,8 @@ vi.mock('../sensorpush.js', () => ({
 }));
 
 import { getToken, fetchSensors, fetchSamples } from '../sensorpush.js';
-import { openDb, upsertSensors, insertReadings } from '../db.js';
-import { triggerPoll, getPollStatus, _resetPollerState } from '../poller.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
+import { triggerPoll, getPollStatus, triggerGapBackfill, getBackfillStatus, _resetPollerState } from '../poller.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -146,6 +146,107 @@ describe('triggerPoll — incremental fetch', () => {
     expect(startTs).toBeLessThan(now - 23 * 3600);
   });
 
+});
+
+describe('triggerGapBackfill', () => {
+  it('does nothing and reports zero windows when DB is empty', async () => {
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('g1')]);
+
+    await triggerGapBackfill(makeDb(), CREDS, { range: '24h' });
+
+    expect(fetchSamples).not.toHaveBeenCalled();
+    const st = getBackfillStatus();
+    expect(st.status).toBe('done');
+    expect(st.progress.total).toBe(0);
+  });
+
+  it('fetches only the gap windows derived from local DB state', async () => {
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+
+    upsertSensors(db, [sensor('g2')]);
+    // Two readings 2h apart at the start of a 24h window, then nothing —
+    // creates a single gap from t-86400+7200 to t-0 (well, until last reading).
+    insertReadings(db, 'g2', [
+      { observed: new Date((now - 23 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+      { observed: new Date((now - 21 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+    ]);
+
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('g2')]);
+    fetchSamples.mockResolvedValue([]);
+
+    await triggerGapBackfill(db, CREDS, { range: '24h' });
+
+    // One gap window now-23h → now-21h (2h, single chunk)
+    expect(fetchSamples).toHaveBeenCalledTimes(1);
+    const [, w] = fetchSamples.mock.calls[0];
+    expect(w.sensorId).toBe('g2');
+    expect(w.startTs).toBeGreaterThanOrEqual(now - 23 * 3600 - 1);
+    expect(w.stopTs).toBeLessThanOrEqual(now - 21 * 3600 + 1);
+  });
+
+  it('chunks gap windows longer than 2 days into <=2-day pieces', async () => {
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+
+    upsertSensors(db, [sensor('g3')]);
+    // Two readings 7 days apart inside a 30d range — gap is ~7d.
+    // For ranges > 24h, getGaps reads hourly_agg, so populate it.
+    const ts1 = now - 29 * 86400, ts2 = now - 22 * 86400;
+    insertReadings(db, 'g3', [
+      { observed: new Date(ts1 * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+      { observed: new Date(ts2 * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+    ]);
+    recomputeHourlyAgg(db, 'g3', ts1 - (ts1 % 3600));
+    recomputeHourlyAgg(db, 'g3', ts2 - (ts2 % 3600));
+
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('g3')]);
+    fetchSamples.mockResolvedValue([]);
+
+    await triggerGapBackfill(db, CREDS, { range: '30d' });
+
+    // 7-day gap → ceil(7/2) = 4 chunks. Allow ±1 for boundary chunking.
+    expect(fetchSamples.mock.calls.length).toBeGreaterThanOrEqual(3);
+    for (const [, w] of fetchSamples.mock.calls) {
+      expect(w.stopTs - w.startTs).toBeLessThanOrEqual(2 * 86400);
+    }
+  });
+
+  it('inserts returned samples and counts them in progress.inserted', async () => {
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+
+    upsertSensors(db, [sensor('g4')]);
+    insertReadings(db, 'g4', [
+      { observed: new Date((now - 23 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+      { observed: new Date((now - 21 * 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
+    ]);
+
+    const filledSample = {
+      observed: new Date((now - 12 * 3600) * 1000).toISOString(),
+      temperature: 71, humidity: 51, barometric_pressure: null, battery_voltage: 2.9,
+    };
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('g4')]);
+    fetchSamples.mockResolvedValueOnce([filledSample]).mockResolvedValue([]);
+
+    await triggerGapBackfill(db, CREDS, { range: '24h' });
+
+    const row = db.prepare('SELECT COUNT(*) AS n FROM readings WHERE sensor_id = ?').get('g4');
+    expect(row.n).toBe(3);
+    expect(getBackfillStatus().progress.inserted).toBe(1);
+  });
+
+  it('throws when auth fails', async () => {
+    getToken.mockResolvedValue(null);
+    await expect(triggerGapBackfill(makeDb(), CREDS, { range: '24h' })).rejects.toThrow('SensorPush auth failed');
+  });
+});
+
+describe('triggerPoll — hourly recompute', () => {
   it('recomputes hourly aggregates for hours that received new readings', async () => {
     const db  = makeDb();
     const now = Math.floor(Date.now() / 1000);

@@ -405,14 +405,16 @@ header .spacer { flex: 1; }
   </div>
 
   <div id="view-analytics" style="display:none">
-    <div class="an-range-row" style="display:flex;align-items:center;gap:6px;padding:12px 16px 0;flex-shrink:0">
+    <div class="an-range-row" style="display:flex;align-items:center;gap:6px;padding:12px 16px 0;flex-shrink:0;flex-wrap:wrap">
       <span style="font-size:11px;color:var(--text2)">Range:</span>
       <button class="an-range-btn" data-range="24h"  onclick="setAnalyticsRange('24h')">24 h</button>
       <button class="an-range-btn active" data-range="7d"   onclick="setAnalyticsRange('7d')">7 d</button>
       <button class="an-range-btn" data-range="30d"  onclick="setAnalyticsRange('30d')">30 d</button>
       <button class="an-range-btn" data-range="90d"  onclick="setAnalyticsRange('90d')">90 d</button>
       <button class="an-range-btn" data-range="365d" onclick="setAnalyticsRange('365d')">1 yr</button>
+      <button class="an-range-btn" id="gap-fill-btn" style="margin-left:auto" onclick="startGapBackfill()" title="Re-fetch only the windows the local DB shows as missing, across all sensors">⤓ Fix all gaps</button>
     </div>
+    <div id="gap-fill-status" style="padding:6px 16px 0;font-size:12px;color:var(--text2)"></div>
     <div id="analytics-content"></div>
   </div>
 </div>
@@ -1088,10 +1090,58 @@ function _schedulePollBackfill() {
     try {
       const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
       _updateBackfillStatus(state);
+      _updateGapBackfillStatus(state);
       if (state.status === 'running') _schedulePollBackfill();
-      else if (state.status === 'done') showToast('Backfill complete ✓');
+      else if (state.status === 'done') {
+        showToast('Backfill complete ✓');
+        // Refresh analytics so newly filled gaps disappear from the view
+        if (document.getElementById('view-analytics').style.display !== 'none') loadAnalytics();
+      }
     } catch(e) { /* silently retry */ _schedulePollBackfill(); }
   }, 2000);
+}
+
+async function startGapBackfill() {
+  const btn = document.getElementById('gap-fill-btn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`${API_BASE}/backfill-gaps`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ range: _analyticsRange }),
+    }).then(r => r.json());
+    if (!resp.ok) { showToast('Error: ' + resp.error); btn.disabled = false; return; }
+    _updateGapBackfillStatus({ status: 'running', progress: { done: 0, total: 0, inserted: 0 } });
+    _schedulePollBackfill();
+  } catch(e) {
+    showToast('Gap backfill request failed');
+    btn.disabled = false;
+  }
+}
+
+function _updateGapBackfillStatus(state) {
+  const el  = document.getElementById('gap-fill-status');
+  const btn = document.getElementById('gap-fill-btn');
+  if (!el) return;
+  if (state.status === 'running') {
+    const p = state.progress;
+    const pct = p?.total ? Math.round(p.done / p.total * 100) : 0;
+    el.innerHTML = `<span style="color:var(--warn)">⏳ Filling gaps… ${p?.done ?? 0}/${p?.total ?? '?'} windows (${pct}%) · ${p?.inserted ?? 0} new readings</span>`;
+    if (btn) btn.disabled = true;
+  } else if (state.status === 'done') {
+    const n = state.progress?.inserted ?? 0;
+    const total = state.progress?.total ?? 0;
+    el.innerHTML = total === 0
+      ? `<span style="color:var(--green)">✓ No gaps found in this range</span>`
+      : `<span style="color:var(--green)">✓ Done — ${n} new readings inserted</span>`;
+    if (btn) btn.disabled = false;
+  } else if (state.status === 'error') {
+    el.innerHTML = `<span style="color:var(--excl)">✗ Error: ${state.error}</span>`;
+    if (btn) btn.disabled = false;
+  } else {
+    el.innerHTML = '';
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function hardRefresh() {

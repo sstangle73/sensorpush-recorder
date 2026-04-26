@@ -1,5 +1,5 @@
 import { getToken, fetchSensors, fetchSamples } from './sensorpush.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime } from './db.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps } from './db.js';
 
 let _lastPollError = null;
 let _lastPollTime  = null;
@@ -132,6 +132,71 @@ export async function triggerBackfill(db, config, fromTs) {
     _backfillState = { status: 'done', progress: _backfillState.progress, error: null };
   } catch (err) {
     console.error('[backfill] error:', err.message);
+    _backfillState = { status: 'error', progress: _backfillState.progress, error: err.message };
+    throw err;
+  }
+}
+
+// Targeted backfill: fetch only the windows the local DB shows as missing
+// (gaps + sparse hours from getGaps) instead of broadly re-pulling the whole
+// range. Iterates all sensors. Reuses _backfillState so the existing
+// /backfill/status endpoint reports progress.
+export async function triggerGapBackfill(db, config, { range = '7d' } = {}) {
+  if (_backfillState.status === 'running') throw new Error('Backfill already running');
+
+  const sp = config?.sensorpush;
+  if (!sp?.email || sp.email.includes('YOUR_')) throw new Error('No SensorPush credentials');
+
+  const token = await getToken(sp.email, sp.password);
+  if (!token) throw new Error('SensorPush auth failed — check email/password in config');
+
+  const sensors = await fetchSensors(token);
+  if (!sensors.length) throw new Error('No sensors found');
+
+  // Build a flat list of fetch windows across all sensors, splitting any
+  // window longer than 2 days to stay under the SensorPush 10000-row limit.
+  const MAX_CHUNK = 2 * 86400;
+  const work = [];
+  for (const sensor of sensors) {
+    const { gaps, sparseHours } = getGaps(db, sensor.id, range);
+    const windows = [];
+    for (const g of gaps) windows.push({ startTs: g.startTs, stopTs: g.endTs });
+    for (const sh of (sparseHours || [])) windows.push({ startTs: sh.hourTs, stopTs: sh.hourTs + 3600 });
+    for (const w of windows) {
+      for (let end = w.stopTs; end > w.startTs; end -= MAX_CHUNK) {
+        const start = Math.max(end - MAX_CHUNK, w.startTs);
+        work.push({ sensorId: sensor.id, startTs: start, stopTs: end });
+      }
+    }
+  }
+
+  const total = work.length;
+  _backfillState = { status: 'running', progress: { done: 0, total, inserted: 0 }, startedAt: Date.now(), error: null };
+  console.log(`[gap-backfill] starting: ${sensors.length} sensors, ${total} windows over ${range}`);
+
+  if (!total) {
+    _backfillState = { status: 'done', progress: { done: 0, total: 0, inserted: 0 }, error: null };
+    return;
+  }
+
+  try {
+    upsertSensors(db, sensors);
+    for (const w of work) {
+      const samples = await fetchSamples(token, w);
+      if (samples.length) {
+        const inserted = insertReadings(db, w.sensorId, samples);
+        if (inserted.length) {
+          const hours = [...new Set(inserted.map(r => r.ts - (r.ts % 3600)))];
+          for (const h of hours) recomputeHourlyAgg(db, w.sensorId, h);
+          _backfillState.progress.inserted += inserted.length;
+        }
+      }
+      _backfillState.progress.done++;
+    }
+    console.log(`[gap-backfill] done — ${_backfillState.progress.inserted} new readings`);
+    _backfillState = { status: 'done', progress: _backfillState.progress, error: null };
+  } catch (err) {
+    console.error('[gap-backfill] error:', err.message);
     _backfillState = { status: 'error', progress: _backfillState.progress, error: err.message };
     throw err;
   }
