@@ -1,0 +1,19 @@
+{
+  "name": "sensorpush-recorder",
+  "version": "1.0.0",
+  "description": "Self-hosted SensorPush cloud → SQLite recorder + REST API + Explorer UI",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  }
+}

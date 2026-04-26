@@ -1,0 +1,24 @@
+services:
+  sensor-api:
+    build: .
+    container_name: sensor-api
+    restart: unless-stopped
+    init: true
+    ports:
+      - "3003:3003"
+    environment:
+      # Allowlist of origins permitted to call this API cross-origin.
+      # Comma-separated, no spaces. Each value must match a request's
+      # Origin header exactly (scheme + host + port).
+      CORS_ORIGINS: "https://dashboard.sstangle.in,http://10.73.37.22:8080,http://localhost:8080"
+    volumes:
+      - ./config.local.js:/config/config.local.js:ro
+      - ./data:/data
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3003/health || exit 1
+      start_period: 30s
+      interval: 1m
+      timeout: 5s
+      retries: 3
+    labels:
+      - autoheal=true

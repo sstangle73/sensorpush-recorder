@@ -1,0 +1,6 @@
+node_modules/
+config.local.js
+data/
+coverage/
+*.log
+.DS_Store

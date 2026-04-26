@@ -1,0 +1,1681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1f1f1f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SensorPush">
+<link rel="manifest" href="manifest.json">
+<title>SensorPush Explorer</title>
+<style>
+:root {
+  --bg:      #161616;
+  --bg2:     #1f1f1f;
+  --bg3:     #2a2a2a;
+  --bg4:     #383838;
+  --text:    #e0e0e0;
+  --text2:   #999;
+  --text3:   #555;
+  --border:  #2e2e2e;
+  --accent:  #4db8ff;
+  --green:   #6ef0b0;
+  --warn:    #f0b942;
+  --excl:    #ff5c5c;
+  --edit-bg: #2a1a1a;
+  --edit-border: #7a3535;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 system-ui, -apple-system, sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ── */
+header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 16px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 15px; font-weight: 600; }
+#poll-status { color: var(--text2); font-size: 12px; }
+header .spacer { flex: 1; }
+.hdr-btn {
+  padding: 4px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 12px;
+}
+.hdr-btn:hover { color: var(--text); }
+
+/* ── Body ── */
+#body { display: flex; flex: 1; min-height: 0; }
+
+/* ── Sidebar ── */
+#sidebar {
+  width: 210px;
+  flex-shrink: 0;
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#sidebar-hdr {
+  padding: 10px 12px 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text3);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+#sidebar-hdr button {
+  background: none; border: none;
+  color: var(--text3); cursor: pointer; font-size: 11px; padding: 0;
+}
+#sidebar-hdr button:hover { color: var(--text2); }
+#sensor-list { flex: 1; overflow-y: auto; padding: 4px 6px 8px; }
+
+.sensor-row {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 7px 8px; border-radius: 6px; cursor: pointer; user-select: none;
+  border: 1px solid transparent;
+}
+.sensor-row:hover { background: var(--bg3); }
+.sensor-row.active { background: var(--bg3); border-color: var(--border); }
+.sensor-color {
+  width: 10px; height: 10px; border-radius: 50%;
+  margin-top: 3px; flex-shrink: 0; transition: opacity .15s;
+}
+.sensor-row:not(.active) .sensor-color { opacity: .25; }
+.sensor-meta { flex: 1; min-width: 0; }
+.sensor-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sensor-vals { font-size: 11px; color: var(--text2); margin-top: 1px; }
+.sensor-seen { font-size: 10px; color: var(--text2); margin-top: 2px; }
+.sensor-seen.warn  { color: var(--warn); }
+.sensor-seen.stale { color: var(--excl); }
+
+/* ── Series checkboxes (inside sensor-row) ── */
+.series-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 8px 3px 26px; cursor: pointer; border-radius: 4px;
+  font-size: 11px; color: var(--text2); user-select: none;
+}
+.sensor-row.active + .series-rows .series-row:hover { background: var(--bg3); }
+.series-rows { display: none; }
+.sensor-row.active ~ .series-rows { display: block; }
+.series-check { width: 11px; height: 11px; accent-color: var(--accent); cursor: pointer; }
+
+/* ── Chart area ── */
+#chart-area {
+  flex: 1; display: flex; flex-direction: column;
+  min-width: 0; padding: 12px 14px 10px; gap: 10px;
+}
+
+/* ── Controls row ── */
+#ctrl-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.range-btn {
+  padding: 4px 13px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--text2);
+  cursor: pointer; font-size: 12px;
+}
+.range-btn.active { background: var(--bg3); color: var(--text); border-color: var(--bg4); }
+#zoom-reset {
+  padding: 4px 11px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--accent);
+  cursor: pointer; font-size: 12px; display: none;
+}
+#zoom-reset:hover { background: var(--bg3); }
+.ctrl-sep { flex: 1; }
+#edit-btn {
+  padding: 4px 13px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--text2);
+  cursor: pointer; font-size: 12px;
+}
+#edit-btn.active {
+  background: var(--edit-bg); color: var(--excl);
+  border-color: var(--edit-border);
+}
+#mode-hint { font-size: 11px; color: var(--text3); }
+
+/* ── Chart wrap ── */
+#chart-wrap { flex: 1; position: relative; min-height: 0; }
+#chart-svg-wrap { width: 100%; height: 100%; }
+#chart-svg-wrap svg { width: 100%; height: 100%; display: block; }
+
+/* ── Tooltip ── */
+#tooltip {
+  position: absolute; pointer-events: none;
+  background: var(--bg2); border: 1px solid var(--bg4);
+  border-radius: 7px; padding: 8px 12px;
+  font-size: 12px; line-height: 1.7; display: none; z-index: 20;
+  max-width: 260px; box-shadow: 0 6px 20px rgba(0,0,0,.5); white-space: nowrap;
+}
+.tt-time { font-weight: 600; color: var(--text); margin-bottom: 3px; }
+.tt-row { display: flex; align-items: center; gap: 6px; }
+.tt-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tt-name { color: var(--text2); }
+.tt-vals { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; }
+.tt-excl { color: var(--excl); font-size: 10px; margin-left: 3px; }
+
+/* ── Legend ── */
+#legend {
+  display: flex; flex-wrap: wrap; gap: 10px 18px;
+  font-size: 11px; color: var(--text2); min-height: 16px;
+}
+.leg-item { display: flex; align-items: center; gap: 5px; }
+.leg-dot { width: 9px; height: 9px; border-radius: 50%; }
+.leg-dash {
+  width: 18px; height: 2px; background: currentColor;
+  background: repeating-linear-gradient(90deg,currentColor 0,currentColor 5px,transparent 5px,transparent 8px);
+}
+
+/* ── Empty ── */
+#empty {
+  position: absolute; inset: 0; display: none;
+  align-items: center; justify-content: center;
+  color: var(--text3); font-size: 14px;
+}
+
+/* ── Tab navigation ── */
+.tab-btn {
+  padding: 4px 11px; border-radius: 5px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--text2); cursor: pointer; font-size: 12px;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--accent); border-color: var(--accent); }
+
+/* ── Analytics view ── */
+#view-analytics {
+  flex: 1; overflow-y: auto; padding: 16px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.an-range-btn {
+  padding: 3px 9px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg3);
+  color: var(--text2); cursor: pointer; font-size: 11px;
+}
+.an-range-btn:hover { color: var(--text); }
+.an-range-btn.active { color: var(--accent); border-color: var(--accent); background: var(--bg2); }
+.an-section {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 14px 16px;
+}
+.an-section h2 {
+  font-size: 11px; font-weight: 600; color: var(--text2);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
+}
+.an-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.an-table th {
+  text-align: left; color: var(--text2); font-weight: 500;
+  padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.an-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.an-table tbody tr:last-child td { border-bottom: none; }
+.an-table tbody tr.clickable { cursor: pointer; }
+.an-table tbody tr.clickable:hover { background: var(--bg3); }
+.an-table tbody tr.selected { background: var(--bg3); outline: 1px solid var(--accent); outline-offset: -1px; }
+.cov-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: var(--bg4); gap: 1px; }
+.cov-slot { flex: 1; min-width: 0; }
+.cov-ok     { background: var(--green); opacity: 0.75; }
+.cov-sparse { background: var(--warn);  opacity: 0.85; }
+.cov-gap    { background: transparent; }
+.cov-row    { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.cov-label  { width: 120px; font-size: 11px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+
+/* ── Dynamic range button container ── */
+#range-btns { display: contents; }
+
+/* ── Settings text input ── */
+.set-text-input {
+  flex: 1; background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text); font-size: 13px;
+  padding: 6px 10px; outline: none; min-width: 0;
+  font-family: inherit;
+}
+.set-text-input:focus { border-color: var(--accent); }
+
+/* ── Chip controls (All / None on mobile) ── */
+.chip-ctrl {
+  flex-shrink: 0; padding: 5px 10px; border-radius: 14px;
+  border: 1.5px solid var(--border); background: transparent;
+  color: var(--text3); cursor: pointer; font-size: 11px;
+  white-space: nowrap; min-height: 34px; transition: color .15s;
+}
+.chip-ctrl:hover { color: var(--text2); }
+.chip-ctrl + .chip-ctrl { margin-left: -2px; }
+.chip-divider { width: 1px; background: var(--border); flex-shrink: 0; align-self: stretch; margin: 6px 2px; }
+
+/* ── Custom range panel ── */
+#custom-range-panel {
+  display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 0 2px;
+}
+#custom-range-panel input[type="datetime-local"] {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text); font-size: 12px;
+  padding: 4px 8px; cursor: pointer;
+  color-scheme: dark;
+}
+#custom-range-panel input[type="datetime-local"]:focus { outline: 1px solid var(--accent); }
+#custom-range-panel .range-sep { color: var(--text3); font-size: 12px; }
+
+/* ── Settings view ── */
+#view-settings {
+  flex: 1; overflow-y: auto; padding: 16px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.set-section {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 14px 16px;
+}
+.set-section h2 {
+  font-size: 11px; font-weight: 600; color: var(--text2);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;
+}
+.set-hint { font-size: 11px; color: var(--text3); margin-top: 8px; }
+.set-btn {
+  padding: 7px 18px; border-radius: 5px; border: 1px solid var(--border);
+  background: var(--bg3); color: var(--text2); cursor: pointer; font-size: 13px;
+}
+.set-btn:hover { color: var(--text); }
+.set-btn.danger { border-color: var(--excl); color: var(--excl); }
+.set-btn.danger:hover { background: #3a1010; }
+
+/* ── Toast ── */
+#toast {
+  position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+  background: var(--bg4); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 20px; font-size: 13px;
+  opacity: 0; transition: opacity .18s; pointer-events: none; z-index: 200;
+  white-space: nowrap;
+}
+#toast.show { opacity: 1; }
+
+/* ── Sensor chips (mobile sidebar replacement) ── */
+#sensor-chips {
+  display: none; flex-shrink: 0; overflow-x: auto;
+  -webkit-overflow-scrolling: touch; padding: 8px 12px;
+  gap: 8px; background: var(--bg2); border-bottom: 1px solid var(--border);
+  scrollbar-width: none; align-items: center;
+}
+#sensor-chips::-webkit-scrollbar { display: none; }
+.sensor-chip {
+  flex-shrink: 0; padding: 5px 13px; border-radius: 14px;
+  border: 1.5px solid var(--border); background: var(--bg3);
+  color: var(--text2); cursor: pointer; font-size: 12px;
+  white-space: nowrap; min-height: 34px; transition: border-color .15s, color .15s;
+}
+.sensor-chip.active { font-weight: 600; }
+
+/* ── Bottom nav (mobile) ── */
+#bottom-nav {
+  display: none; flex-shrink: 0; background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+.nav-btn {
+  flex: 1; padding: 12px 8px; border: none; background: none;
+  color: var(--text2); cursor: pointer; font-size: 13px;
+  border-top: 2px solid transparent; transition: color .15s;
+}
+.nav-btn.active { color: var(--accent); border-top-color: var(--accent); }
+.nav-btn.edit-active { color: var(--excl); border-top-color: var(--edit-border); }
+
+/* ── Mobile layout ── */
+@media (max-width: 640px) {
+  #sidebar { display: none; }
+  #sensor-chips { display: flex; }
+  #bottom-nav { display: flex; }
+  .tab-btn { display: none; }
+  #edit-btn { display: none; }
+  #mode-hint { display: none; }
+  #chart-area { padding: 8px 10px 6px; gap: 6px; }
+  .range-btn { padding: 7px 10px; min-height: 36px; }
+  #legend { gap: 6px 12px; font-size: 10px; }
+  .an-section { padding: 10px 12px; }
+  #view-analytics { padding: 8px; gap: 10px; }
+  .an-range-row { padding: 8px 8px 0 !important; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SensorPush Explorer</h1>
+  <button class="tab-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
+  <button class="tab-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
+  <button class="tab-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
+  <span id="poll-status"></span>
+  <div class="spacer"></div>
+  <button class="hdr-btn" onclick="init()">↺ Refresh</button>
+</header>
+
+<div id="sensor-chips"></div>
+<div id="body">
+  <div id="sidebar">
+    <div id="sidebar-hdr">
+      Sensors
+      <span>
+        <button onclick="selectAll()">All</button>
+        &nbsp;
+        <button onclick="selectNone()">None</button>
+      </span>
+    </div>
+    <div id="sensor-list"></div>
+  </div>
+
+  <div id="chart-area">
+    <div id="ctrl-row">
+      <div id="range-btns"></div>
+      <button id="custom-range-btn" class="range-btn" onclick="toggleCustomRange()">Custom…</button>
+      <button id="zoom-reset" onclick="resetZoom()">✕ Reset zoom</button>
+      <div class="ctrl-sep"></div>
+      <span id="mode-hint"></span>
+      <button id="edit-btn" onclick="toggleEditMode()">Edit</button>
+    </div>
+    <div id="custom-range-panel">
+      <input type="datetime-local" id="custom-start">
+      <span class="range-sep">→</span>
+      <input type="datetime-local" id="custom-end">
+      <button class="range-btn" onclick="applyCustomRange()">Apply</button>
+    </div>
+    <div id="chart-wrap">
+      <div id="chart-svg-wrap"></div>
+      <div id="tooltip"></div>
+      <div id="empty">Select at least one sensor</div>
+    </div>
+    <div id="legend"></div>
+  </div>
+
+  <div id="view-analytics" style="display:none">
+    <div class="an-range-row" style="display:flex;align-items:center;gap:6px;padding:12px 16px 0;flex-shrink:0">
+      <span style="font-size:11px;color:var(--text2)">Range:</span>
+      <button class="an-range-btn" data-range="24h"  onclick="setAnalyticsRange('24h')">24 h</button>
+      <button class="an-range-btn active" data-range="7d"   onclick="setAnalyticsRange('7d')">7 d</button>
+      <button class="an-range-btn" data-range="30d"  onclick="setAnalyticsRange('30d')">30 d</button>
+      <button class="an-range-btn" data-range="90d"  onclick="setAnalyticsRange('90d')">90 d</button>
+      <button class="an-range-btn" data-range="365d" onclick="setAnalyticsRange('365d')">1 yr</button>
+    </div>
+    <div id="analytics-content"></div>
+  </div>
+</div>
+
+<div id="view-settings" style="display:none">
+  <div class="set-section">
+    <h2>Range Buttons</h2>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="text" id="ranges-input" class="set-text-input" placeholder="e.g. 1h 24h 7d 30d 1yr" oninput="previewRanges()">
+      <button class="set-btn" onclick="saveRangeInput()">Save</button>
+    </div>
+    <div id="ranges-preview" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px"></div>
+    <p class="set-hint" style="margin-top:8px">Space-separated. Resolution is determined by unit: <b>h</b> = raw readings · <b>d</b> = hourly averages · <b>yr</b> = daily averages.</p>
+  </div>
+  <div class="set-section">
+    <h2>Backfill Historical Data</h2>
+    <p class="set-hint" style="margin-bottom:10px">Re-fetch all sensor readings from SensorPush from a start date to now. Safe to run anytime — existing data is never overwritten.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="date" id="backfill-date" class="set-text-input" style="flex:0 0 auto;width:160px;color-scheme:dark">
+      <button class="set-btn" id="backfill-btn" onclick="startBackfill()">Backfill</button>
+    </div>
+    <div id="backfill-status" style="margin-top:10px;font-size:12px;color:var(--text2)"></div>
+  </div>
+
+  <div class="set-section">
+    <h2>App</h2>
+    <button class="set-btn danger" onclick="hardRefresh()">Clear cache &amp; refresh</button>
+    <p class="set-hint">Unregisters the service worker, clears the PWA cache, and reloads to pick up the latest version.</p>
+  </div>
+</div>
+
+<div id="toast"></div>
+<nav id="bottom-nav">
+  <button class="nav-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
+  <button class="nav-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
+  <button class="nav-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
+  <button class="nav-btn" id="edit-nav-btn" onclick="toggleEditMode()">Edit</button>
+</nav>
+
+<script>
+'use strict';
+
+// Wong 2011 colorblind-safe palette
+const COLORS = ['#56B4E9','#E69F00','#009E73','#CC79A7','#D55E00','#0072B2','#F0E442'];
+
+function timeAgo(iso) {
+  if (!iso) return 'never';
+  const mins = (Date.now() - new Date(iso).getTime()) / 60000;
+  if (mins < 1)   return 'just now';
+  if (mins < 60)  return Math.round(mins) + ' min ago';
+  const hrs = mins / 60;
+  if (hrs < 24)   return Math.round(hrs) + ' hr ago';
+  return Math.round(hrs / 24) + ' d ago';
+}
+
+function seenClass(iso) {
+  if (!iso) return 'stale';
+  const mins = (Date.now() - new Date(iso).getTime()) / 60000;
+  if (mins > 30) return 'stale';
+  if (mins > 10) return 'warn';
+  return '';
+}
+
+function fmtDuration(secs) {
+  if (secs < 60)   return secs + ' sec';
+  if (secs < 3600) return Math.round(secs / 60) + ' min';
+  const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
+  if (secs < 86400) return h + ' hr' + (m ? ' ' + m + ' min' : '');
+  const d = Math.floor(secs / 86400), hr = Math.round((secs % 86400) / 3600);
+  return d + ' d' + (hr ? ' ' + hr + ' hr' : '');
+}
+
+// When accessed directly on port 3003, nginx isn't in the path so the
+// /api/sensors/ prefix doesn't exist — sensor-api routes are at /.
+const API_BASE = window.location.pathname.startsWith('/sensorpush') ? '/api/sensors' : '';
+
+// Fixed SVG logical canvas
+const W = 1000, H = 640;
+const PL = 52, PR = 58, PT = 18, PB = 34;
+const VGAP = 16; // gap between panels
+
+let _sensors   = {};
+let _selected  = new Set();
+// Which series per sensor are active: 'temp' | 'humidity' | 'pressure'
+let _series    = {};   // id → Set of active series names
+let _range     = '24h';
+let _colorMap  = {};
+let _chartData = {};   // id → { name, color, samples, resolution }
+
+// Interaction state
+let _editMode  = false;
+let _zoomTs    = null;   // { min, max } ms, or null
+let _autoRefreshTimer = null;
+let _touchHideTimer   = null;
+
+// Per-sensor threshold visibility
+let _showThresholds = {};  // id → boolean
+
+// Settings state
+const DEFAULT_RANGES = ['1h', '24h', '7d', '30d', '90d', '1yr'];
+let _settings = { ranges: [...DEFAULT_RANGES] };
+
+// Analytics state
+let _currentView          = 'explorer';
+let _analyticsRange       = '7d';
+let _analyticsData        = {};   // id → { gaps, sparseHours, coveragePct, rangeStartTs, rangeEndTs }
+let _analyticsSelectedId  = null;
+
+// ── Analytics ─────────────────────────────────────────────────────────────
+
+function switchView(name) {
+  _currentView = name;
+  // Sidebar stays visible for both explorer and analytics (desktop); settings gets full width.
+  document.getElementById('body').style.display           = name !== 'settings'  ? 'flex' : 'none';
+  document.getElementById('chart-area').style.display     = name === 'explorer'  ? 'flex' : 'none';
+  document.getElementById('view-analytics').style.display = name === 'analytics' ? 'flex' : 'none';
+  document.getElementById('view-settings').style.display  = name === 'settings'  ? 'flex' : 'none';
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  document.querySelectorAll('.nav-btn[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  if (name === 'analytics') loadAnalytics();
+  if (name === 'settings')  renderSettings();
+}
+
+function setAnalyticsRange(r) {
+  _analyticsRange = r;
+  document.querySelectorAll('.an-range-btn').forEach(b => b.classList.toggle('active', b.dataset.range === r));
+  loadAnalytics();
+}
+
+async function loadAnalytics() {
+  const ids = [..._selected];
+  if (!ids.length) { renderAnalytics(); return; }
+  const results = await Promise.all(ids.map(id =>
+    fetch(`${API_BASE}/${encodeURIComponent(id)}/gaps?range=${_analyticsRange}`)
+      .then(r => r.json()).catch(() => null)
+  ));
+  _analyticsData = {};
+  results.forEach((d, i) => { if (d?.ok) _analyticsData[ids[i]] = d; });
+  renderAnalytics();
+}
+
+function buildSlots(startTs, endTs, gaps, sparseHours, N = 120) {
+  const slotSecs = (endTs - startTs) / N;
+  const slots = new Array(N).fill('ok');
+  for (const g of gaps) {
+    const s = Math.floor((g.startTs - startTs) / slotSecs);
+    const e = Math.ceil((g.endTs   - startTs) / slotSecs);
+    for (let i = Math.max(0, s); i < Math.min(N, e); i++) slots[i] = 'gap';
+  }
+  for (const sh of (sparseHours || [])) {
+    const i = Math.floor((sh.hourTs - startTs) / slotSecs);
+    if (i >= 0 && i < N && slots[i] !== 'gap') slots[i] = 'sparse';
+  }
+  return slots;
+}
+
+function selectAnalyticsSensor(id) {
+  _analyticsSelectedId = (_analyticsSelectedId === id) ? null : id;
+  renderAnalytics();
+}
+
+function renderAnalytics() {
+  const ids = [..._selected].filter(id => _analyticsData[id]);
+  const el  = document.getElementById('analytics-content');
+
+  if (!ids.length) {
+    el.innerHTML = '<div style="color:var(--text2);padding:32px;text-align:center;font-size:13px">Select at least one sensor to see analytics.</div>';
+    return;
+  }
+
+  // Summary table
+  const summaryRows = ids.map(id => {
+    const d   = _analyticsData[id];
+    const s   = _sensors[id];
+    const top = d.gaps[0];
+    const sel = id === _analyticsSelectedId;
+    const cc  = d.coveragePct < 80 ? 'var(--excl)' : d.coveragePct < 95 ? 'var(--warn)' : 'var(--green)';
+    return `<tr class="clickable${sel ? ' selected' : ''}" onclick="selectAnalyticsSensor('${esc(id)}')">
+      <td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${_colorMap[id]||'#888'};margin-right:6px;vertical-align:middle"></span>${esc(s?.name||id)}</td>
+      <td style="color:${cc}">${d.coveragePct.toFixed(1)}%</td>
+      <td>${top ? fmtDuration(top.durationSecs) : '—'}</td>
+      <td${(d.sparseHours?.length||0)>5?' style="color:var(--warn)"':''}>${d.sparseHours?.length||0}${(d.sparseHours?.length||0)>5?' ⚠':''}</td>
+      <td class="${seenClass(s?.lastSeen)}">${timeAgo(s?.lastSeen)}</td>
+    </tr>`;
+  }).join('');
+
+  // Coverage timeline
+  const timelineRows = ids.map(id => {
+    const d     = _analyticsData[id];
+    const s     = _sensors[id];
+    const slots = buildSlots(d.rangeStartTs, d.rangeEndTs, d.gaps, d.sparseHours);
+    return `<div class="cov-row">
+      <div class="cov-label" title="${esc(s?.name||id)}">${esc(s?.name||id)}</div>
+      <div class="cov-bar" style="flex:1">${slots.map(st=>`<div class="cov-slot cov-${st}"></div>`).join('')}</div>
+    </div>`;
+  }).join('');
+
+  const legend = `<div style="display:flex;gap:14px;margin-top:8px;font-size:11px;color:var(--text2)">
+    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--green);opacity:0.75"></span>Good</span>
+    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--warn)"></span>Sparse</span>
+    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--bg4)"></span>Missing</span>
+  </div>`;
+
+  // Gap detail for selected sensor
+  let gapDetail = '';
+  if (_analyticsSelectedId && _analyticsData[_analyticsSelectedId]) {
+    const d    = _analyticsData[_analyticsSelectedId];
+    const name = esc(_sensors[_analyticsSelectedId]?.name || _analyticsSelectedId);
+    if (!d.gaps.length && !(d.sparseHours?.length)) {
+      gapDetail = `<div class="an-section"><h2>Gaps — ${name}</h2>
+        <div style="color:var(--text2);font-size:12px">No gaps or sparse hours detected.</div></div>`;
+    } else {
+      const gRows = d.gaps.map(g => `<tr>
+        <td>${fmtTs(g.startTs*1000)}</td><td>${fmtTs(g.endTs*1000)}</td>
+        <td>${fmtDuration(g.durationSecs)}</td>
+        <td style="color:var(--excl)">missing</td></tr>`).join('');
+      const sRows = (d.sparseHours||[]).slice(0,30).map(sh => `<tr>
+        <td>${fmtTs(sh.hourTs*1000)}</td><td>—</td>
+        <td>1 hr</td>
+        <td style="color:var(--warn)">${sh.sampleCount} readings</td></tr>`).join('');
+      gapDetail = `<div class="an-section"><h2>Gaps — ${name}</h2>
+        <table class="an-table">
+          <thead><tr><th>Start</th><th>End</th><th>Duration</th><th>Type</th></tr></thead>
+          <tbody>${gRows}${sRows}</tbody>
+        </table></div>`;
+    }
+  }
+
+  el.innerHTML = `
+    <div class="an-section">
+      <h2>Coverage Summary</h2>
+      <table class="an-table">
+        <thead><tr><th>Sensor</th><th>Coverage</th><th>Longest Gap</th><th>Sparse Hrs</th><th>Last Seen</th></tr></thead>
+        <tbody>${summaryRows}</tbody>
+      </table>
+    </div>
+    <div class="an-section">
+      <h2>Coverage Timeline — click a row above to see gap detail</h2>
+      ${timelineRows}${legend}
+    </div>
+    ${gapDetail}`;
+}
+
+// ── Fetch ──────────────────────────────────────────────────────────────────
+
+function updateLastUpdatedLabel() {
+  const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  document.getElementById('poll-status').textContent = 'Updated ' + t;
+}
+
+async function autoRefreshTick() {
+  try {
+    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    if (!sr.ok) return;
+    _sensors = sr.sensors;
+
+    document.querySelectorAll('.sensor-row[data-id]').forEach(row => {
+      const s = _sensors[row.dataset.id];
+      if (!s) return;
+      const temp = s.temperature  != null ? s.temperature.toFixed(1)  + '°F'   : '—';
+      const hum  = s.humidity     != null ? Math.round(s.humidity)    + '%'    : '—';
+      const baro = s.baroPressure != null ? s.baroPressure.toFixed(1) + ' hPa' : null;
+      const vals = row.querySelector('.sensor-vals');
+      if (vals) vals.textContent = temp + ' · ' + hum + (baro ? ' · ' + baro : '');
+      const seen = row.querySelector('.sensor-seen');
+      if (seen) { seen.textContent = timeAgo(s.lastSeen); seen.className = 'sensor-seen ' + seenClass(s.lastSeen); }
+    });
+
+    await refreshChart();
+    if (_currentView === 'analytics') await loadAnalytics();
+    updateLastUpdatedLabel();
+  } catch (e) {
+    console.warn('Auto-refresh failed:', e);
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  _autoRefreshTimer = setInterval(autoRefreshTick, 60_000);
+}
+
+function stopAutoRefresh() {
+  if (_autoRefreshTimer !== null) {
+    clearInterval(_autoRefreshTimer);
+    _autoRefreshTimer = null;
+  }
+}
+
+async function init() {
+  await loadSettings();
+  if (!_settings.ranges.includes(_range)) _range = _settings.ranges[0] || '24h';
+  renderRangeBtns();
+  document.getElementById('poll-status').textContent = 'Loading…';
+  try {
+    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    if (!sr.ok) throw new Error('API error');
+    _sensors = sr.sensors;
+
+    Object.keys(_sensors).forEach((id, i) => { _colorMap[id] = COLORS[i % COLORS.length]; });
+
+    // First load: auto-select all
+    if (_selected.size === 0) {
+      Object.keys(_sensors).forEach(id => {
+        _selected.add(id);
+        _series[id] = new Set(['temp', 'humidity', 'pressure']);
+      });
+    }
+
+    renderSidebar();
+    await refreshChart();
+    updateLastUpdatedLabel();
+    startAutoRefresh();
+  } catch (e) {
+    document.getElementById('poll-status').textContent = 'Error loading sensors';
+    console.error(e);
+  }
+}
+
+async function refreshChart() {
+  const ids = [..._selected];
+  if (!ids.length) {
+    document.getElementById('chart-svg-wrap').innerHTML = '';
+    document.getElementById('empty').style.display = 'flex';
+    document.getElementById('legend').innerHTML = '';
+    return;
+  }
+  document.getElementById('empty').style.display = 'none';
+
+  const results = await Promise.all(ids.map(id =>
+    fetch(`${API_BASE}/${encodeURIComponent(id)}/history/all?range=${_range}`)
+      .then(r => r.json()).catch(() => null)
+  ));
+
+  _chartData = {};
+  results.forEach((d, i) => {
+    if (!d?.ok) return;
+    _chartData[ids[i]] = {
+      name:       _sensors[ids[i]]?.name || ids[i],
+      color:      _colorMap[ids[i]],
+      samples:    d.samples,
+      resolution: d.resolution,
+    };
+  });
+
+  if (_editMode) return;
+  renderChart();
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+
+function renderSidebar() {
+  document.getElementById('sensor-list').innerHTML =
+    Object.values(_sensors).map(s => {
+      const active = _selected.has(s.id);
+      const color  = _colorMap[s.id] || '#888';
+      const temp   = s.temperature  != null ? s.temperature.toFixed(1)  + '°F'  : '—';
+      const hum    = s.humidity     != null ? Math.round(s.humidity)    + '%'   : '—';
+      const baro   = s.baroPressure != null ? s.baroPressure.toFixed(1) + ' hPa' : null;
+      const hasBaro = s.baroPressure != null ||
+        (_chartData[s.id]?.samples || []).some(x => x.baroPressure != null);
+      const ser = _series[s.id] || new Set();
+
+      const al = _sensors[s.id]?.alerts;
+      const hasAlerts = al && (al.temperature?.enabled || al.humidity?.enabled);
+      const serRows = active ? `<div class="series-rows">
+        <label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="temp" ${ser.has('temp')?'checked':''} onchange="toggleSeries(this)"> Temperature
+        </label>
+        <label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="humidity" ${ser.has('humidity')?'checked':''} onchange="toggleSeries(this)"> Humidity
+        </label>
+        ${hasBaro ? `<label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="pressure" ${ser.has('pressure')?'checked':''} onchange="toggleSeries(this)"> Pressure
+        </label>` : ''}
+        ${hasAlerts ? `<label class="series-row" style="margin-top:3px;border-top:1px solid var(--border);padding-top:5px">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" ${_showThresholds[s.id]?'checked':''} onchange="toggleThresholds(this)"> Thresholds
+        </label>` : ''}
+      </div>` : '';
+
+      return `<div class="sensor-row${active ? ' active' : ''}" data-id="${esc(s.id)}" onclick="toggleSensor(this.dataset.id)">
+        <div class="sensor-color" style="background:${color}"></div>
+        <div class="sensor-meta">
+          <div class="sensor-name" title="${esc(s.name)}">${esc(s.name)}</div>
+          <div class="sensor-vals">${temp} · ${hum}${baro ? ' · ' + baro : ''}</div>
+          <div class="sensor-seen ${seenClass(s.lastSeen)}">${timeAgo(s.lastSeen)}</div>
+        </div>
+      </div>${serRows}`;
+    }).join('');
+  renderSensorChips();
+}
+
+function renderSensorChips() {
+  const el = document.getElementById('sensor-chips');
+  if (!el) return;
+  const chips = Object.values(_sensors).map(s => {
+    const active = _selected.has(s.id);
+    const color  = _colorMap[s.id] || '#888';
+    const style  = active ? `border-color:${color};color:${color}` : '';
+    return `<button class="sensor-chip${active ? ' active' : ''}" style="${style}" data-id="${esc(s.id)}" onclick="toggleSensor('${esc(s.id)}')">${esc(s.name)}</button>`;
+  }).join('');
+  el.innerHTML =
+    `<button class="chip-ctrl" onclick="selectAll()">All</button>` +
+    `<button class="chip-ctrl" onclick="selectNone()">None</button>` +
+    `<div class="chip-divider"></div>` +
+    chips;
+}
+
+function toggleSeries(cb) {
+  cb.stopPropagation?.();
+  const id = cb.dataset.id, ser = cb.dataset.ser;
+  if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
+  if (cb.checked) _series[id].add(ser); else _series[id].delete(ser);
+  renderChart();
+}
+
+async function toggleSensor(id) {
+  if (_longHoldConsumed()) return;
+  if (_selected.has(id)) {
+    _selected.delete(id);
+  } else {
+    _selected.add(id);
+    if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
+  }
+  renderSidebar();
+  await refreshChart();
+  if (_currentView === 'analytics') loadAnalytics();
+}
+
+function soloSensor(id) {
+  _selected.clear();
+  _selected.add(id);
+  if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
+  // Auto-enable thresholds when isolating a sensor
+  if (_sensors[id]?.alerts) _showThresholds[id] = true;
+  renderSidebar();
+  refreshChart();
+  if (_currentView === 'analytics') loadAnalytics();
+}
+
+function toggleThresholds(cb) {
+  _showThresholds[cb.dataset.id] = cb.checked;
+  renderChart();
+}
+
+function selectAll()  { Object.keys(_sensors).forEach(id => { _selected.add(id); if(!_series[id]) _series[id]=new Set(['temp','humidity','pressure']); }); renderSidebar(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
+function selectNone() { _selected.clear(); renderSidebar(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
+
+// ── Range & zoom controls ──────────────────────────────────────────────────
+
+// ── Dynamic range buttons ──────────────────────────────────────────────────
+
+function rangeLabel(r) {
+  const m = /^(\d+)(h|d|yr)$/.exec(r);
+  if (!m) return r;
+  return m[2] === 'h' ? m[1] + ' hr' : m[2] === 'd' ? m[1] + ' d' : m[1] + ' yr';
+}
+
+function renderRangeBtns() {
+  document.getElementById('range-btns').innerHTML =
+    _settings.ranges.map(r =>
+      `<button class="range-btn${r === _range ? ' active' : ''}" data-range="${esc(r)}">${rangeLabel(r)}</button>`
+    ).join('');
+}
+
+// Single delegated listener — works for dynamically rendered buttons
+document.getElementById('range-btns').addEventListener('click', e => {
+  const btn = e.target.closest('[data-range]');
+  if (!btn) return;
+  document.querySelectorAll('#range-btns [data-range]').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('custom-range-panel').style.display = 'none';
+  document.getElementById('custom-range-btn').classList.remove('active');
+  document.getElementById('custom-range-btn').textContent = 'Custom…';
+  _range  = btn.dataset.range;
+  _zoomTs = null;
+  document.getElementById('zoom-reset').style.display = 'none';
+  refreshChart();
+});
+
+function resetZoom() {
+  _zoomTs = null;
+  document.getElementById('zoom-reset').style.display = 'none';
+  document.getElementById('custom-range-panel').style.display = 'none';
+  document.getElementById('custom-range-btn').classList.remove('active');
+  document.getElementById('custom-range-btn').textContent = 'Custom…';
+  document.querySelectorAll('#range-btns [data-range]').forEach(b => b.classList.toggle('active', b.dataset.range === _range));
+  renderChart();
+}
+
+// ── Custom range ───────────────────────────────────────────────────────────
+
+function toLocalDtInput(ms) {
+  const d = new Date(ms), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function toggleCustomRange() {
+  const panel = document.getElementById('custom-range-panel');
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  const now = Date.now();
+  document.getElementById('custom-start').value = toLocalDtInput(now - 86400000);
+  document.getElementById('custom-end').value   = toLocalDtInput(now);
+  panel.style.display = 'flex';
+}
+
+function applyCustomRange() {
+  const startMs = new Date(document.getElementById('custom-start').value).getTime();
+  const endMs   = new Date(document.getElementById('custom-end').value).getTime();
+  if (isNaN(startMs) || isNaN(endMs) || endMs <= startMs) return;
+  document.getElementById('custom-range-panel').style.display = 'none';
+  document.querySelectorAll('#range-btns [data-range]').forEach(b => b.classList.remove('active'));
+  document.getElementById('custom-range-btn').classList.add('active');
+  // Pick the smallest configured range that covers the span, or fall back
+  const spanSecs = (endMs - startMs) / 1000;
+  const covering = _settings.ranges
+    .map(r => ({ r, secs: rangeToSeconds(r) }))
+    .filter(x => x.secs >= spanSecs)
+    .sort((a, b) => a.secs - b.secs)[0];
+  _range  = covering ? covering.r : _settings.ranges[_settings.ranges.length - 1] || '365d';
+  _zoomTs = { min: startMs, max: endMs };
+  document.getElementById('zoom-reset').style.display = '';
+  refreshChart();
+}
+
+// Client-side mirror of server's rangeToSeconds for applyCustomRange
+function rangeToSeconds(r) {
+  const m = /^(\d+)(h|d|yr)$/.exec(r);
+  if (!m) return 0;
+  const n = parseInt(m[1]);
+  return m[2] === 'h' ? n * 3600 : m[2] === 'd' ? n * 86400 : n * 31536000;
+}
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+function parseRangeInput(text) {
+  return text.trim().split(/[\s,]+/)
+    .map(s => s.trim().toLowerCase()
+      .replace(/hrs?$/, 'h')
+      .replace(/years?$/, 'yr')
+      .replace(/days?$/, 'd')
+    )
+    .filter(s => /^\d+(h|d|yr)$/.test(s) && parseInt(s) > 0)
+    .filter((s, i, a) => a.indexOf(s) === i);
+}
+
+let _toastTimer = null;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+async function loadSettings() {
+  try {
+    const resp = await fetch(`${API_BASE}/settings`).then(r => r.json());
+    if (resp.ok && Array.isArray(resp.settings?.ranges) && resp.settings.ranges.length) {
+      _settings.ranges = resp.settings.ranges.filter(r => /^\d+(h|d|yr)$/.test(r));
+      return;
+    }
+  } catch(e) {}
+  // Fallback: migrate from localStorage
+  try {
+    const s = JSON.parse(localStorage.getItem('sp_settings') || '{}');
+    const raw = Array.isArray(s.ranges) ? s.ranges : (Array.isArray(s.visibleRanges) ? s.visibleRanges : []);
+    const parsed = raw.filter(r => /^\d+(h|d|yr)$/.test(r));
+    if (parsed.length) _settings.ranges = parsed;
+  } catch(e) {}
+}
+
+async function saveSettings() {
+  try {
+    await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_settings),
+    });
+  } catch(e) {
+    localStorage.setItem('sp_settings', JSON.stringify(_settings));
+  }
+}
+
+async function renderSettings() {
+  document.getElementById('ranges-input').value = _settings.ranges.join(' ');
+  previewRanges();
+  // Resume progress display if a backfill is already in progress
+  try {
+    const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
+    _updateBackfillStatus(state);
+    if (state.status === 'running') _schedulePollBackfill();
+  } catch(e) {}
+}
+
+function rangeResolution(r) {
+  const u = /^(\d+)(h|d|yr)$/.exec(r)?.[2];
+  return u === 'h' ? 'raw' : u === 'd' ? 'hourly' : 'daily';
+}
+
+function previewRanges() {
+  const parsed = parseRangeInput(document.getElementById('ranges-input').value);
+  const el = document.getElementById('ranges-preview');
+  el.innerHTML = parsed.map(r => {
+    const res = rangeResolution(r);
+    const resColor = res === 'raw' ? 'var(--accent)' : res === 'hourly' ? 'var(--warn)' : '#b48eff';
+    return `<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;font-size:11px"><span>${rangeLabel(r)}</span><span style="color:${resColor};font-size:10px">${res}</span></span>`;
+  }).join('');
+}
+
+async function saveRangeInput() {
+  const parsed = parseRangeInput(document.getElementById('ranges-input').value);
+  if (!parsed.length) return;
+  if (!parsed.includes(_range)) _range = parsed[0];
+  _settings.ranges = parsed;
+  await saveSettings();
+  document.getElementById('ranges-input').value = parsed.join(' ');
+  renderRangeBtns();
+  showToast('Saved ✓');
+}
+
+let _backfillPollTimer = null;
+
+async function startBackfill() {
+  const dateVal = document.getElementById('backfill-date').value;
+  if (!dateVal) { showToast('Pick a start date first'); return; }
+  const btn = document.getElementById('backfill-btn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`${API_BASE}/backfill`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromDate: dateVal }),
+    }).then(r => r.json());
+    if (!resp.ok) { showToast('Error: ' + resp.error); btn.disabled = false; return; }
+    _updateBackfillStatus({ status: 'running', progress: { done: 0, total: 0, inserted: 0 } });
+    _schedulePollBackfill();
+  } catch(e) {
+    showToast('Backfill request failed');
+    btn.disabled = false;
+  }
+}
+
+function _updateBackfillStatus(state) {
+  const el  = document.getElementById('backfill-status');
+  const btn = document.getElementById('backfill-btn');
+  if (!el) return;
+  if (state.status === 'running') {
+    const p = state.progress;
+    const pct = p?.total ? Math.round(p.done / p.total * 100) : 0;
+    let eta = '';
+    if (p?.done > 1 && p?.total && state.startedAt) {
+      const elapsedMs  = Date.now() - state.startedAt;
+      const remainingMs = (elapsedMs / p.done) * (p.total - p.done);
+      eta = ` · ~${fmtDuration(Math.round(remainingMs / 1000))} remaining`;
+    }
+    el.innerHTML = `<span style="color:var(--warn)">⏳ Backfilling… ${p?.done ?? 0}/${p?.total ?? '?'} chunks (${pct}%)${eta} · ${p?.inserted ?? 0} new readings</span>`;
+    if (btn) btn.disabled = true;
+  } else if (state.status === 'done') {
+    el.innerHTML = `<span style="color:var(--green)">✓ Done — ${state.progress?.inserted ?? 0} new readings inserted</span>`;
+    if (btn) btn.disabled = false;
+  } else if (state.status === 'error') {
+    el.innerHTML = `<span style="color:var(--excl)">✗ Error: ${state.error}</span>`;
+    if (btn) btn.disabled = false;
+  } else {
+    el.innerHTML = '';
+    if (btn) btn.disabled = false;
+  }
+}
+
+function _schedulePollBackfill() {
+  clearTimeout(_backfillPollTimer);
+  _backfillPollTimer = setTimeout(async () => {
+    try {
+      const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
+      _updateBackfillStatus(state);
+      if (state.status === 'running') _schedulePollBackfill();
+      else if (state.status === 'done') showToast('Backfill complete ✓');
+    } catch(e) { /* silently retry */ _schedulePollBackfill(); }
+  }, 2000);
+}
+
+async function hardRefresh() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+  } catch(e) {}
+  location.reload(true);
+}
+
+function toggleEditMode() {
+  _editMode = !_editMode;
+  const btn = document.getElementById('edit-btn');
+  btn.classList.toggle('active', _editMode);
+  btn.textContent = _editMode ? 'Done' : 'Edit';
+  document.getElementById('mode-hint').textContent = _editMode
+    ? 'Click a data point to exclude / restore it'
+    : '';
+  const editNavBtn = document.getElementById('edit-nav-btn');
+  if (editNavBtn) editNavBtn.classList.toggle('edit-active', _editMode);
+  renderChart();
+}
+
+// ── Chart rendering ────────────────────────────────────────────────────────
+
+function renderChart() {
+  const entries = Object.entries(_chartData).filter(([, d]) => d.samples.length > 0);
+  const wrap    = document.getElementById('chart-svg-wrap');
+
+  if (!entries.length) {
+    wrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text3)">No data for selected range</div>`;
+    document.getElementById('legend').innerHTML = '';
+    return;
+  }
+
+  const allSamples = entries.flatMap(([, d]) => d.samples);
+  const allIncl    = allSamples.filter(s => !s.excluded);
+  if (!allIncl.length) {
+    wrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text3)">All data points are excluded</div>`;
+    return;
+  }
+
+  // Determine which series types are actually active across selected sensors
+  const showTemp  = entries.some(([id]) => (_series[id]||new Set()).has('temp'));
+  const showHum   = entries.some(([id]) => (_series[id]||new Set()).has('humidity'));
+  const showBaro  = entries.some(([id]) => (_series[id]||new Set()).has('pressure') &&
+    (_chartData[id]?.samples||[]).some(s => s.baroPressure != null));
+
+  // Count active panels to divide height
+  const panels = [showTemp, showHum, showBaro].filter(Boolean).length || 1;
+  const panelFracs = [];
+  if (showTemp)  panelFracs.push(showBaro ? 0.50 : showHum ? 0.58 : 1.0);
+  if (showHum)   panelFracs.push(showBaro ? 0.32 : 0.42);
+  if (showBaro)  panelFracs.push(0.18);
+
+  // X range — zoom overrides data range
+  const dataMin = Math.min(...allSamples.map(s => s.ts)) * 1000;
+  const dataMax = Math.max(...allSamples.map(s => s.ts)) * 1000;
+  const xMin = _zoomTs ? _zoomTs.min : dataMin;
+  const xMax = _zoomTs ? _zoomTs.max : dataMax;
+  if (xMin >= xMax) { wrap.innerHTML = ''; return; }
+
+  // Samples in view (with small buffer for connecting lines)
+  const bufMs = (xMax - xMin) * 0.01;
+  function inView(s) { return s.ts * 1000 >= xMin - bufMs && s.ts * 1000 <= xMax + bufMs; }
+
+  const inclInView = allIncl.filter(inView);
+  if (!inclInView.length) {
+    wrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text3)">No data in selected zoom range</div>`;
+    return;
+  }
+
+  // Layout
+  const cW = W - PL - PR;
+  const cH = H - PT - PB - VGAP * (panels - 1);
+  let panelTops = [], panelHeights = [];
+  let cursor = PT;
+  panelFracs.forEach(f => {
+    const h = Math.floor(cH * f);
+    panelTops.push(cursor);
+    panelHeights.push(h);
+    cursor += h + VGAP;
+  });
+
+  // Map panel index to type
+  const panelTypes = [];
+  if (showTemp) panelTypes.push('temp');
+  if (showHum)  panelTypes.push('hum');
+  if (showBaro) panelTypes.push('baro');
+
+  function panelIdx(type) { return panelTypes.indexOf(type); }
+  function panelTop(type)    { const i = panelIdx(type); return i < 0 ? 0 : panelTops[i]; }
+  function panelHeight(type) { const i = panelIdx(type); return i < 0 ? 0 : panelHeights[i]; }
+
+  function xp(tsMs) { return PL + (tsMs - xMin) / (xMax - xMin) * cW; }
+
+  // Y scales
+  function makeYScale(vals, pad = 0.12, minSpan = 2) {
+    if (!vals.length) return { min: 0, max: 1, fn: () => 0 };
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const span = Math.max(hi - lo, minSpan);
+    lo -= span * pad; hi += span * pad;
+    return { min: lo, max: hi };
+  }
+
+  let yTFn, yHFn, yBFn;
+
+  if (showTemp) {
+    const allT = inclInView.flatMap(s => [s.temperature, s.tempMin, s.tempMax]).filter(v => v != null);
+    // Expand scale to include threshold values so they're always visible
+    for (const [id] of entries) {
+      if (!_showThresholds[id]) continue;
+      const al = _sensors[id]?.alerts;
+      if (al?.temperature?.enabled) {
+        if (al.temperature.max != null) allT.push(al.temperature.max);
+        if (al.temperature.min != null) allT.push(al.temperature.min);
+      }
+    }
+    const sc = makeYScale(allT, 0.12, 2);
+    const top = panelTop('temp'), ht = panelHeight('temp');
+    yTFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
+    yTFn.sc = sc;
+  }
+  if (showHum) {
+    const allH = inclInView.map(s => s.humidity).filter(v => v != null);
+    for (const [id] of entries) {
+      if (!_showThresholds[id]) continue;
+      const al = _sensors[id]?.alerts;
+      if (al?.humidity?.enabled) {
+        if (al.humidity.max != null) allH.push(al.humidity.max);
+        if (al.humidity.min != null) allH.push(al.humidity.min);
+      }
+    }
+    const sc = makeYScale(allH, 0.12, 5);
+    const top = panelTop('hum'), ht = panelHeight('hum');
+    yHFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
+    yHFn.sc = sc;
+  }
+  if (showBaro) {
+    const allB = inclInView.map(s => s.baroPressure).filter(v => v != null);
+    const sc = makeYScale(allB, 0.12, 0.05);
+    const top = panelTop('baro'), ht = panelHeight('baro');
+    yBFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
+    yBFn.sc = sc;
+  }
+
+  // ── Grid & axes ──
+  let gridSvg = '', labelSvg = '';
+  const chartBottom = panelTops[panelTops.length - 1] + panelHeights[panelHeights.length - 1];
+
+  function addGrid(fn, step, fmt, side) {
+    const { min, max } = fn.sc;
+    for (let v = Math.ceil(min / step) * step; v <= max; v += step) {
+      const y = fn(v).toFixed(1);
+      gridSvg += `<line x1="${PL}" y1="${y}" x2="${PL+cW}" y2="${y}" stroke="#222" stroke-width="1"/>`;
+      if (side === 'left')
+        labelSvg += `<text x="${PL-5}" y="${(+y+4).toFixed(1)}" text-anchor="end" font-size="10" fill="#555">${fmt(v)}</text>`;
+      else
+        labelSvg += `<text x="${PL+cW+5}" y="${(+y+4).toFixed(1)}" text-anchor="start" font-size="10" fill="#555">${fmt(v)}</text>`;
+    }
+  }
+
+  if (yTFn) {
+    const span = yTFn.sc.max - yTFn.sc.min;
+    const step = span <= 8 ? 1 : span <= 25 ? 2 : 5;
+    addGrid(yTFn, step, v => v + '°', 'left');
+  }
+  if (yHFn) {
+    const span = yHFn.sc.max - yHFn.sc.min;
+    addGrid(yHFn, span <= 20 ? 5 : 10, v => Math.round(v) + '%', 'right');
+  }
+  if (yBFn) {
+    const span = yBFn.sc.max - yBFn.sc.min;
+    const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
+    addGrid(yBFn, step, v => v.toFixed(2), 'right');
+  }
+
+  // Panel borders and labels
+  let axesSvg = '';
+  panelTypes.forEach((type, i) => {
+    const top = panelTops[i], ht = panelHeights[i];
+    const label = type === 'temp' ? 'TEMPERATURE' : type === 'hum' ? 'HUMIDITY' : 'PRESSURE (inHg)';
+    axesSvg +=
+      `<line x1="${PL}" y1="${top}" x2="${PL}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
+      `<line x1="${PL}" y1="${top+ht}" x2="${PL+cW}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
+      `<text x="${PL+4}" y="${top+11}" font-size="9" fill="#444" font-weight="600" letter-spacing=".05em">${label}</text>`;
+    if (i > 0) {
+      // dashed separator above each panel except first
+      axesSvg += `<line x1="${PL}" y1="${top-VGAP/2}" x2="${PL+cW}" y2="${top-VGAP/2}" stroke="#222" stroke-width="0.5" stroke-dasharray="2,6"/>`;
+    }
+  });
+
+  // X-axis labels & day lines
+  const isLong = (xMax - xMin) > 2 * 86400 * 1000;
+  let xLabels = '';
+  const xLabelY = H - PB + 14;
+  if (isLong) {
+    const dayMs = 86400 * 1000;
+    const d0 = new Date(xMin);
+    const midnight0 = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() + 1).getTime();
+    const bounds = [];
+    for (let dt = midnight0; dt <= xMax; dt += dayMs) bounds.push(dt);
+    const everyN = Math.max(1, Math.ceil(bounds.length / 8));
+    bounds.forEach((dt, i) => {
+      const lx = xp(dt).toFixed(1);
+      gridSvg += `<line x1="${lx}" y1="${PT}" x2="${lx}" y2="${chartBottom}" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="2,6"/>`;
+      if (i % everyN === 0)
+        xLabels += `<text x="${lx}" y="${xLabelY}" text-anchor="middle" font-size="10" fill="#555">${new Date(dt).toLocaleDateString([],{month:'short',day:'numeric'})}</text>`;
+    });
+  } else {
+    const nT = Math.min(7, Math.floor(cW / 100));
+    for (let i = 0; i <= nT; i++) {
+      const tt = xMin + i / nT * (xMax - xMin);
+      xLabels += `<text x="${xp(tt).toFixed(1)}" y="${xLabelY}" text-anchor="middle" font-size="10" fill="#555">${new Date(tt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</text>`;
+    }
+  }
+
+  // ── Threshold zones + lines (drawn behind data) ──
+  // Danger zones are red-tinted fills that make out-of-range data visually obvious.
+  let thresholdSvg = '';
+  for (const [id, { color }] of entries) {
+    if (!_showThresholds[id]) continue;
+    const alerts = _sensors[id]?.alerts;
+    if (!alerts) continue;
+    const ser = _series[id] || new Set(['temp', 'humidity', 'pressure']);
+
+    const drawThreshold = (fn, pType, value, isMax, label) => {
+      if (value == null || !fn) return;
+      const yTop = panelTop(pType), yBot = yTop + panelHeight(pType);
+      const y    = fn(value);
+
+      // Danger zone fill — clamped to panel bounds so it never bleeds into other panels.
+      // Even if the threshold is off-scale (all data already in danger), fill the full panel.
+      if (isMax) {
+        const fillH = (Math.min(yBot, Math.max(yTop, y)) - yTop).toFixed(1);
+        if (+fillH > 0.5)
+          thresholdSvg += `<rect x="${PL}" y="${yTop}" width="${cW}" height="${fillH}" fill="#ff5c5c" fill-opacity=".10"/>`;
+      } else {
+        const fillTop = Math.min(yBot, Math.max(yTop, y));
+        const fillH   = (yBot - fillTop).toFixed(1);
+        if (+fillH > 0.5)
+          thresholdSvg += `<rect x="${PL}" y="${fillTop.toFixed(1)}" width="${cW}" height="${fillH}" fill="#ff5c5c" fill-opacity=".10"/>`;
+      }
+
+      // Threshold line + label — only when the value falls within the visible scale.
+      if (y >= yTop && y <= yBot) {
+        const yStr = y.toFixed(1);
+        thresholdSvg +=
+          `<line x1="${PL}" y1="${yStr}" x2="${PL + cW}" y2="${yStr}" stroke="#ff5c5c" stroke-width="1.5" stroke-dasharray="5,4" opacity=".7"/>` +
+          `<text x="${PL + cW - 3}" y="${(+yStr - 3).toFixed(1)}" text-anchor="end" font-size="9" fill="#ff5c5c" opacity=".75">${isMax ? 'max' : 'min'} ${label}</text>`;
+      }
+    };
+
+    if (alerts.temperature?.enabled && yTFn && ser.has('temp')) {
+      if (alerts.temperature.max != null) drawThreshold(yTFn, 'temp', alerts.temperature.max, true,  alerts.temperature.max + '°');
+      if (alerts.temperature.min != null) drawThreshold(yTFn, 'temp', alerts.temperature.min, false, alerts.temperature.min + '°');
+    }
+    if (alerts.humidity?.enabled && yHFn && ser.has('humidity')) {
+      if (alerts.humidity.max != null) drawThreshold(yHFn, 'hum', alerts.humidity.max, true,  Math.round(alerts.humidity.max) + '%');
+      if (alerts.humidity.min != null) drawThreshold(yHFn, 'hum', alerts.humidity.min, false, Math.round(alerts.humidity.min) + '%');
+    }
+  }
+
+  // ── Data paths ──
+  let dataSvg = '';
+  const clickTargets = []; // { id, ts, cx, panelCys: {temp,hum,baro}, excluded, resolution }
+
+  for (const [id, { color, samples, resolution }] of entries) {
+    const ser    = _series[id] || new Set(['temp','humidity','pressure']);
+    const pts    = samples.filter(inView);
+    const incl   = pts.filter(s => !s.excluded);
+    const exclPts= pts.filter(s =>  s.excluded);
+
+    if (showTemp && ser.has('temp') && yTFn && incl.length >= 2) {
+      // Band (hourly and daily both carry tempMin/tempMax)
+      if (resolution !== 'raw') {
+        const band = incl.filter(s => s.tempMin != null && s.tempMax != null);
+        if (band.length >= 2) {
+          const top = band.map(s => `${xp(s.ts*1000).toFixed(1)},${yTFn(s.tempMax).toFixed(1)}`);
+          const bot = [...band].reverse().map(s => `${xp(s.ts*1000).toFixed(1)},${yTFn(s.tempMin).toFixed(1)}`);
+          dataSvg += `<polygon points="${[...top,...bot].join(' ')}" fill="${color}" fill-opacity=".10" stroke="none"/>`;
+        }
+      }
+      const tp = incl.filter(s => s.temperature != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yTFn(s.temperature).toFixed(1)}`).join('');
+      if (tp) dataSvg += `<path d="${tp}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
+
+    if (showHum && ser.has('humidity') && yHFn && incl.length >= 2) {
+      const hp = incl.filter(s => s.humidity != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yHFn(s.humidity).toFixed(1)}`).join('');
+      if (hp) dataSvg += `<path d="${hp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5,3" opacity=".65"/>`;
+    }
+
+    if (showBaro && ser.has('pressure') && yBFn) {
+      const bp = incl.filter(s => s.baroPressure != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yBFn(s.baroPressure).toFixed(1)}`).join('');
+      if (bp) dataSvg += `<path d="${bp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity=".55"/>`;
+    }
+
+    // Excluded markers (✕) — always visible so you can see what was excluded
+    for (const s of exclPts) {
+      const cx = xp(s.ts*1000).toFixed(1);
+      if (yTFn && s.temperature != null)
+        dataSvg += `<text x="${cx}" y="${yTFn(s.temperature).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12" fill="#5a2a2a" class="excl-x" data-sid="${esc(id)}" data-ts="${s.ts}" data-res="${resolution}" style="cursor:${_editMode?'pointer':'default'}">✕</text>`;
+    }
+
+    // Edit-mode point markers (small circles to indicate clickability)
+    if (_editMode) {
+      for (const s of incl) {
+        if (yTFn && s.temperature != null) {
+          const cx = xp(s.ts*1000).toFixed(1);
+          const cy = yTFn(s.temperature).toFixed(1);
+          dataSvg += `<circle cx="${cx}" cy="${cy}" r="3" fill="${color}" fill-opacity=".5" stroke="${color}" stroke-width="1" style="cursor:pointer" class="edit-dot" data-sid="${esc(id)}" data-ts="${s.ts}" data-res="${resolution}"/>`;
+        }
+      }
+    }
+
+    // Invisible click targets
+    for (const s of pts) {
+      if (s.temperature != null && yTFn) {
+        const panelCys = { temp: yTFn(s.temperature) };
+        if (yHFn && s.humidity    != null) panelCys.hum  = yHFn(s.humidity);
+        if (yBFn && s.baroPressure!= null) panelCys.baro = yBFn(s.baroPressure);
+        clickTargets.push({ id, ts: s.ts, cx: xp(s.ts*1000), panelCys, excluded: !!s.excluded, resolution });
+      }
+    }
+  }
+
+  // Selection rectangle (updated dynamically on drag)
+  const selRectSvg = `<rect id="sel-rect" x="0" y="${PT}" width="0" height="${chartBottom-PT}" fill="var(--accent)" fill-opacity=".08" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4,4" display="none"/>`;
+
+  // Crosshair + hit area
+  const hitSvg =
+    `<line id="ch" x1="0" y1="${PT}" x2="0" y2="${chartBottom}" stroke="#444" stroke-width="1" stroke-dasharray="4,4" display="none"/>` +
+    selRectSvg +
+    `<rect id="hit" x="${PL}" y="${PT}" width="${cW}" height="${chartBottom-PT}" fill="transparent" style="cursor:${_editMode?'crosshair':'crosshair'}"/>`;
+
+  const chartCursor = _editMode ? 'crosshair' : 'crosshair';
+
+  wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" id="chart">
+    ${gridSvg}${axesSvg}${labelSvg}${xLabels}${thresholdSvg}${dataSvg}${hitSvg}
+  </svg>`;
+
+  // ── Legend ──
+  const legItems = [];
+  entries.forEach(([id, { name, color }]) => {
+    const ser = _series[id] || new Set(['temp','humidity','pressure']);
+    const hasBaro = (_chartData[id]?.samples || []).some(s => s.baroPressure != null);
+    if (showTemp && ser.has('temp'))
+      legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${color}"></div>${esc(name)} temp</div>`);
+    if (showHum && ser.has('humidity'))
+      legItems.push(`<div class="leg-item" style="color:${color};opacity:.65"><div class="leg-dash"></div>${esc(name)} humidity</div>`);
+    if (showBaro && ser.has('pressure') && hasBaro)
+      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} pressure</div>`);
+  });
+  document.getElementById('legend').innerHTML = legItems.join('');
+
+  // ── Mouse interaction ──
+  const svgEl   = wrap.querySelector('#chart');
+  const hitEl   = svgEl.querySelector('#hit');
+  const chLine  = svgEl.querySelector('#ch');
+  const selRect = svgEl.querySelector('#sel-rect');
+  const tooltip = document.getElementById('tooltip');
+  const wrapEl  = document.getElementById('chart-wrap');
+
+  let dragStart = null; // { svgX, clientX }
+
+  function toSvg(e) {
+    const r = svgEl.getBoundingClientRect();
+    return {
+      svgX:    (e.clientX - r.left) / r.width  * W,
+      svgY:    (e.clientY - r.top)  / r.height * H,
+      clientX: e.clientX,
+      clientY: e.clientY,
+    };
+  }
+
+  function showTooltip(svgX, clientX, clientY) {
+    const hoverMs = xMin + (svgX - PL) / cW * (xMax - xMin);
+    let html = `<div class="tt-time">${fmtTs(hoverMs)}</div>`;
+
+    for (const [id, { name, color, samples }] of entries) {
+      const ser = _series[id] || new Set(['temp','humidity','pressure']);
+      const pts = samples.filter(inView);
+      if (!pts.length) continue;
+      const near = pts.reduce((a, b) =>
+        Math.abs(b.ts * 1000 - hoverMs) < Math.abs(a.ts * 1000 - hoverMs) ? b : a);
+      const temp = near.temperature  != null ? near.temperature.toFixed(1) + '°F' : null;
+      const hum  = near.humidity     != null ? Math.round(near.humidity)   + '%'  : null;
+      const baro = near.baroPressure != null ? near.baroPressure.toFixed(2) + '"' : null;
+      const exTag = near.excluded ? '<span class="tt-excl">excl</span>' : '';
+      const vals = [ser.has('temp') && temp, ser.has('humidity') && hum, ser.has('pressure') && baro]
+        .filter(Boolean).join(' · ') || '—';
+      html += `<div class="tt-row">
+        <div class="tt-dot" style="background:${color}"></div>
+        <span class="tt-name">${esc(name)}${exTag}</span>
+        <span class="tt-vals">${vals}</span>
+      </div>`;
+    }
+
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    const wr = wrapEl.getBoundingClientRect();
+    let left = clientX - wr.left + 14;
+    let top  = clientY - wr.top  - 28;
+    if (left + 270 > wr.width)  left = clientX - wr.left - 280;
+    if (top  < 0)               top  = 4;
+    if (top + 160 > wr.height)  top  = wr.height - 164;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top  = top  + 'px';
+  }
+
+  hitEl.addEventListener('mousemove', e => {
+    const { svgX, clientX, clientY } = toSvg(e);
+    if (svgX < PL || svgX > PL + cW) return;
+
+    if (dragStart && !_editMode) {
+      // Drawing selection rectangle
+      const x1 = Math.min(dragStart.svgX, svgX);
+      const x2 = Math.max(dragStart.svgX, svgX);
+      selRect.setAttribute('x', x1);
+      selRect.setAttribute('width', x2 - x1);
+      selRect.removeAttribute('display');
+      chLine.setAttribute('display', 'none');
+      tooltip.style.display = 'none';
+    } else {
+      // Normal hover: crosshair + tooltip
+      chLine.setAttribute('x1', svgX); chLine.setAttribute('x2', svgX);
+      chLine.removeAttribute('display');
+      showTooltip(svgX, clientX, clientY);
+    }
+  });
+
+  hitEl.addEventListener('mouseleave', () => {
+    if (!dragStart) {
+      chLine.setAttribute('display', 'none');
+      tooltip.style.display = 'none';
+    }
+  });
+
+  hitEl.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    dragStart = { svgX: toSvg(e).svgX };
+    e.preventDefault();
+  });
+
+  // Global mouseup (handles release outside the hit area)
+  function onMouseUp(e) {
+    if (!dragStart) return;
+    const { svgX, svgY } = toSvg(e);
+    const dx = Math.abs(svgX - dragStart.svgX);
+
+    if (!_editMode && dx > 10) {
+      // Zoom to selection
+      const x1Ms = xMin + (Math.min(dragStart.svgX, svgX) - PL) / cW * (xMax - xMin);
+      const x2Ms = xMin + (Math.max(dragStart.svgX, svgX) - PL) / cW * (xMax - xMin);
+      _zoomTs = { min: x1Ms, max: x2Ms };
+      document.getElementById('zoom-reset').style.display = '';
+      dragStart = null;
+      renderChart();
+      return;
+    }
+
+    // Short click in edit mode → exclude nearest point
+    if (_editMode && dx <= 10) {
+      const clickSvgX = dragStart.svgX;
+      const clickSvgY = svgY;
+      let best = null, bestDist = Infinity;
+      for (const pt of clickTargets) {
+        const dx2 = pt.cx - clickSvgX;
+        const dy2 = pt.panelCys.temp != null ? pt.panelCys.temp - clickSvgY : Infinity;
+        const dist = Math.sqrt(dx2*dx2 + dy2*dy2);
+        if (dist < bestDist && dist < 22) { bestDist = dist; best = pt; }
+      }
+      if (best) {
+        excludeToggle(best.id, best.ts, !best.excluded, best.resolution);
+      }
+    }
+
+    selRect.setAttribute('display', 'none');
+    dragStart = null;
+  }
+
+  svgEl.addEventListener('mouseup', onMouseUp);
+  document.addEventListener('mouseup', onMouseUp, { once: true });
+
+  // Restore excluded point by clicking its ✕ marker (edit mode only)
+  svgEl.addEventListener('click', async e => {
+    if (!_editMode) return;
+    const x = e.target.closest('.excl-x');
+    if (x) await excludeToggle(x.dataset.sid, parseInt(x.dataset.ts), false, x.dataset.res);
+  });
+
+  // Touch: tap to show tooltip, auto-hide after 3 s
+  let _touchAnchorX = null;
+  hitEl.addEventListener('touchstart', e => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    _touchAnchorX = toSvg({ clientX: t.clientX, clientY: t.clientY }).svgX;
+  }, { passive: true });
+
+  hitEl.addEventListener('touchend', e => {
+    if (_touchAnchorX === null) return;
+    const t = e.changedTouches[0];
+    const { svgX, clientX, clientY } = toSvg({ clientX: t.clientX, clientY: t.clientY });
+    const moved = Math.abs(svgX - _touchAnchorX);
+    _touchAnchorX = null;
+    if (moved > 15 || svgX < PL || svgX > PL + cW) return;
+    chLine.setAttribute('x1', svgX); chLine.setAttribute('x2', svgX);
+    chLine.removeAttribute('display');
+    showTooltip(svgX, clientX, clientY);
+    clearTimeout(_touchHideTimer);
+    _touchHideTimer = setTimeout(() => {
+      chLine.setAttribute('display', 'none');
+      tooltip.style.display = 'none';
+    }, 3000);
+  }, { passive: true });
+}
+
+async function excludeToggle(sensorId, ts, excluded, resolution) {
+  if (resolution === 'daily') return; // daily points are on-the-fly aggregates; no per-point exclusion
+  const isRaw = resolution === 'raw';
+  const url   = isRaw
+    ? `${API_BASE}/${encodeURIComponent(sensorId)}/readings/exclude`
+    : `${API_BASE}/${encodeURIComponent(sensorId)}/hourly/exclude`;
+  const body  = isRaw ? { ts, excluded } : { hour_ts: ts, excluded };
+  await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  await refreshChart();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function fmtTs(ms) {
+  return new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── PWA ────────────────────────────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  const swPath = window.location.pathname.startsWith('/sensorpush')
+    ? '/sensorpush/sw.js' : '/sw.js';
+  navigator.serviceWorker.register(swPath).catch(() => {});
+}
+
+// ── Long-hold solo filter ─────────────────────────────────────────────────
+// Hold a sensor name for 600 ms to isolate it (deselect all others).
+// Uses event delegation so it works on dynamically re-rendered rows/chips.
+const _longHoldConsumed = (() => {
+  let timer = null, fired = false;
+
+  function start(id) {
+    cancel();
+    fired = false;
+    timer = setTimeout(() => { fired = true; soloSensor(id); }, 600);
+  }
+  function cancel() { clearTimeout(timer); timer = null; }
+
+  function attachTo(el, getIdFromTarget) {
+    el.addEventListener('pointerdown', e => {
+      const id = getIdFromTarget(e.target);
+      if (id) start(id);
+    });
+    el.addEventListener('pointerup',     cancel);
+    el.addEventListener('pointercancel', cancel);
+    el.addEventListener('pointermove', e => {
+      if (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5) cancel();
+    });
+  }
+
+  attachTo(document.getElementById('sensor-list'), t => t.closest('.sensor-row[data-id]')?.dataset.id);
+  attachTo(document.getElementById('sensor-chips'), t => t.closest('.sensor-chip[data-id]')?.dataset.id);
+
+  return () => { if (fired) { fired = false; return true; } return false; };
+})();
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+init();
+</script>
+</body>
+</html>

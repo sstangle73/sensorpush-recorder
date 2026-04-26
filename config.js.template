@@ -1,0 +1,8 @@
+// Copy to config.local.js and fill in your SensorPush cloud credentials.
+// Only sensorpush.email and sensorpush.password are read by this service.
+window.DASHBOARD_CONFIG = {
+  sensorpush: {
+    email:    'YOUR_SENSORPUSH_EMAIL',
+    password: 'YOUR_SENSORPUSH_PASSWORD',
+  },
+};
