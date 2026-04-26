@@ -478,6 +478,25 @@ function seenClass(iso) {
   return '';
 }
 
+// NWS Rothfusz heat index, °F. Below ~80°F the simple Steadman approximation
+// is used (and adjusted-or-not, the result is essentially temperature anyway).
+// Above 80°F with low/high humidity, applies the standard NWS adjustments.
+function heatIndex(tF, rh) {
+  if (tF == null || rh == null) return null;
+  const simple = 0.5 * (tF + 61.0 + (tF - 68.0) * 1.2 + rh * 0.094);
+  if ((simple + tF) / 2 < 80) return simple;
+  let hi = -42.379 + 2.04901523 * tF + 10.14333127 * rh
+         - 0.22475541 * tF * rh - 0.00683783 * tF * tF
+         - 0.05481717 * rh * rh + 0.00122874 * tF * tF * rh
+         + 0.00085282 * tF * rh * rh - 0.00000199 * tF * tF * rh * rh;
+  if (rh < 13 && tF >= 80 && tF <= 112) {
+    hi -= ((13 - rh) / 4) * Math.sqrt((17 - Math.abs(tF - 95)) / 17);
+  } else if (rh > 85 && tF >= 80 && tF <= 87) {
+    hi += ((rh - 85) / 10) * ((87 - tF) / 5);
+  }
+  return hi;
+}
+
 // Color-code RSSI: ≥-70 strong (green), -70..-85 fair (warn), <-85 weak (excl).
 function rssiBadge(rssi) {
   if (rssi == null) return '';
@@ -821,6 +840,7 @@ function renderSidebar() {
       const baro   = s.baroPressure != null ? s.baroPressure.toFixed(1) + ' hPa' : null;
       const hasBaro = s.baroPressure != null ||
         (_chartData[s.id]?.samples || []).some(x => x.baroPressure != null);
+      const hasDerived = (_chartData[s.id]?.samples || []).some(x => x.dewpoint != null || x.vpd != null);
       const ser = _series[s.id] || new Set();
 
       const al = _sensors[s.id]?.alerts;
@@ -834,6 +854,15 @@ function renderSidebar() {
         </label>
         ${hasBaro ? `<label class="series-row">
           <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="pressure" ${ser.has('pressure')?'checked':''} onchange="toggleSeries(this)"> Pressure
+        </label>` : ''}
+        ${hasDerived ? `<label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="dewpoint" ${ser.has('dewpoint')?'checked':''} onchange="toggleSeries(this)"> Dew point
+        </label>
+        <label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="heatindex" ${ser.has('heatindex')?'checked':''} onchange="toggleSeries(this)"> Heat index
+        </label>
+        <label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="vpd" ${ser.has('vpd')?'checked':''} onchange="toggleSeries(this)"> VPD
         </label>` : ''}
         ${hasAlerts ? `<label class="series-row" style="margin-top:3px;border-top:1px solid var(--border);padding-top:5px">
           <input type="checkbox" class="series-check" data-id="${esc(s.id)}" ${_showThresholds[s.id]?'checked':''} onchange="toggleThresholds(this)"> Thresholds
@@ -1240,13 +1269,23 @@ function renderChart() {
   const showHum   = entries.some(([id]) => (_series[id]||new Set()).has('humidity'));
   const showBaro  = entries.some(([id]) => (_series[id]||new Set()).has('pressure') &&
     (_chartData[id]?.samples||[]).some(s => s.baroPressure != null));
+  const showDew   = entries.some(([id]) => (_series[id]||new Set()).has('dewpoint') &&
+    (_chartData[id]?.samples||[]).some(s => s.dewpoint != null));
+  const showHI    = entries.some(([id]) => (_series[id]||new Set()).has('heatindex') &&
+    (_chartData[id]?.samples||[]).some(s => s.temperature != null && s.humidity != null));
+  const showVPD   = entries.some(([id]) => (_series[id]||new Set()).has('vpd') &&
+    (_chartData[id]?.samples||[]).some(s => s.vpd != null));
+  // showTempPanel = anything that lives on the temp axis (including dewpoint/HI overlays)
+  const showTempPanel = showTemp || showDew || showHI;
 
   // Count active panels to divide height
-  const panels = [showTemp, showHum, showBaro].filter(Boolean).length || 1;
+  const extras = (showBaro ? 1 : 0) + (showVPD ? 1 : 0);
+  const panels = [showTempPanel, showHum, showBaro, showVPD].filter(Boolean).length || 1;
   const panelFracs = [];
-  if (showTemp)  panelFracs.push(showBaro ? 0.50 : showHum ? 0.58 : 1.0);
-  if (showHum)   panelFracs.push(showBaro ? 0.32 : 0.42);
-  if (showBaro)  panelFracs.push(0.18);
+  if (showTempPanel) panelFracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : showHum ? 0.58 : 1.0);
+  if (showHum)       panelFracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
+  if (showBaro)      panelFracs.push(showVPD ? 0.15 : 0.18);
+  if (showVPD)       panelFracs.push(showBaro ? 0.15 : 0.18);
 
   // X range — zoom overrides data range
   const dataMin = Math.min(...allSamples.map(s => s.ts)) * 1000;
@@ -1279,9 +1318,10 @@ function renderChart() {
 
   // Map panel index to type
   const panelTypes = [];
-  if (showTemp) panelTypes.push('temp');
-  if (showHum)  panelTypes.push('hum');
-  if (showBaro) panelTypes.push('baro');
+  if (showTempPanel) panelTypes.push('temp');
+  if (showHum)       panelTypes.push('hum');
+  if (showBaro)      panelTypes.push('baro');
+  if (showVPD)       panelTypes.push('vpd');
 
   function panelIdx(type) { return panelTypes.indexOf(type); }
   function panelTop(type)    { const i = panelIdx(type); return i < 0 ? 0 : panelTops[i]; }
@@ -1298,10 +1338,30 @@ function renderChart() {
     return { min: lo, max: hi };
   }
 
-  let yTFn, yHFn, yBFn;
+  let yTFn, yHFn, yBFn, yVFn;
 
-  if (showTemp) {
-    const allT = inclInView.flatMap(s => [s.temperature, s.tempMin, s.tempMax]).filter(v => v != null);
+  if (showTempPanel) {
+    const allT = [];
+    for (const [id, { samples }] of entries) {
+      const ser = _series[id] || new Set();
+      const inViewSamples = samples.filter(inView).filter(s => !s.excluded);
+      if (showTemp && ser.has('temp')) {
+        for (const s of inViewSamples) {
+          if (s.temperature != null) allT.push(s.temperature);
+          if (s.tempMin     != null) allT.push(s.tempMin);
+          if (s.tempMax     != null) allT.push(s.tempMax);
+        }
+      }
+      if (showDew && ser.has('dewpoint')) {
+        for (const s of inViewSamples) if (s.dewpoint != null) allT.push(s.dewpoint);
+      }
+      if (showHI && ser.has('heatindex')) {
+        for (const s of inViewSamples) {
+          const hi = heatIndex(s.temperature, s.humidity);
+          if (hi != null) allT.push(hi);
+        }
+      }
+    }
     // Expand scale to include threshold values so they're always visible
     for (const [id] of entries) {
       if (!_showThresholds[id]) continue;
@@ -1338,6 +1398,13 @@ function renderChart() {
     yBFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
     yBFn.sc = sc;
   }
+  if (showVPD) {
+    const allV = inclInView.map(s => s.vpd).filter(v => v != null);
+    const sc = makeYScale(allV, 0.12, 0.2);
+    const top = panelTop('vpd'), ht = panelHeight('vpd');
+    yVFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
+    yVFn.sc = sc;
+  }
 
   // ── Grid & axes ──
   let gridSvg = '', labelSvg = '';
@@ -1369,12 +1436,17 @@ function renderChart() {
     const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
     addGrid(yBFn, step, v => v.toFixed(2), 'right');
   }
+  if (yVFn) {
+    const span = yVFn.sc.max - yVFn.sc.min;
+    const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
+    addGrid(yVFn, step, v => v.toFixed(2), 'right');
+  }
 
   // Panel borders and labels
   let axesSvg = '';
   panelTypes.forEach((type, i) => {
     const top = panelTops[i], ht = panelHeights[i];
-    const label = type === 'temp' ? 'TEMPERATURE' : type === 'hum' ? 'HUMIDITY' : 'PRESSURE (inHg)';
+    const label = type === 'temp' ? 'TEMPERATURE' : type === 'hum' ? 'HUMIDITY' : type === 'baro' ? 'PRESSURE (inHg)' : 'VPD (kPa)';
     axesSvg +=
       `<line x1="${PL}" y1="${top}" x2="${PL}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
       `<line x1="${PL}" y1="${top+ht}" x2="${PL+cW}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
@@ -1493,6 +1565,23 @@ function renderChart() {
       if (bp) dataSvg += `<path d="${bp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity=".55"/>`;
     }
 
+    // Dewpoint and heat-index overlays on the temperature panel
+    if (showDew && ser.has('dewpoint') && yTFn) {
+      const dp = incl.filter(s => s.dewpoint != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yTFn(s.dewpoint).toFixed(1)}`).join('');
+      if (dp) dataSvg += `<path d="${dp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="3,3" opacity=".55"/>`;
+    }
+    if (showHI && ser.has('heatindex') && yTFn) {
+      const hp = incl.filter(s => s.temperature != null && s.humidity != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yTFn(heatIndex(s.temperature, s.humidity)).toFixed(1)}`).join('');
+      if (hp) dataSvg += `<path d="${hp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3" opacity=".7"/>`;
+    }
+    if (showVPD && ser.has('vpd') && yVFn) {
+      const vp = incl.filter(s => s.vpd != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yVFn(s.vpd).toFixed(1)}`).join('');
+      if (vp) dataSvg += `<path d="${vp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity=".7"/>`;
+    }
+
     // Excluded markers (✕) — always visible so you can see what was excluded
     for (const s of exclPts) {
       const cx = xp(s.ts*1000).toFixed(1);
@@ -1539,15 +1628,23 @@ function renderChart() {
 
   // ── Legend ──
   const legItems = [];
-  entries.forEach(([id, { name, color }]) => {
+  entries.forEach(([id, { name, color, samples }]) => {
     const ser = _series[id] || new Set(['temp','humidity','pressure']);
-    const hasBaro = (_chartData[id]?.samples || []).some(s => s.baroPressure != null);
+    const hasBaro = (samples || []).some(s => s.baroPressure != null);
+    const hasDP   = (samples || []).some(s => s.dewpoint != null);
+    const hasV    = (samples || []).some(s => s.vpd != null);
     if (showTemp && ser.has('temp'))
       legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${color}"></div>${esc(name)} temp</div>`);
     if (showHum && ser.has('humidity'))
       legItems.push(`<div class="leg-item" style="color:${color};opacity:.65"><div class="leg-dash"></div>${esc(name)} humidity</div>`);
     if (showBaro && ser.has('pressure') && hasBaro)
       legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} pressure</div>`);
+    if (showDew && ser.has('dewpoint') && hasDP)
+      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} dewpoint</div>`);
+    if (showHI && ser.has('heatindex') && (samples || []).some(s => s.temperature != null && s.humidity != null))
+      legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} heat idx</div>`);
+    if (showVPD && ser.has('vpd') && hasV)
+      legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} VPD</div>`);
   });
   document.getElementById('legend').innerHTML = legItems.join('');
 
@@ -1584,9 +1681,19 @@ function renderChart() {
       const temp = near.temperature  != null ? near.temperature.toFixed(1) + '°F' : null;
       const hum  = near.humidity     != null ? Math.round(near.humidity)   + '%'  : null;
       const baro = near.baroPressure != null ? near.baroPressure.toFixed(2) + '"' : null;
+      const dp   = near.dewpoint     != null ? 'dp ' + near.dewpoint.toFixed(1) + '°' : null;
+      const hi_  = ser.has('heatindex') ? heatIndex(near.temperature, near.humidity) : null;
+      const hi   = hi_ != null ? 'hi ' + hi_.toFixed(1) + '°' : null;
+      const vpd  = near.vpd          != null ? 'vpd ' + near.vpd.toFixed(2) : null;
       const exTag = near.excluded ? '<span class="tt-excl">excl</span>' : '';
-      const vals = [ser.has('temp') && temp, ser.has('humidity') && hum, ser.has('pressure') && baro]
-        .filter(Boolean).join(' · ') || '—';
+      const vals = [
+        ser.has('temp')      && temp,
+        ser.has('humidity')  && hum,
+        ser.has('pressure')  && baro,
+        ser.has('dewpoint')  && dp,
+        ser.has('heatindex') && hi,
+        ser.has('vpd')       && vpd,
+      ].filter(Boolean).join(' · ') || '—';
       html += `<div class="tt-row">
         <div class="tt-dot" style="background:${color}"></div>
         <span class="tt-name">${esc(name)}${exTag}</span>
