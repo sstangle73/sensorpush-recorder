@@ -313,5 +313,5 @@ if (process.env.NODE_ENV !== 'test') {
   const db     = openDb(DB_PATH);
   const app    = createApp(db, config);
   startPoller(db, config);
-  app.listen(PORT, () => console.log(`[sensor-api] listening on :${PORT}`));
+  app.listen(PORT, () => console.log(`[sensorpush-recorder] listening on :${PORT}`));
 }

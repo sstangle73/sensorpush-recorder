@@ -4,12 +4,12 @@ Self-hosted recorder for [SensorPush](https://www.sensorpush.com/) wireless temp
 
 Polls the SensorPush cloud every 5 minutes, stores all readings locally in SQLite, exposes a REST API, and ships with a self-contained Explorer UI for charting and data QA.
 
-Originally extracted from [storie-dashboard](https://github.com/sstangle73/storie-dashboard).
+Originally extracted from [storie-dashboard](https://gitlab.com/sstangle73/storie-dashboard).
 
 ## Quick start
 
 ```bash
-git clone <this-repo> sensorpush-recorder
+git clone git@gitlab.com:sstangle73/sensorpush-recorder.git
 cd sensorpush-recorder
 cp config.js.template config.local.js
 # edit config.local.js with your sensorpush.com email + password

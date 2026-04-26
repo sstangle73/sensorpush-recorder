@@ -4,7 +4,29 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-A standalone Node service that polls the SensorPush cloud every 5 minutes, stores readings in SQLite, and exposes a REST API + self-contained Explorer UI on port 3003. Originally extracted from [storie-dashboard](https://github.com/sstangle73/storie-dashboard); the dashboard's frontend pane fetches from this service cross-origin.
+A standalone Node service that polls the SensorPush cloud every 5 minutes, stores readings in SQLite, and exposes a REST API + self-contained Explorer UI on port 3003. Originally extracted from [storie-dashboard](https://gitlab.com/sstangle73/storie-dashboard); the dashboard's frontend pane fetches from this service cross-origin at `https://sensors.sstangle.in`.
+
+## Production deployment
+
+- **Repo**: <https://gitlab.com/sstangle73/sensorpush-recorder> (private)
+- **Host**: docker2 VM (Proxmox), at `/home/sstangle73/stacks/sensorpush-recorder`
+- **Container**: `sensorpush-recorder` listening on `0.0.0.0:3003`
+- **Public URL**: `https://sensors.sstangle.in` via Cloudflare Tunnel → docker2:3003
+- **DB**: `./data/sensorpush.db` (relative to the compose file)
+- **Allowed CORS origins** (set via `CORS_ORIGINS` env var in compose):
+  - `https://dashboard.sstangle.in` (production dashboard)
+  - `http://10.73.37.22:8080` (LAN kiosk)
+  - `http://localhost:8080` (local dev)
+
+Add a new caller by appending its origin to `CORS_ORIGINS` in `docker-compose.yml`, then `docker compose up -d` to recreate the container with the new env.
+
+After source changes:
+
+```bash
+ssh sstangle73@docker2 "cd ~/stacks/sensorpush-recorder && git pull && docker compose up -d --build"
+```
+
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js ui.html ./` list — adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.
 
 ## Layout
 
