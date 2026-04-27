@@ -6,6 +6,7 @@ import { deflateSync } from 'node:zlib';
 import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
+import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
@@ -131,15 +132,17 @@ self.addEventListener('fetch',e=>{
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Optional shared bearer token. When RECORDER_TOKEN is set, every request
-// (except /health, /ui, the icon/manifest/sw assets, and OPTIONS preflight)
-// must carry `Authorization: Bearer <token>`. Lets a public-internet recorder
-// (e.g. sensors.sstangle.in via Cloudflare Tunnel) avoid being a leaky
-// origin-allowlist endpoint where anyone hitting the URL can read sensors
-// and toggle exclusions. Backwards compatible: leave the env unset for
-// LAN-only deploys to keep auth disabled.
-const RECORDER_TOKEN = process.env.RECORDER_TOKEN || '';
-const PUBLIC_PATHS = new Set(['/health', '/ui', '/icon.svg', '/icon-192.png', '/icon-512.png', '/sw.js', '/manifest.json', '/favicon.ico']);
+// Bearer token resolution: env (RECORDER_TOKEN) > /data/recorder-token file
+// (managed via Settings → Security in the UI) > null (no auth). See auth.js.
+//
+// Public bypass paths — health, UI assets, and the auth-bootstrap endpoint
+// (so a fresh recorder can mint its first token without a chicken-and-egg).
+const PUBLIC_PATHS = new Set([
+  '/health',
+  '/ui',
+  '/icon.svg', '/icon-192.png', '/icon-512.png',
+  '/sw.js', '/manifest.json', '/favicon.ico',
+]);
 
 export function createApp(db, config = null) {
   const app = express();
@@ -157,30 +160,32 @@ export function createApp(db, config = null) {
     next();
   });
 
-  // Bearer-token gate. Only enforced when RECORDER_TOKEN is set. Bypasses:
-  //   1. Public paths (health, UI assets, manifest, sw) — Cloudflare Tunnel
-  //      health checks + browser asset loads need no credentials.
-  //   2. HTML GET / — the Explorer UI itself loads via direct browser nav.
+  // Bearer-token gate. Only enforced when a token is configured (env or
+  // /data file). Bypasses:
+  //   1. Public paths (health, UI assets, manifest, sw, favicon).
+  //   2. HTML GET / — the Explorer UI loads via direct browser nav.
   //   3. Same-origin requests (Sec-Fetch-Site: same-origin) — fetches from
   //      the Explorer UI's own JS context. Browsers set Sec-Fetch-Site
   //      automatically and JS cannot override it, so cross-origin
   //      attackers can't spoof it. Cross-origin programmatic access still
-  //      needs the bearer. The dashboard pane goes through user-api's
-  //      proxy which injects the bearer server-side.
-  if (RECORDER_TOKEN) {
-    app.use((req, res, next) => {
-      if (PUBLIC_PATHS.has(req.path)) return next();
-      if (req.path === '/' && (req.headers.accept || '').includes('text/html')) return next();
-      if (req.headers['sec-fetch-site'] === 'same-origin') return next();
-      const auth = req.headers.authorization || '';
-      const m = /^Bearer\s+(.+)$/i.exec(auth);
-      if (!m || m[1] !== RECORDER_TOKEN) {
-        res.status(401).json({ error: 'unauthorized' });
-        return;
-      }
-      next();
-    });
-  }
+  //      needs the bearer. The rosestorie dashboard pane goes through
+  //      user-api's proxy which injects the bearer server-side.
+  //   4. POST /settings/auth/generate when no token is set — bootstrap
+  //      flow so a fresh recorder can mint its first token from the UI.
+  app.use((req, res, next) => {
+    const token = getToken();
+    if (!token) return next();
+    if (PUBLIC_PATHS.has(req.path)) return next();
+    if (req.path === '/' && (req.headers.accept || '').includes('text/html')) return next();
+    if (req.headers['sec-fetch-site'] === 'same-origin') return next();
+    const auth = req.headers.authorization || '';
+    const m = /^Bearer\s+(.+)$/i.exec(auth);
+    if (!m || m[1] !== token) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    next();
+  });
 
   app.get('/health', (_req, res) => {
     const { lastPollTime, lastPollError } = getPollStatus();
@@ -393,6 +398,68 @@ export function createApp(db, config = null) {
     res.json({ ok: true });
   });
 
+  // ── Auth (recorder bearer token) ────────────────────────────────────────
+  // GET /settings/auth — read-only metadata about the current token state.
+  // Never returns the token itself; the bearer is shown ONCE on generate
+  // or rotate and never again.
+  app.get('/settings/auth', (_req, res) => {
+    res.json({
+      ok: true,
+      tokenSet: getToken() !== null,
+      source: getTokenSource(),               // 'env' | 'file' | null
+      canRotate: getTokenSource() === 'file', // env-managed = read-only
+    });
+  });
+
+  // POST /settings/auth/generate — bootstrap-only. Refuses if a token is
+  // already set (use /rotate for that). The middleware whitelist above
+  // lets unauthenticated calls through ONLY when getToken() returns null,
+  // so a public-internet recorder with no token configured can be locked
+  // down by anyone — race window is bounded by how fast the operator
+  // actually clicks Generate after deploy.
+  app.post('/settings/auth/generate', (_req, res) => {
+    if (getToken() !== null) {
+      return res.status(409).json({ ok: false, error: 'token already set; use /settings/auth/rotate' });
+    }
+    try {
+      const token = generateToken();
+      setToken(token);
+      res.json({ ok: true, token });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // POST /settings/auth/rotate — replace the existing file-based token.
+  // Requires the current bearer (the auth middleware enforces it). 409
+  // when source is env, since file mutation is no-op while env wins.
+  app.post('/settings/auth/rotate', (_req, res) => {
+    if (getTokenSource() === 'env') {
+      return res.status(409).json({ ok: false, error: 'token is set via RECORDER_TOKEN env; remove it before rotating via UI' });
+    }
+    try {
+      const token = generateToken();
+      setToken(token);
+      res.json({ ok: true, token });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // DELETE /settings/auth — clear the file-based token (auth disabled).
+  // Same env-precedence guard as rotate.
+  app.delete('/settings/auth', (_req, res) => {
+    if (getTokenSource() === 'env') {
+      return res.status(409).json({ ok: false, error: 'token is set via RECORDER_TOKEN env; cannot clear via UI' });
+    }
+    try {
+      clearStoredToken();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   app.post('/poll', async (_req, res) => {
     if (!config) return res.status(503).json({ ok: false, error: 'No config available' });
     try {
@@ -461,5 +528,22 @@ if (process.env.NODE_ENV !== 'test') {
   const db     = openDb(DB_PATH);
   const app    = createApp(db, config);
   startPoller(db, config);
-  app.listen(PORT, () => console.log(`[sensorpush-recorder] listening on :${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`[sensorpush-recorder] listening on :${PORT}`);
+    // One-shot warning when no auth is configured. A LAN-only deploy can
+    // ignore it; a public-internet recorder should generate a token via
+    // the Settings → Security panel in the Explorer UI before letting
+    // anyone hit it.
+    const src = getTokenSource();
+    if (!src) {
+      console.warn(
+        '[sensorpush-recorder] WARNING: no RECORDER_TOKEN configured — ' +
+        'all routes are open to anyone with the URL. Generate a token at ' +
+        '/settings/auth/generate (or via the Settings → Security panel in ' +
+        'the Explorer UI) before exposing this service publicly.'
+      );
+    } else {
+      console.log(`[sensorpush-recorder] auth enabled (source: ${src})`);
+    }
+  });
 }

@@ -42,12 +42,13 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 
 - `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern; only `sensorpush.email` and `sensorpush.password` are read.
 - `CORS_ORIGINS` env var — comma-separated allowlist. The middleware echoes the request `Origin` only when it matches an entry; never sends `*`.
-- `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. When set, all routes except `/health`, the icon/manifest/sw assets, and HTML `GET /` require `Authorization: Bearer <token>`. Backwards compatible: unset = no auth (LAN-only deploys). Set this when exposing the recorder over public internet (Cloudflare Tunnel etc.) so origin-allowlist isn't the only line of defense — anyone hitting the URL without the token gets 401.
+- `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. Set in `docker-compose.yml` env if you want config-as-code; otherwise leave unset and use the Settings → Security UI (see below) to generate + persist a token to `/data/recorder-token`. Resolution order: env > file > null (no auth). Bearer required on all routes except `/health`, icon/manifest/sw assets, HTML `GET /`, and same-origin requests (`Sec-Fetch-Site: same-origin`).
 - `DB_PATH` (default `/data/sensorpush.db`)
 - `PORT` (default `3003`)
 
 ## Routes
 
+- **Auth**: `GET /settings/auth` (state), `POST /settings/auth/generate` (bootstrap-only), `POST /settings/auth/rotate` (requires bearer), `DELETE /settings/auth` (clear file token)
 - **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
 - **Gateways**: `GET /gateways`
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`

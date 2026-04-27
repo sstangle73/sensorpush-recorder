@@ -41,10 +41,39 @@ The first poll backfills 30 days of history; subsequent polls run every 5 minute
 |---|---|
 | `config.local.js` (mounted to `/config/config.local.js`) | SensorPush credentials |
 | `CORS_ORIGINS` env var | Comma-separated allowlist of origins permitted cross-origin |
+| `RECORDER_TOKEN` env var | Optional shared bearer (alternative to UI-managed file token) |
 | `DB_PATH` env var (default `/data/sensorpush.db`) | SQLite location |
 | `PORT` env var (default `3003`) | HTTP port |
 
 CORS: only origins listed in `CORS_ORIGINS` get an `Access-Control-Allow-Origin` header. The header is never `*` — each origin is echoed exactly when it matches.
+
+### Auth (bearer token)
+
+When the recorder is reachable from the public internet (e.g. via Cloudflare Tunnel), enable bearer-token auth so origin-allowlist isn't the only line of defense:
+
+**Easy mode — generate from the UI:**
+
+1. Open `http://localhost:3003/` (or your public URL) in a browser.
+2. Go to **Settings → Security**.
+3. Click **Generate token**.
+4. Copy the token shown once (it's stored at `/data/recorder-token` server-side and never displayed again).
+5. Paste it into your client (e.g. the rosestorie dashboard's SensorPush settings).
+
+The token resolution order is `RECORDER_TOKEN` env var → `/data/recorder-token` file → no auth. Same-origin requests (the Explorer UI's own JS) bypass the bearer via `Sec-Fetch-Site: same-origin` so the UI Just Works without a token in browser-accessible JS. Cross-origin programmatic callers (the rosestorie dashboard, scripts, etc.) must include `Authorization: Bearer <token>`.
+
+**Config-as-code mode — env var:**
+
+```yaml
+# docker-compose.yml
+services:
+  sensorpush-recorder:
+    environment:
+      RECORDER_TOKEN: "$(openssl rand -hex 32)"  # paste a real value here
+```
+
+Env var wins over the file. Use this if you'd rather keep the secret out of the writable container filesystem (e.g. injected from Vault, Compose secret, etc.). To rotate when env-managed, edit compose and restart.
+
+To rotate a UI-managed token: Settings → Security → **Rotate token**. Existing clients fail until you paste the new value into them.
 
 ## API
 

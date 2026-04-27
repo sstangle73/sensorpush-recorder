@@ -440,6 +440,22 @@ header .spacer { flex: 1; }
   </div>
 
   <div class="set-section">
+    <h2>Security</h2>
+    <p class="set-hint" style="margin-bottom:10px">A bearer token gates non-public routes. Browsers loading the Explorer UI from this hostname bypass it via <code>Sec-Fetch-Site: same-origin</code>; cross-origin programmatic callers (the rosestorie dashboard, etc.) must include <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+    <div id="auth-state" style="margin-bottom:10px;font-size:13px;color:var(--text2)">Loading…</div>
+    <div id="auth-actions" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    <div id="auth-fresh-token" style="margin-top:14px;display:none;background:var(--bg-elev);border:1px solid var(--accent);border-radius:6px;padding:12px">
+      <p style="margin:0 0 6px;font-size:13px;font-weight:600;color:var(--accent)">New token (shown once — copy it now)</p>
+      <code id="auth-fresh-token-value" style="display:block;word-break:break-all;font-size:12px;background:rgba(0,0,0,0.25);padding:8px;border-radius:4px;margin-bottom:8px"></code>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="set-btn" onclick="copyFreshToken()">Copy</button>
+        <button class="set-btn" onclick="dismissFreshToken()">Done</button>
+      </div>
+      <p class="set-hint" style="margin-top:10px">Paste this into the rosestorie dashboard's SensorPush settings (Recorder token field). It won't be shown again — if you lose it, click Rotate to mint a new one.</p>
+    </div>
+  </div>
+
+  <div class="set-section">
     <h2>App</h2>
     <button class="set-btn danger" onclick="hardRefresh()">Clear cache &amp; refresh</button>
     <p class="set-hint">Unregisters the service worker, clears the PWA cache, and reloads to pick up the latest version.</p>
@@ -1116,6 +1132,91 @@ async function renderSettings() {
     _updateBackfillStatus(state);
     if (state.status === 'running') _schedulePollBackfill();
   } catch(e) {}
+  renderAuthSection();
+}
+
+// ── Security: bearer token lifecycle ───────────────────────────────────────
+let _freshToken = null; // captured one-shot for copy button after generate/rotate
+
+async function renderAuthSection() {
+  const stateEl = document.getElementById('auth-state');
+  const actionsEl = document.getElementById('auth-actions');
+  if (!stateEl || !actionsEl) return;
+  try {
+    const r = await fetch(`${API_BASE}/settings/auth`);
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'failed');
+    actionsEl.innerHTML = '';
+    if (!data.tokenSet) {
+      stateEl.innerHTML = '<span style="color:var(--warn,#e0a060)">⚠ No token configured — anyone with the URL can read sensors and toggle exclusions.</span>';
+      const btn = document.createElement('button');
+      btn.className = 'set-btn';
+      btn.textContent = 'Generate token';
+      btn.onclick = () => generateRecorderToken('generate');
+      actionsEl.appendChild(btn);
+    } else if (data.source === 'env') {
+      stateEl.innerHTML = '✓ Token configured via <code>RECORDER_TOKEN</code> env var. To rotate, edit <code>docker-compose.yml</code> and restart.';
+    } else {
+      stateEl.innerHTML = '✓ Token configured (file). Rotate periodically or remove if you want to disable auth.';
+      const rot = document.createElement('button');
+      rot.className = 'set-btn';
+      rot.textContent = 'Rotate token';
+      rot.onclick = () => generateRecorderToken('rotate');
+      actionsEl.appendChild(rot);
+      const rm = document.createElement('button');
+      rm.className = 'set-btn danger';
+      rm.textContent = 'Remove token (disable auth)';
+      rm.onclick = removeRecorderToken;
+      actionsEl.appendChild(rm);
+    }
+  } catch (e) {
+    stateEl.textContent = 'Could not load auth state: ' + e.message;
+    actionsEl.innerHTML = '';
+  }
+}
+
+async function generateRecorderToken(kind) {
+  const path = kind === 'rotate' ? '/settings/auth/rotate' : '/settings/auth/generate';
+  if (kind === 'rotate' && !confirm('Rotate token? Existing clients (rosestorie dashboard, etc.) will start failing until you paste the new token into them.')) return;
+  try {
+    const r = await fetch(`${API_BASE}${path}`, { method: 'POST' });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    _freshToken = data.token;
+    document.getElementById('auth-fresh-token-value').textContent = data.token;
+    document.getElementById('auth-fresh-token').style.display = '';
+    showToast(kind === 'rotate' ? 'Token rotated' : 'Token generated');
+    renderAuthSection();
+  } catch (e) {
+    showToast('Failed: ' + e.message);
+  }
+}
+
+async function removeRecorderToken() {
+  if (!confirm('Remove the token? Auth will be disabled — anyone with the URL can read and modify sensor data. Only do this for LAN-only deploys.')) return;
+  try {
+    const r = await fetch(`${API_BASE}/settings/auth`, { method: 'DELETE' });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    showToast('Token removed; auth disabled');
+    dismissFreshToken();
+    renderAuthSection();
+  } catch (e) {
+    showToast('Failed: ' + e.message);
+  }
+}
+
+function copyFreshToken() {
+  if (!_freshToken) return;
+  navigator.clipboard.writeText(_freshToken).then(
+    () => showToast('Copied to clipboard'),
+    () => showToast('Copy failed — select the value manually'),
+  );
+}
+
+function dismissFreshToken() {
+  _freshToken = null;
+  document.getElementById('auth-fresh-token').style.display = 'none';
 }
 
 function rangeResolution(r) {
