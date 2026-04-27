@@ -2,6 +2,10 @@
 
 Guidance for Claude Code (and other AI agents) working in this repository.
 
+> If a `CLAUDE.local.md` exists alongside this file, read it too — it carries
+> deployment-specific context (hostnames, deploy commands, internal CORS
+> origins) for the local operator and is gitignored.
+
 ## What this is
 
 A standalone Node service that polls the SensorPush cloud every 5 minutes, stores readings in SQLite, and exposes a REST API + self-contained Explorer UI on port 3003.
