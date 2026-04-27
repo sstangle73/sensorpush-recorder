@@ -198,6 +198,46 @@ export function createApp(db, config = null) {
     res.json({ ok: true, sensorId, range, resolution: rangeUnit(range) === 'h' ? 'raw' : rangeUnit(range) === 'd' ? 'hourly' : 'daily', samples });
   });
 
+  // CSV export — same data getHistory returns (resolution depends on range
+  // unit), shaped for spreadsheet import. Excluded points are filtered out
+  // to match /history (use /history/all if you want excluded data; we don't
+  // expose a CSV variant of that since CSV export is meant for analysis).
+  app.get('/:id/history.csv', (req, res) => {
+    const sensorId = req.params.id;
+    const range    = req.query.range || '7d';
+    if (!rangeToSeconds(range))
+      return res.status(400).type('text/plain').send('Invalid range. Use e.g. 24h, 7d, 30d, 1yr.');
+    const sensor = db.prepare('SELECT id, name FROM sensors WHERE id = ?').get(sensorId);
+    if (!sensor) return res.status(404).type('text/plain').send('Sensor not found');
+
+    const samples = getHistory(db, sensorId, range);
+    const unit    = rangeUnit(range);
+    // Column set varies by resolution: raw has dewpoint/vpd per sample,
+    // hourly/daily aggregates expose min/max bands.
+    const cols = unit === 'h'
+      ? ['ts', 'observed_iso', 'temperature', 'humidity', 'baro_pressure', 'dewpoint', 'vpd']
+      : ['ts', 'observed_iso', 'temperature', 'temp_min', 'temp_max', 'humidity', 'hum_min', 'hum_max', 'baro_pressure', 'dewpoint', 'vpd'];
+
+    const fmt = v => v == null ? '' : (typeof v === 'number' ? v.toString() : String(v));
+    const rows = samples.map(s => cols.map(c => {
+      switch (c) {
+        case 'ts':            return fmt(s.ts);
+        case 'observed_iso':  return new Date(s.ts * 1000).toISOString();
+        case 'baro_pressure': return fmt(s.baroPressure);
+        case 'temp_min':      return fmt(s.tempMin);
+        case 'temp_max':      return fmt(s.tempMax);
+        case 'hum_min':       return fmt(s.humMin);
+        case 'hum_max':       return fmt(s.humMax);
+        default:              return fmt(s[c]);
+      }
+    }).join(','));
+
+    const safeName = (sensor.name || sensorId).replace(/[^a-z0-9_-]+/gi, '_');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+       .setHeader('Content-Disposition', `attachment; filename="${safeName}-${range}.csv"`)
+       .send(cols.join(',') + '\n' + rows.join('\n') + (rows.length ? '\n' : ''));
+  });
+
   // Like /history but includes excluded points (for the data explorer UI)
   app.get('/:id/history/all', (req, res) => {
     const sensorId = req.params.id;

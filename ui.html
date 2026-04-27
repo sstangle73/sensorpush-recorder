@@ -504,6 +504,18 @@ function rssiBadge(rssi) {
   return ` · <span style="color:${color}" title="Signal strength">${rssi} dBm</span>`;
 }
 
+// Color-code battery: SensorPush HT/HTP units use 3V CR2477 cells. Fresh ≈ 3.0V,
+// nominal use ≈ 2.85–2.95V, dropping fast below ~2.5V (replace soon), critical
+// below ~2.4V (likely to die within days). Only render the badge when low —
+// healthy batteries shouldn't clutter the row.
+function batteryBadge(v) {
+  if (v == null) return '';
+  if (v >= 2.7) return '';
+  const color = v >= 2.5 ? 'var(--warn)' : 'var(--excl)';
+  const title = v >= 2.5 ? 'Battery getting low — replace soon' : 'Battery critical — replace now';
+  return ` · <span style="color:${color}" title="${title}">🔋 ${v.toFixed(2)}V</span>`;
+}
+
 function fmtDuration(secs) {
   if (secs < 60)   return secs + ' sec';
   if (secs < 3600) return Math.round(secs / 60) + ' min';
@@ -890,11 +902,12 @@ function renderSidebar() {
       </div>` : '';
 
       const rssi = rssiBadge(s.rssi);
+      const batt = batteryBadge(s.batteryVoltage);
       return `<div class="sensor-row${active ? ' active' : ''}" data-id="${esc(s.id)}" onclick="toggleSensor(this.dataset.id)">
         <div class="sensor-color" style="background:${color}"></div>
         <div class="sensor-meta">
           <div class="sensor-name" title="${esc(s.name)}">${esc(s.name)}</div>
-          <div class="sensor-vals">${temp} · ${hum}${baro ? ' · ' + baro : ''}${rssi}</div>
+          <div class="sensor-vals">${temp} · ${hum}${baro ? ' · ' + baro : ''}${rssi}${batt}</div>
           <div class="sensor-seen ${seenClass(s.lastSeen)}">${timeAgo(s.lastSeen)}</div>
         </div>
       </div>${serRows}`;

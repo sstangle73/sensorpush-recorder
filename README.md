@@ -18,6 +18,9 @@ Originally extracted from [storie-dashboard](https://gitlab.com/sstangle73/stori
 - **Explorer UI** — multi-sensor chart with toggleable series (temp, humidity, pressure, dewpoint, heat index, VPD), zoom, edit mode, analytics view with coverage timeline.
 - **PWA** — installable, offline-shell cached via service worker.
 - **Cross-origin friendly** — explicit CORS allowlist so the same recorder can serve a primary dashboard, a kiosk, and local dev.
+- **Self-healing** — daily auto gap-fill at 03:00 plus daily SQLite snapshot to `/data/backups/` (7-day retention).
+- **Battery monitoring** — UI badges sensors with low (≤2.7V) or critical (≤2.5V) battery voltage.
+- **CSV export** — `GET /:id/history.csv?range=7d` for spreadsheet analysis.
 
 ## Quick start
 
@@ -56,6 +59,7 @@ CORS: only origins listed in `CORS_ORIGINS` get an `Access-Control-Allow-Origin`
 | GET | `/gateways` | per-gateway status: name, last seen, version, paired |
 | GET | `/:id/history?range=24h` | time series; ranges: `1h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg) |
 | GET | `/:id/history/all?range=7d` | includes excluded points (data QA) |
+| GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition |
 | GET | `/:id/gaps?range=7d` | missing windows + sparse hours + coverage %; each gap annotated with `gatewayOnline: true \| false \| null` |
 | PATCH | `/:id/readings/exclude` | toggle reading exclusion (auto-recomputes hourly bucket) |
 | PATCH | `/:id/hourly/exclude` | toggle hourly bucket exclusion |
@@ -88,7 +92,9 @@ npm install
 npm test
 ```
 
-183 vitest tests across `db.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `config.test.js`. All run in-memory (no DB or network required); `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively.
+192 vitest tests across `db.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `config.test.js`. All run in-memory (no DB or network required); `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively.
+
+CI: `.gitlab-ci.yml` runs `npm test` on every push and merge request against a Node 22-alpine runner.
 
 ## Deploying to a public URL
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../sensorpush.js', () => ({
   getToken:      vi.fn(),
@@ -9,7 +9,7 @@ vi.mock('../sensorpush.js', () => ({
 
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
-import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState } from '../poller.js';
+import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb } from '../poller.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -315,6 +315,89 @@ describe('triggerGapBackfill — already-running guard', () => {
     await expect(triggerGapBackfill(db, CREDS, { range: '24h' })).rejects.toThrow(/already running/i);
     release([]);
     await first;
+  });
+});
+
+describe('_snapshotDb (daily DB backup)', () => {
+  let tmpDir, prevDbPath;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    tmpDir = mkdtempSync(join(tmpdir(), 'sp-snapshot-'));
+    prevDbPath = process.env.DB_PATH;
+    // _snapshotDb derives the backups dir from dirname(DB_PATH)
+    process.env.DB_PATH = join(tmpDir, 'sensorpush.db');
+  });
+
+  afterEach(async () => {
+    if (prevDbPath === undefined) delete process.env.DB_PATH;
+    else process.env.DB_PATH = prevDbPath;
+    const { rmSync } = await import('node:fs');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('writes a dated snapshot file and creates the backups/ directory', async () => {
+    const { existsSync, statSync, readdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const db = makeDb();
+    upsertSensors(db, [sensor('snap1')]);
+    insertReadings(db, 'snap1', [{
+      observed: new Date().toISOString(), temperature: 70, humidity: 50,
+    }]);
+
+    await _snapshotDb(db);
+
+    const backupsDir = join(tmpDir, 'backups');
+    expect(existsSync(backupsDir)).toBe(true);
+    const files = readdirSync(backupsDir).filter(f => f.endsWith('.db'));
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^sensorpush-\d{4}-\d{2}-\d{2}\.db$/);
+    expect(statSync(join(backupsDir, files[0])).size).toBeGreaterThan(0);
+  });
+
+  it('keeps only the 7 most-recent dated snapshots', async () => {
+    const { writeFileSync, mkdirSync, readdirSync, utimesSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const backupsDir = join(tmpDir, 'backups');
+    mkdirSync(backupsDir);
+    // Plant 10 dummy snapshots with mtimes spaced 1 day apart, oldest first.
+    const NOW = Date.now() / 1000;
+    for (let i = 0; i < 10; i++) {
+      const d = new Date(Date.now() - (10 - i) * 86400 * 1000).toISOString().slice(0, 10);
+      const p = join(backupsDir, `sensorpush-${d}.db`);
+      writeFileSync(p, 'fake');
+      const t = NOW - (10 - i) * 86400;
+      utimesSync(p, t, t);
+    }
+    // A non-snapshot file should NOT be touched by retention pruning.
+    writeFileSync(join(backupsDir, 'unrelated.txt'), 'keep me');
+
+    const db = makeDb();
+    await _snapshotDb(db);
+
+    const files = readdirSync(backupsDir).filter(f => /^sensorpush-.*\.db$/.test(f));
+    expect(files.length).toBe(7);
+    // unrelated.txt survives
+    expect(readdirSync(backupsDir)).toContain('unrelated.txt');
+  });
+
+  it('handles single-quoted paths safely (escapes for VACUUM INTO)', async () => {
+    const { mkdtempSync, existsSync, readdirSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const trickyDir = mkdtempSync(join(tmpdir(), `sp-quote'-`));
+    process.env.DB_PATH = join(trickyDir, 'sensorpush.db');
+    try {
+      const db = makeDb();
+      await _snapshotDb(db);
+      const files = readdirSync(join(trickyDir, 'backups'));
+      expect(files.some(f => /^sensorpush-.*\.db$/.test(f))).toBe(true);
+    } finally {
+      const { rmSync } = await import('node:fs');
+      rmSync(trickyDir, { recursive: true, force: true });
+    }
   });
 });
 

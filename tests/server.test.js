@@ -164,11 +164,17 @@ describe('GET /:id/history/all', () => {
 });
 
 describe('PATCH /:id/readings/exclude', () => {
+  // Capture the seeded ts ONCE in beforeAll and reuse it from every `it`.
+  // Previously each `it` re-derived `ts = floor(Date.now() / 1000) - 3600`,
+  // which differed from the seeded ts when the test crossed a second
+  // boundary between beforeAll and the `it` body — making the SQL lookup
+  // miss and the assertion fail spuriously.
+  let seededTs;
   beforeAll(() => {
-    const now = Math.floor(Date.now() / 1000);
+    seededTs = Math.floor(Date.now() / 1000) - 3600;
     upsertSensors(db, [{ id: 'ex1', name: 'Ex', type: 'HT1', active: true, batteryVoltage: null }]);
     insertReadings(db, 'ex1', [
-      { observed: new Date((now - 3600) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date(seededTs * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
     ]);
   });
 
@@ -197,23 +203,18 @@ describe('PATCH /:id/readings/exclude', () => {
   });
 
   it('marks a reading excluded and returns ok', async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const ts = now - 3600;
-    const { status, body } = await patch('/ex1/readings/exclude', { ts, excluded: true });
+    const { status, body } = await patch('/ex1/readings/exclude', { ts: seededTs, excluded: true });
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
-    // verify excluded=1 in DB
-    const row = db.prepare('SELECT excluded FROM readings WHERE sensor_id=? AND ts=?').get('ex1', ts);
+    const row = db.prepare('SELECT excluded FROM readings WHERE sensor_id=? AND ts=?').get('ex1', seededTs);
     expect(row?.excluded).toBe(1);
   });
 
   it('restores a reading and returns ok', async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const ts = now - 3600;
-    await patch('/ex1/readings/exclude', { ts, excluded: true });
-    const { body } = await patch('/ex1/readings/exclude', { ts, excluded: false });
+    await patch('/ex1/readings/exclude', { ts: seededTs, excluded: true });
+    const { body } = await patch('/ex1/readings/exclude', { ts: seededTs, excluded: false });
     expect(body.ok).toBe(true);
-    const row = db.prepare('SELECT excluded FROM readings WHERE sensor_id=? AND ts=?').get('ex1', ts);
+    const row = db.prepare('SELECT excluded FROM readings WHERE sensor_id=? AND ts=?').get('ex1', seededTs);
     expect(row?.excluded).toBe(0);
   });
 });
@@ -518,6 +519,74 @@ describe('CORS middleware', () => {
   it('OPTIONS request returns 204 quickly without invoking route', async () => {
     const r = await fetch(baseUrl + '/health', { method: 'OPTIONS' });
     expect(r.status).toBe(204);
+  });
+});
+
+describe('GET /:id/history.csv', () => {
+  let csvDb, csvSrv, csvUrl;
+  beforeAll(async () => {
+    csvDb = openDb(':memory:');
+    upsertSensors(csvDb, [{ id: 'csv1', name: 'CSV Test', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    const now = Math.floor(Date.now() / 1000);
+    insertReadings(csvDb, 'csv1', [
+      { observed: new Date((now - 600) * 1000).toISOString(), temperature: 70.5, humidity: 45.2, barometric_pressure: null, dewpoint: 47.8, vpd: 1.05 },
+      { observed: new Date((now - 300) * 1000).toISOString(), temperature: 71.0, humidity: 44.5, barometric_pressure: null, dewpoint: 47.9, vpd: 1.08 },
+    ]);
+    await new Promise(r => {
+      csvSrv = http.createServer(createApp(csvDb));
+      csvSrv.listen(0, '127.0.0.1', () => { csvUrl = `http://127.0.0.1:${csvSrv.address().port}`; r(); });
+    });
+  });
+  afterAll(() => new Promise(r => csvSrv.close(r)));
+
+  it('returns 200 with text/csv content-type and attachment disposition', async () => {
+    const r = await fetch(csvUrl + '/csv1/history.csv?range=24h');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toMatch(/text\/csv/);
+    expect(r.headers.get('content-disposition')).toMatch(/attachment.*\.csv/);
+  });
+
+  it('uses raw-resolution columns at h-unit ranges (no min/max bands)', async () => {
+    const r = await fetch(csvUrl + '/csv1/history.csv?range=24h');
+    const text = await r.text();
+    const header = text.split('\n')[0];
+    expect(header).toBe('ts,observed_iso,temperature,humidity,baro_pressure,dewpoint,vpd');
+    // Two readings → two data rows
+    expect(text.trim().split('\n').length).toBe(3);
+    // Values from the seeded data should appear
+    expect(text).toContain('70.5');
+    expect(text).toContain('47.8');
+  });
+
+  it('uses aggregate columns (min/max bands) at d-unit ranges', async () => {
+    const r = await fetch(csvUrl + '/csv1/history.csv?range=7d');
+    const text = await r.text();
+    const header = text.split('\n')[0];
+    expect(header).toBe('ts,observed_iso,temperature,temp_min,temp_max,humidity,hum_min,hum_max,baro_pressure,dewpoint,vpd');
+  });
+
+  it('returns 404 for unknown sensor', async () => {
+    const r = await fetch(csvUrl + '/missing/history.csv?range=24h');
+    expect(r.status).toBe(404);
+  });
+
+  it('returns 400 for invalid range', async () => {
+    const r = await fetch(csvUrl + '/csv1/history.csv?range=forever');
+    expect(r.status).toBe(400);
+  });
+
+  it('sanitises sensor name in the Content-Disposition filename', async () => {
+    upsertSensors(csvDb, [{ id: 'csv2', name: 'Hi/There; rm -rf', type: 'HT1', active: true, batteryVoltage: null }]);
+    const r = await fetch(csvUrl + '/csv2/history.csv?range=24h');
+    const cd = r.headers.get('content-disposition');
+    const m = /filename="([^"]+)"/.exec(cd);
+    expect(m).not.toBeNull();
+    const filename = m[1];
+    // Slashes, semicolons, and shell metacharacters are stripped from the
+    // sanitised name; only [a-z0-9_-] survives (plus the .csv extension).
+    expect(filename).not.toMatch(/[/;\s]/);
+    expect(filename).toMatch(/^Hi_There_rm_-rf/);
+    expect(filename).toMatch(/\.csv$/);
   });
 });
 

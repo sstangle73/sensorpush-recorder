@@ -35,9 +35,10 @@ server.js       — Express bootstrap, all routes, CORS middleware, PWA assets, 
 config.js       — loadConfig() reads /config/config.local.js via new Function sandbox; parseConfig() exported for tests
 db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
-poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted), gateway-status recording + 30-day prune
+poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune
+.gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom, analytics view with gateway panel + per-gap gateway annotation)
-tests/          — 183 vitest tests; in-memory SQLite + http.createServer for route tests
+tests/          — 192 vitest tests; in-memory SQLite + http.createServer for route tests
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
@@ -56,6 +57,7 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 - **Gateways**: `GET /gateways`
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
+- **Export**: `GET /:id/history.csv?range=7d`
 - **Settings**: `GET /settings`, `PUT /settings`
 - **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
 
@@ -72,7 +74,7 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 ## Testing
 
 ```bash
-npm test                       # all 183 tests
+npm test                       # all 192 tests
 npx vitest run tests/db.test.js
 npm run test:watch
 ```
@@ -114,6 +116,9 @@ git pull && docker compose up -d --build
 - **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a PT host.
 - **CORS sends echoed origin, not `*`** — adding a new caller means adding it to `CORS_ORIGINS` (or running behind a same-origin reverse proxy that strips/sets CORS itself).
 - **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
+- **Scheduled jobs** (`scheduleDaily` in poller.js) align to host-local clock time, not relative offsets. On docker2 (UTC) "03:00" fires at 03:00 UTC. The schedule re-arms after each run so a long-running job doesn't drift the cadence.
+- **Daily snapshots use `VACUUM INTO`** which produces a clean single-file copy of the SQLite DB without taking a long write lock. Files land in `/data/backups/sensorpush-YYYY-MM-DD.db`; only the 7 most recent are kept (mtime-sorted, then unlinked beyond 7).
+- **Auto gap-fill (03:00) skips silently** if a manual `/backfill` or `/backfill-gaps` is already running — it doesn't queue or retry.
 
 ## SensorPush API surface — what we use vs. don't
 

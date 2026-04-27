@@ -1,0 +1,22 @@
+# Pinned to the same Node major as the Dockerfile (22-alpine) so anything
+# the runtime catches surfaces here too. node:sqlite is stable on 22+.
+image: node:22-alpine
+
+stages:
+  - test
+
+test:
+  stage: test
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+  script:
+    - npm ci || npm install
+    - npm test
+  rules:
+    # Run on every push to any branch and on merge requests.
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"

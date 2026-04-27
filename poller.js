@@ -8,6 +8,11 @@ let _backfillState = { status: 'idle', progress: null, error: null };
 // Run one poll immediately, then every 5 minutes. Errors are intentionally
 // swallowed here so a transient cloud outage doesn't stop the interval — the
 // failure surfaces via /health (lastPollError) and the next tick retries.
+//
+// Also schedules two daily clock-aligned jobs:
+//   03:00 — auto gap-backfill over the last 7 days (self-healing data)
+//   03:30 — SQLite snapshot to /data/backups/sensorpush-YYYY-MM-DD.db
+//           with retention pruning beyond 7 daily snapshots
 export function startPoller(db, config) {
   _poll(db, config).catch(err => {
     _lastPollError = err.message;
@@ -19,6 +24,65 @@ export function startPoller(db, config) {
       console.error('[poller] error:', err.message);
     });
   }, 5 * 60 * 1000);
+
+  scheduleDaily(3,  0, () => _autoGapBackfill(db, config));
+  scheduleDaily(3, 30, () => _snapshotDb(db));
+}
+
+// scheduleDaily(hour, minute, fn) — runs `fn` once per day at the next
+// occurrence of the given local-time clock position, then every 24h after.
+// Local time matches the host TZ; on docker2 (UTC) 03:00 fires at 03:00 UTC.
+// We use a one-shot setTimeout that re-arms on completion so the schedule
+// stays aligned even if the host clock drifts or `fn` runs long.
+function scheduleDaily(hour, minute, fn) {
+  const next = new Date();
+  next.setHours(hour, minute, 0, 0);
+  if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+  const delay = next.getTime() - Date.now();
+  setTimeout(async () => {
+    try { await fn(); } catch (err) { console.error('[poller] scheduled job error:', err.message); }
+    scheduleDaily(hour, minute, fn);
+  }, delay);
+}
+
+// Daily self-healing: re-fetch any windows the local DB shows as missing
+// over the last 7 days. Skips silently if a manual backfill is in progress.
+async function _autoGapBackfill(db, config) {
+  if (_backfillState.status === 'running') {
+    console.log('[poller] skipping auto gap-backfill — another backfill is running');
+    return;
+  }
+  const sp = config?.sensorpush;
+  if (!sp?.email || sp.email.includes('YOUR_')) return;
+  console.log('[poller] auto gap-backfill starting (7d)');
+  await triggerGapBackfill(db, config, { range: '7d' });
+}
+
+// Daily snapshot via SQLite's `VACUUM INTO`, which produces a clean
+// single-file copy without locking the live DB for long. Snapshots land
+// in /data/backups/ alongside the live DB; the most recent 7 are kept.
+// Exported for tests.
+export async function _snapshotDb(db) {
+  const { mkdirSync, readdirSync, statSync, unlinkSync } = await import('node:fs');
+  const { join, dirname } = await import('node:path');
+  const liveDb = process.env.DB_PATH || '/data/sensorpush.db';
+  const dir    = join(dirname(liveDb), 'backups');
+  mkdirSync(dir, { recursive: true });
+
+  const datestamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const dest      = join(dir, `sensorpush-${datestamp}.db`);
+  // Quoting: VACUUM INTO accepts a string-literal path. We control it.
+  db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  console.log(`[poller] snapshot written: ${dest}`);
+
+  // Retention: keep the 7 newest sensorpush-*.db files, delete the rest.
+  const files = readdirSync(dir)
+    .filter(f => /^sensorpush-\d{4}-\d{2}-\d{2}\.db$/.test(f))
+    .map(f => ({ f, mtime: statSync(join(dir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+  for (const { f } of files.slice(7)) {
+    try { unlinkSync(join(dir, f)); } catch (_) {}
+  }
 }
 
 async function _poll(db, config) {
