@@ -131,6 +131,16 @@ self.addEventListener('fetch',e=>{
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
+// Optional shared bearer token. When RECORDER_TOKEN is set, every request
+// (except /health, /ui, the icon/manifest/sw assets, and OPTIONS preflight)
+// must carry `Authorization: Bearer <token>`. Lets a public-internet recorder
+// (e.g. sensors.sstangle.in via Cloudflare Tunnel) avoid being a leaky
+// origin-allowlist endpoint where anyone hitting the URL can read sensors
+// and toggle exclusions. Backwards compatible: leave the env unset for
+// LAN-only deploys to keep auth disabled.
+const RECORDER_TOKEN = process.env.RECORDER_TOKEN || '';
+const PUBLIC_PATHS = new Set(['/health', '/ui', '/icon.svg', '/icon-192.png', '/icon-512.png', '/sw.js', '/manifest.json']);
+
 export function createApp(db, config = null) {
   const app = express();
   app.use(express.json());
@@ -141,11 +151,31 @@ export function createApp(db, config = null) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     }
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
+
+  // Bearer-token gate. Only enforced when RECORDER_TOKEN is set. Public
+  // paths (health, UI assets) stay open so Cloudflare Tunnel health checks
+  // and browser UI loads work without credentials. UI HTML loaded via Accept:
+  // text/html on `/` is also exempt — adding the token check there would
+  // break direct browser navigation to sensors.sstangle.in.
+  if (RECORDER_TOKEN) {
+    app.use((req, res, next) => {
+      if (PUBLIC_PATHS.has(req.path)) return next();
+      // Root path serves UI for browsers — let HTML clients through unauth.
+      if (req.path === '/' && (req.headers.accept || '').includes('text/html')) return next();
+      const auth = req.headers.authorization || '';
+      const m = /^Bearer\s+(.+)$/i.exec(auth);
+      if (!m || m[1] !== RECORDER_TOKEN) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      next();
+    });
+  }
 
   app.get('/health', (_req, res) => {
     const { lastPollTime, lastPollError } = getPollStatus();

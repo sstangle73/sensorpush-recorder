@@ -42,6 +42,7 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 
 - `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern; only `sensorpush.email` and `sensorpush.password` are read.
 - `CORS_ORIGINS` env var — comma-separated allowlist. The middleware echoes the request `Origin` only when it matches an entry; never sends `*`.
+- `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. When set, all routes except `/health`, the icon/manifest/sw assets, and HTML `GET /` require `Authorization: Bearer <token>`. Backwards compatible: unset = no auth (LAN-only deploys). Set this when exposing the recorder over public internet (Cloudflare Tunnel etc.) so origin-allowlist isn't the only line of defense — anyone hitting the URL without the token gets 401.
 - `DB_PATH` (default `/data/sensorpush.db`)
 - `PORT` (default `3003`)
 

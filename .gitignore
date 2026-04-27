@@ -8,3 +8,4 @@ coverage/
 # anything the operator wants Claude Code et al. to know that shouldn't ship
 # in the public repo). Companion file to CLAUDE.md.
 CLAUDE.local.md
+.claude/
