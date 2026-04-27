@@ -15,7 +15,17 @@ test:
       - node_modules/
   script:
     - npm ci || npm install
-    - npm test
+    - npm run test:ci
+  artifacts:
+    when: always
+    # JUnit XML feeds the GitLab "Tests" tab on the pipeline page and the
+    # MR widget. `when: always` so a failing run still uploads the report
+    # (which is precisely when you want to inspect it).
+    reports:
+      junit: test-results/junit.xml
+    paths:
+      - test-results/
+    expire_in: 1 week
   rules:
     # Run on every push to any branch and on merge requests.
     - if: $CI_PIPELINE_SOURCE == "push"

@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:ci": "vitest run --reporter=default --reporter=junit --outputFile.junit=./test-results/junit.xml"
   },
   "dependencies": {
     "express": "^4.19.0",

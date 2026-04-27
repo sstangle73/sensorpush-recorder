@@ -2,6 +2,7 @@ node_modules/
 config.local.js
 data/
 coverage/
+test-results/
 *.log
 .DS_Store
 # Local-only AI agent context (personal deployment notes, internal hostnames,
