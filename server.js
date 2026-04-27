@@ -26,7 +26,19 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <path d="M 160 176 Q 112 228 160 280" fill="none" stroke="#4db8ff" stroke-width="14" stroke-linecap="round" opacity="0.45"/>
 </svg>`;
 
-// Generate a thermometer PNG icon at the given size using only built-in modules
+// Procedurally generate the PWA icon: a thermometer (capsule body + bulb) on
+// a rounded-rect dark background, at the given size. Pure built-ins (no PNG
+// encoder dependency) — we hand-roll a single-IDAT, no-filter PNG chunk.
+//
+// Layout (all coords scale with `f = size / 512`):
+//   tW/tH           — thermometer body width / height
+//   tX/tY           — body top-left
+//   bR / bCY        — bulb radius / center-Y (bulb sits below body)
+//   bord            — outline thickness (blue border around body and bulb)
+//   tRx             — body's capsule radius (= half its width)
+//   filY            — y-coord above which body is empty (dark) and below
+//                     which it's filled with mercury red
+//   rc              — corner radius of the dark-grey rounded-rect background
 function makePNG(size) {
   const W = size, H = size, cx = W / 2, f = size / 512;
   const tW = Math.round(80*f), tH = Math.round(248*f);
@@ -35,6 +47,7 @@ function makePNG(size) {
   const bord = Math.max(2, Math.round(14*f)), tRx = tW/2;
   const filY = Math.round(tY + tH*0.38), rc = Math.round(108*f);
 
+  // CRC32 table + per-chunk PNG writer (length, type, data, CRC).
   const crcTable = new Uint32Array(256);
   for (let i=0;i<256;i++){let c=i;for(let j=0;j<8;j++)c=(c&1)?0xedb88320^(c>>>1):(c>>>1);crcTable[i]=c;}
   const crc32 = buf => { let c=0xffffffff; for(const b of buf)c=crcTable[(c^b)&0xff]^(c>>>8); return(c^0xffffffff)>>>0; };
@@ -44,17 +57,30 @@ function makePNG(size) {
     return Buffer.concat([l,t,data,cv]);
   };
 
+  // px(x, y) → [r, g, b, a]. Tested in order: rounded-rect background corner
+  // (anti-aliased fall-off), bulb (red interior + blue ring), thermometer
+  // body (capsule shape: rectangle middle, semicircular caps top + bottom),
+  // else the dark-grey background.
   function px(x,y) {
     const ddx=Math.min(x,W-1-x), ddy=Math.min(y,H-1-y); let a=255;
+    // Rounded-rect alpha: corner pixels outside the corner radius are
+    // transparent; a 1.5-pixel ramp near the radius gives soft edges.
     if(ddx<rc&&ddy<rc){const d=Math.sqrt((rc-ddx)**2+(rc-ddy)**2);if(d>rc)return[0,0,0,0];if(d>rc-1.5)a=Math.round(255*(rc-d)/1.5);}
+    // Bulb: red fill inside (bR-bord), blue ring outside.
     const bx=x-cx,by=y-bCY,bd=Math.sqrt(bx*bx+by*by);
     if(bd<=bR){if(bd<=bR-bord)return[255,107,91,a];return[77,184,255,a];}
+    // Thermometer body capsule.
     if(y>=tY&&y<=tY+tH){
       const tCT=tY+tRx,tCB=tY+tH-tRx,tx=x-cx; let inT=false;
       if(y>=tCT&&y<=tCB)inT=Math.abs(tx)<=tRx;
       else if(y<tCT)inT=Math.sqrt(tx*tx+(y-tCT)**2)<=tRx;
       else           inT=Math.sqrt(tx*tx+(y-tCB)**2)<=tRx;
-      if(inT){if(Math.abs(tx)>tRx-bord||y<tCT)return[77,184,255,a];if(y>=filY)return[255,107,91,a];return[37,37,37,a];}
+      if(inT){
+        // Edge band → blue border; below filY → mercury red; above → empty grey.
+        if(Math.abs(tx)>tRx-bord||y<tCT)return[77,184,255,a];
+        if(y>=filY)return[255,107,91,a];
+        return[37,37,37,a];
+      }
     }
     return[26,26,26,a];
   }
@@ -78,7 +104,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v5';
+const CACHE='sensorpush-v6';
 self.addEventListener('install',e=>{
   e.waitUntil(caches.open(CACHE).then(c=>c.add(new Request(self.registration.scope,{cache:'reload'}))).catch(()=>{}));
   self.skipWaiting();
@@ -90,7 +116,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health)/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -253,7 +279,10 @@ export function createApp(db, config = null) {
     const { fromDate } = req.body ?? {};
     if (!fromDate || !/^\d{4}-\d{2}-\d{2}$/.test(fromDate))
       return res.status(400).json({ ok: false, error: 'fromDate required (YYYY-MM-DD)' });
-    const fromTs = Math.floor(new Date(fromDate + 'T00:00:00').getTime() / 1000);
+    // Parse as UTC midnight ('Z' suffix) so the start epoch is stable across
+    // server timezones — without it, a UTC container and a PT host produce
+    // different boundaries for the same fromDate.
+    const fromTs = Math.floor(new Date(fromDate + 'T00:00:00Z').getTime() / 1000);
     if (isNaN(fromTs)) return res.status(400).json({ ok: false, error: 'Invalid date' });
     if (getBackfillStatus().status === 'running')
       return res.status(409).json({ ok: false, error: 'Backfill already running' });

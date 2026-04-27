@@ -187,16 +187,27 @@ export function getGateways(db) {
 }
 
 // For a [startTs, endTs] window, return whether a gateway was "fresh" (polled
-// with last_seen within FRESH_THRESHOLD of polled_at) at any point during the
-// window. If gatewayId is provided, only that gateway counts; otherwise any.
+// with last_seen within FRESH_THRESHOLD of polled_at) at any point covering
+// the window. If gatewayId is provided, only that gateway counts; otherwise any.
 //   true  → was online during the window
 //   false → polled during the window, stale every time
 //   null  → no poll data within the window (can't tell)
-const FRESH_THRESHOLD = 600; // 10 minutes
+//
+// FRESH_THRESHOLD (10 min) is generous compared to SensorPush's typical ~60s
+// gateway heartbeat; the slack keeps us from false-positive "offline" on
+// momentary network blips between gateway and cloud.
+//
+// LOOKUP_PAD (one poll interval) widens the window so a gap shorter than the
+// 5-min poll cadence can still be answered: a poll just before or after the
+// gap proves the gateway's state continuously, since gateway last_seen is
+// monotonic. Without the pad, sub-5-min gaps return null spuriously.
+const FRESH_THRESHOLD = 600;
+const LOOKUP_PAD      = 5 * 60;
 export function gatewayOnlineDuringWindow(db, startTs, endTs, gatewayId = null) {
+  const lo = startTs - LOOKUP_PAD, hi = endTs + LOOKUP_PAD;
   const rows = gatewayId
-    ? db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ? AND gateway_id = ?`).all(startTs, endTs, gatewayId)
-    : db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ?`).all(startTs, endTs);
+    ? db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ? AND gateway_id = ?`).all(lo, hi, gatewayId)
+    : db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ?`).all(lo, hi);
   if (!rows.length) return null;
   for (const r of rows) {
     if (r.last_seen != null && (r.polled_at - r.last_seen) <= FRESH_THRESHOLD) return true;
@@ -263,6 +274,20 @@ export function insertReadings(db, sensorId, samples) {
 }
 
 export function recomputeHourlyAgg(db, sensorId, hourTs) {
+  // Count non-excluded readings first. If zero, DELETE any existing row
+  // rather than INSERT OR REPLACE-ing it with all-NULL aggregates and
+  // sample_count = 0 — such "zombie" rows would show up in sparseHours
+  // (sample_count < 20) on every gap query and trigger pointless backfills.
+  const { n } = db.prepare(`
+    SELECT COUNT(*) AS n FROM readings
+    WHERE sensor_id = ? AND ts >= ? AND ts < ? AND excluded = 0
+  `).get(sensorId, hourTs, hourTs + 3600);
+
+  if (n === 0) {
+    db.prepare(`DELETE FROM hourly_agg WHERE sensor_id = ? AND hour_ts = ?`).run(sensorId, hourTs);
+    return;
+  }
+
   db.prepare(`
     INSERT OR REPLACE INTO hourly_agg
       (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, sample_count)
@@ -381,29 +406,49 @@ export function setReadingExcluded(db, sensorId, ts, excluded) {
   recomputeHourlyAgg(db, sensorId, ts - (ts % 3600));
 }
 
+// Hourly-bucket exclusion is an explicit override and does NOT recompute —
+// callers may want to mask out a noisy hour without touching individual
+// readings. A subsequent recomputeHourlyAgg() (e.g. after new readings land
+// in the same hour) WILL overwrite the row via INSERT OR REPLACE, which
+// resets excluded to 0. If you need durable hour-level exclusion, exclude
+// the underlying readings instead.
 export function setHourlyExcluded(db, sensorId, hourTs, excluded) {
   db.prepare('UPDATE hourly_agg SET excluded = ? WHERE sensor_id = ? AND hour_ts = ?')
     .run(excluded ? 1 : 0, sensorId, hourTs);
 }
 
 // Returns gap analysis for a sensor: missing windows + sparse hours + coverage %.
+//
+// Three classes of gap are detected:
+//   1. Leading gap   — first reading is significantly after the window start
+//                      (or no readings at all, in which case the whole window
+//                      is one big gap)
+//   2. Interior gaps — pairs of adjacent readings >5 min (or >1 hr at >24h
+//                      ranges) apart, found via SQL window-function LAG
+//   3. Trailing gap  — last reading is significantly before "now"
+//
+// Without (1)/(3) a dead sensor would silently report 100% coverage, since
+// LAG-based detection only finds gaps *between* readings.
 export function getGaps(db, sensorId, range) {
   const rangeSeconds = rangeToSeconds(range) ?? 604800;
   const now     = Math.floor(Date.now() / 1000);
   const startTs = now - rangeSeconds;
+  const useRaw  = rangeSeconds <= 86400;
+  // Gap-detection threshold: 5 min for raw resolution, 1 hr for hourly buckets.
+  const gapThreshold = useRaw ? 300 : 3600;
 
   let gaps = [], sparseHours = [];
 
-  if (rangeSeconds <= 86400) {
+  if (useRaw) {
     gaps = db.prepare(`
       WITH r AS (
         SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts
         FROM readings WHERE sensor_id = ? AND excluded = 0 AND ts >= ?
       )
       SELECT prev_ts AS startTs, ts AS endTs, ts - prev_ts AS durationSecs
-      FROM r WHERE prev_ts IS NOT NULL AND ts - prev_ts > 300
+      FROM r WHERE prev_ts IS NOT NULL AND ts - prev_ts > ?
       ORDER BY durationSecs DESC
-    `).all(sensorId, startTs);
+    `).all(sensorId, startTs, gapThreshold);
   } else {
     gaps = db.prepare(`
       WITH h AS (
@@ -411,9 +456,9 @@ export function getGaps(db, sensorId, range) {
         FROM hourly_agg WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?
       )
       SELECT prev_hour_ts AS startTs, hour_ts AS endTs, hour_ts - prev_hour_ts AS durationSecs
-      FROM h WHERE prev_hour_ts IS NOT NULL AND hour_ts - prev_hour_ts > 3600
+      FROM h WHERE prev_hour_ts IS NOT NULL AND hour_ts - prev_hour_ts > ?
       ORDER BY durationSecs DESC
-    `).all(sensorId, startTs);
+    `).all(sensorId, startTs, gapThreshold);
 
     sparseHours = db.prepare(`
       SELECT hour_ts AS hourTs, sample_count AS sampleCount
@@ -422,6 +467,25 @@ export function getGaps(db, sensorId, range) {
       ORDER BY sample_count ASC
     `).all(sensorId, startTs);
   }
+
+  // Detect leading + trailing gaps using min/max in the window.
+  const bounds = useRaw
+    ? db.prepare(`SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM readings  WHERE sensor_id = ? AND excluded = 0 AND ts      >= ?`).get(sensorId, startTs)
+    : db.prepare(`SELECT MIN(hour_ts) AS lo, MAX(hour_ts) AS hi FROM hourly_agg WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?`).get(sensorId, startTs);
+
+  if (bounds.lo == null) {
+    // No readings at all in the window — one big gap covering everything.
+    gaps.push({ startTs, endTs: now, durationSecs: now - startTs });
+  } else {
+    if (bounds.lo - startTs > gapThreshold) {
+      gaps.push({ startTs, endTs: bounds.lo, durationSecs: bounds.lo - startTs });
+    }
+    if (now - bounds.hi > gapThreshold) {
+      gaps.push({ startTs: bounds.hi, endTs: now, durationSecs: now - bounds.hi });
+    }
+  }
+  // Re-sort: leading/trailing additions may not have landed in duration order.
+  gaps.sort((a, b) => b.durationSecs - a.durationSecs);
 
   const gapSecs    = gaps.reduce((s, g) => s + g.durationSecs, 0);
   const coveragePct = Math.max(0, Math.min(100, (rangeSeconds - gapSecs) / rangeSeconds * 100));

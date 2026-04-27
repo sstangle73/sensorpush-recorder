@@ -13,14 +13,23 @@ export const PORT    = parseInt(process.env.PORT || '3003', 10);
 //     sensorpush: { email: 'you@example.com', password: 'yourpassword' }
 //   };
 //
-export function loadConfig() {
+// parseConfig is exported separately for unit testing — it operates on the
+// already-read source string and never touches the filesystem.
+export function parseConfig(source) {
   try {
-    const source = readFileSync('/config/config.local.js', 'utf8');
     const w = {};
     new Function('window', source)(w);
     if (w.DASHBOARD_CONFIG) return w.DASHBOARD_CONFIG;
   } catch (_) {
-    // fall through
+    // malformed source → empty config
   }
   return {};
+}
+
+export function loadConfig() {
+  try {
+    return parseConfig(readFileSync('/config/config.local.js', 'utf8'));
+  } catch (_) {
+    return {};
+  }
 }

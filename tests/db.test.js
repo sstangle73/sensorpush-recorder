@@ -373,11 +373,12 @@ describe('getGaps', () => {
       expect(coveragePct).toBeCloseTo(100, 0);
     });
 
-    it('returns empty result on empty DB', () => {
+    it('reports the entire window as one gap on empty DB (dead-sensor case)', () => {
       const { gaps, sparseHours, coveragePct } = getGaps(sensorDb(), 'g1', '24h');
-      expect(gaps).toHaveLength(0);
+      expect(gaps).toHaveLength(1);
+      expect(gaps[0].durationSecs).toBeGreaterThanOrEqual(86400 - 1);
       expect(sparseHours).toHaveLength(0);
-      expect(coveragePct).toBeGreaterThanOrEqual(0);
+      expect(coveragePct).toBeLessThan(1);
     });
 
     it('detects a 10-minute gap (> 5 min threshold)', () => {
@@ -392,28 +393,66 @@ describe('getGaps', () => {
       expect(bigGap.durationSecs).toBeGreaterThanOrEqual(600);
     });
 
-    it('does NOT return gaps shorter than 5 minutes', () => {
+    it('does NOT include interior gaps shorter than 5 minutes', () => {
       const db = sensorDb();
       const start = NOW - 86400;
-      // Two readings 4 min apart — below threshold
+      // Two readings 4 min apart — below the 5-min threshold for interior gaps.
+      // (Leading/trailing gaps will still be reported; we only check that no
+      // gap spans this 4-min interior window.)
       insertReadings(db, 'g1', [
         { observed: new Date((start) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
         { observed: new Date((start + 240) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9 },
       ]);
       const { gaps } = getGaps(db, 'g1', '24h');
-      expect(gaps).toHaveLength(0);
+      const interior = gaps.filter(g => g.startTs >= start && g.endTs <= start + 240 + 1);
+      expect(interior).toHaveLength(0);
     });
 
-    it('returns gaps sorted by duration descending', () => {
+    it('returns gaps sorted by duration descending (including leading/trailing)', () => {
       const db = sensorDb();
       const start = NOW - 86400;
-      // Insert three clusters with gaps of 30 min and 60 min
+      // Three clusters with interior gaps of 30 min and 60 min, plus the
+      // leading/trailing gaps the new logic detects. Just assert overall sort.
       insertReadings(db, 'g1', makeSamples('g1', 5, start, 300));
-      insertReadings(db, 'g1', makeSamples('g1', 5, start + 5 * 300 + 1800, 300)); // +30 min gap
-      insertReadings(db, 'g1', makeSamples('g1', 5, start + 10 * 300 + 1800 + 3600, 300)); // +60 min gap
+      insertReadings(db, 'g1', makeSamples('g1', 5, start + 5 * 300 + 1800, 300));
+      insertReadings(db, 'g1', makeSamples('g1', 5, start + 10 * 300 + 1800 + 3600, 300));
       const { gaps } = getGaps(db, 'g1', '24h');
-      expect(gaps.length).toBe(2);
-      expect(gaps[0].durationSecs).toBeGreaterThan(gaps[1].durationSecs);
+      expect(gaps.length).toBeGreaterThanOrEqual(2);
+      for (let i = 1; i < gaps.length; i++) {
+        expect(gaps[i - 1].durationSecs).toBeGreaterThanOrEqual(gaps[i].durationSecs);
+      }
+      // Two interior gaps in the data: ~35min (last of cluster 1 → first of
+      // cluster 2 is 1800s plus the 300s sample spacing) and ~65min between
+      // cluster 2 and cluster 3. Don't assert exact durations — just that
+      // both interior gaps are present and distinct from leading/trailing.
+      const interior = gaps.filter(g => g.startTs >= start && g.endTs <= start + 86400);
+      expect(interior.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('detects a leading gap when readings start well after the window start', () => {
+      const db = sensorDb();
+      // Single reading at end of window — leading gap should cover ~24h
+      insertReadings(db, 'g1', [{
+        observed: new Date((NOW - 60) * 1000).toISOString(),
+        temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9,
+      }]);
+      const { gaps } = getGaps(db, 'g1', '24h');
+      const leading = gaps.find(g => g.startTs <= NOW - 86000);
+      expect(leading).toBeDefined();
+      expect(leading.durationSecs).toBeGreaterThan(86000);
+    });
+
+    it('detects a trailing gap when last reading is well before now', () => {
+      const db = sensorDb();
+      // Single reading at start of window — trailing gap should cover ~24h
+      insertReadings(db, 'g1', [{
+        observed: new Date((NOW - 86000) * 1000).toISOString(),
+        temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9,
+      }]);
+      const { gaps } = getGaps(db, 'g1', '24h');
+      const trailing = gaps.find(g => g.endTs >= NOW - 60);
+      expect(trailing).toBeDefined();
+      expect(trailing.durationSecs).toBeGreaterThan(80000);
     });
   });
 
@@ -635,6 +674,49 @@ describe('per-sample gateway + dewpoint/vpd capture', () => {
     expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100, 'gwB')).toBe(true);
     // No filter → any gateway online
     expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100)).toBe(true);
+  });
+});
+
+describe('recomputeHourlyAgg zombie-row prevention', () => {
+  it('DELETEs the hourly_agg row when no non-excluded readings remain', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's_zombie', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    const hour = Math.floor(Date.now() / 1000);
+    const ts = hour - (hour % 3600) + 60;
+    insertReadings(db, 's_zombie', [{ observed: new Date(ts * 1000).toISOString(), temperature: 70, humidity: 50 }]);
+    recomputeHourlyAgg(db, 's_zombie', ts - (ts % 3600));
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id=?`).get('s_zombie').n).toBe(1);
+
+    // Exclude the only reading → recompute should DELETE the row, not leave
+    // a sample_count=0 ghost that surfaces as a sparseHour.
+    setReadingExcluded(db, 's_zombie', ts, true);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id=?`).get('s_zombie').n).toBe(0);
+  });
+});
+
+describe('gatewayOnlineDuringWindow lookup padding', () => {
+  it('answers a sub-poll-interval gap using a poll just before/after', () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    // Gap is 60s long. Poll happens 200s before the gap's start, with fresh gateway.
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW - 60 }], NOW);
+    // Window entirely after the recorded poll, but within the LOOKUP_PAD (5 min).
+    expect(gatewayOnlineDuringWindow(db, NOW + 100, NOW + 160, 'gw1')).toBe(true);
+  });
+
+  it('still returns null when no poll covers the padded window', () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW }], NOW);
+    // Window is 1 hour after the poll — well outside the 5-min pad.
+    expect(gatewayOnlineDuringWindow(db, NOW + 3600, NOW + 3700, 'gw1')).toBeNull();
+  });
+
+  it('treats null last_seen as not-fresh (gateway never reported)', () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, NULL)`).run('gw1', NOW);
+    expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100, 'gw1')).toBe(false);
   });
 });
 

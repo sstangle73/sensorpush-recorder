@@ -5,6 +5,9 @@ let _lastPollError = null;
 let _lastPollTime  = null;
 let _backfillState = { status: 'idle', progress: null, error: null };
 
+// Run one poll immediately, then every 5 minutes. Errors are intentionally
+// swallowed here so a transient cloud outage doesn't stop the interval — the
+// failure surfaces via /health (lastPollError) and the next tick retries.
 export function startPoller(db, config) {
   _poll(db, config).catch(err => {
     _lastPollError = err.message;
@@ -48,7 +51,10 @@ async function _poll(db, config) {
     let allSamples = [];
 
     if (!latestTs) {
-      // First run: backfill 30 days in 7-day chunks (API limit ~2016 per request)
+      // First run: backfill 30 days in 2-day chunks. The SensorPush /samples
+      // API caps at 10000 rows per response; at ~1 reading/min that's ~7 days
+      // for an HT1, but HTP sensors emit more series so we stay well under
+      // with 2-day windows.
       const now     = Math.floor(Date.now() / 1000);
       const oldest  = now - 30 * 86400;
       const chunk   = 2 * 86400;

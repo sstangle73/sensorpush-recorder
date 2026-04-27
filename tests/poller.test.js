@@ -9,7 +9,7 @@ vi.mock('../sensorpush.js', () => ({
 
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
-import { triggerPoll, getPollStatus, triggerGapBackfill, getBackfillStatus, _resetPollerState } from '../poller.js';
+import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState } from '../poller.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -152,16 +152,19 @@ describe('triggerPoll — incremental fetch', () => {
 });
 
 describe('triggerGapBackfill', () => {
-  it('does nothing and reports zero windows when DB is empty', async () => {
+  it('treats an empty DB as one big gap covering the whole range', async () => {
+    // Empty DB now reports the full window as a single missing gap (a dead
+    // sensor, in effect). Backfill should fetch chunks covering it.
     getToken.mockResolvedValue('tok');
     fetchSensors.mockResolvedValue([sensor('g1')]);
+    fetchSamples.mockResolvedValue([]);
 
     await triggerGapBackfill(makeDb(), CREDS, { range: '24h' });
 
-    expect(fetchSamples).not.toHaveBeenCalled();
+    expect(fetchSamples).toHaveBeenCalled();
     const st = getBackfillStatus();
     expect(st.status).toBe('done');
-    expect(st.progress.total).toBe(0);
+    expect(st.progress.total).toBeGreaterThan(0);
   });
 
   it('fetches only the gap windows derived from local DB state', async () => {
@@ -182,12 +185,18 @@ describe('triggerGapBackfill', () => {
 
     await triggerGapBackfill(db, CREDS, { range: '24h' });
 
-    // One gap window now-23h → now-21h (2h, single chunk)
-    expect(fetchSamples).toHaveBeenCalledTimes(1);
-    const [, w] = fetchSamples.mock.calls[0];
-    expect(w.sensorId).toBe('g2');
-    expect(w.startTs).toBeGreaterThanOrEqual(now - 23 * 3600 - 1);
-    expect(w.stopTs).toBeLessThanOrEqual(now - 21 * 3600 + 1);
+    // Three gap windows: leading (now-86400 → now-23h), interior (now-23h →
+    // now-21h, 2h), trailing (now-21h → now). All targeted at sensor 'g2',
+    // none broader than 2 days.
+    expect(fetchSamples).toHaveBeenCalled();
+    for (const [, w] of fetchSamples.mock.calls) {
+      expect(w.sensorId).toBe('g2');
+      expect(w.stopTs - w.startTs).toBeLessThanOrEqual(2 * 86400);
+    }
+    // Confirm the interior gap is covered by at least one fetch
+    const hasInterior = fetchSamples.mock.calls.some(([, w]) =>
+      w.startTs <= now - 23 * 3600 + 1 && w.stopTs >= now - 21 * 3600 - 1);
+    expect(hasInterior).toBe(true);
   });
 
   it('chunks gap windows longer than 2 days into <=2-day pieces', async () => {
@@ -246,6 +255,86 @@ describe('triggerGapBackfill', () => {
   it('throws when auth fails', async () => {
     getToken.mockResolvedValue(null);
     await expect(triggerGapBackfill(makeDb(), CREDS, { range: '24h' })).rejects.toThrow('SensorPush auth failed');
+  });
+});
+
+describe('triggerBackfill (broad)', () => {
+  it('throws when auth fails', async () => {
+    getToken.mockResolvedValue(null);
+    const fromTs = Math.floor(Date.now() / 1000) - 7 * 86400;
+    await expect(triggerBackfill(makeDb(), CREDS, fromTs)).rejects.toThrow('SensorPush auth failed');
+  });
+
+  it('chunks the [fromTs, now] range into 2-day windows per sensor', async () => {
+    const db = makeDb();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('b1')]);
+    fetchSamples.mockResolvedValue([]);
+
+    const fromTs = Math.floor(Date.now() / 1000) - 6 * 86400;
+    await triggerBackfill(db, CREDS, fromTs);
+
+    // 6 days / 2-day chunks = 3 windows for one sensor
+    expect(fetchSamples).toHaveBeenCalledTimes(3);
+    for (const [, w] of fetchSamples.mock.calls) {
+      expect(w.stopTs - w.startTs).toBeLessThanOrEqual(2 * 86400);
+    }
+  });
+
+  it('throws "already running" when a backfill is in progress', async () => {
+    const db = makeDb();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('b2')]);
+    // Make fetchSamples never resolve so the backfill stays running.
+    let release;
+    const blocker = new Promise(r => { release = r; });
+    fetchSamples.mockImplementation(() => blocker);
+
+    const fromTs = Math.floor(Date.now() / 1000) - 86400;
+    const first = triggerBackfill(db, CREDS, fromTs);
+
+    // Wait one tick so the first call enters the "running" state.
+    await new Promise(r => setImmediate(r));
+    await expect(triggerBackfill(db, CREDS, fromTs)).rejects.toThrow(/already running/i);
+
+    release([]);
+    await first;
+  });
+});
+
+describe('triggerGapBackfill — already-running guard', () => {
+  it('refuses when another backfill is in progress', async () => {
+    const db = makeDb();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('gb1')]);
+    let release;
+    fetchSamples.mockImplementation(() => new Promise(r => { release = r; }));
+
+    const first = triggerGapBackfill(db, CREDS, { range: '24h' });
+    await new Promise(r => setImmediate(r));
+    await expect(triggerGapBackfill(db, CREDS, { range: '24h' })).rejects.toThrow(/already running/i);
+    release([]);
+    await first;
+  });
+});
+
+describe('poller invokes pruneGatewayStatus', () => {
+  it('removes gateway_status rows older than 30 days each successful poll', async () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    // Pre-seed an old row that should be pruned.
+    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, ?)`)
+      .run('old_gw', NOW - 31 * 86400, NOW - 31 * 86400);
+
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('p1')]);
+    fetchSamples.mockResolvedValue([]);
+    fetchGateways.mockResolvedValue([{ id: 'gw1', name: 'A', lastSeen: NOW, lastAlert: null, version: '1', paired: true, message: null }]);
+
+    await triggerPoll(db, CREDS);
+
+    const oldRow = db.prepare(`SELECT 1 FROM gateway_status WHERE gateway_id = ?`).get('old_gw');
+    expect(oldRow).toBeUndefined();
   });
 });
 

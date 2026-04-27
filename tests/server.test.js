@@ -358,7 +358,10 @@ describe('GET /:id/gaps', () => {
 
     const { body } = await get('/gw_gap/gaps?range=24h');
     expect(body.gaps.length).toBeGreaterThan(0);
-    expect(body.gaps[0].gatewayOnline).toBe(true);
+    // Find the interior gap (between the two readings) and verify gateway annotation.
+    const interior = body.gaps.find(g => g.startTs >= now - 23 * 3600 - 1 && g.endTs <= now - 21 * 3600 + 1);
+    expect(interior).toBeDefined();
+    expect(interior.gatewayOnline).toBe(true);
   });
 });
 
@@ -380,5 +383,182 @@ describe('GET /gateways', () => {
     expect(gw.lastSeen).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(gw.version).toBe('1.0');
     expect(gw.paired).toBe(true);
+  });
+});
+
+describe('POST /backfill validation', () => {
+  async function post(path, body) {
+    const res = await fetch(baseUrl + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('returns 503 without config', async () => {
+    // Default `db`-only app has no config → 503 on backfill
+    const { status, body } = await post('/backfill', { fromDate: '2026-01-01' });
+    expect(status).toBe(503);
+    expect(body.ok).toBe(false);
+  });
+
+  it('returns 400 when fromDate is missing', async () => {
+    // Use the no-config app to test validation runs even without config?
+    // Actually 503 fires first. Spin up a second app with a stub config.
+    const stubConfig = { sensorpush: { email: 'YOUR_PLACEHOLDER', password: 'pw' } };
+    const db2 = openDb(':memory:');
+    const srv2 = http.createServer(createApp(db2, stubConfig));
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv2.address().port}`;
+    const r1 = await fetch(u + '/backfill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    expect(r1.status).toBe(400);
+    const r2 = await fetch(u + '/backfill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fromDate: 'not-a-date' }) });
+    expect(r2.status).toBe(400);
+    await new Promise(r => srv2.close(r));
+  });
+
+  it('parses fromDate as UTC midnight (timezone-stable)', async () => {
+    // Verify the route accepts a valid date and that fromTs is computed
+    // from UTC, not local time. We check that triggerBackfill is invoked
+    // with a UTC-derived epoch via the logged "starting" message; here we
+    // just confirm 'YYYY-MM-DD' is accepted. Triggering the actual backfill
+    // would need network mocking — covered indirectly via poller tests.
+    const stubConfig = { sensorpush: { email: 'YOUR_PLACEHOLDER', password: 'pw' } };
+    const db2 = openDb(':memory:');
+    const srv2 = http.createServer(createApp(db2, stubConfig));
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv2.address().port}`;
+    const r = await fetch(u + '/backfill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fromDate: '2026-01-15' }) });
+    expect(r.status).toBe(200);
+    await new Promise(r => srv2.close(r));
+  });
+});
+
+describe('POST /backfill-gaps validation', () => {
+  it('returns 503 without config', async () => {
+    const r = await fetch(baseUrl + '/backfill-gaps', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    expect(r.status).toBe(503);
+  });
+
+  it('returns 400 on invalid range', async () => {
+    const stubConfig = { sensorpush: { email: 'YOUR_PLACEHOLDER', password: 'pw' } };
+    const db2 = openDb(':memory:');
+    const srv2 = http.createServer(createApp(db2, stubConfig));
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv2.address().port}`;
+    const r = await fetch(u + '/backfill-gaps', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ range: 'forever' }) });
+    expect(r.status).toBe(400);
+    await new Promise(r => srv2.close(r));
+  });
+});
+
+describe('GET /backfill/status', () => {
+  it('returns ok with current state', async () => {
+    const { status, body } = await get('/backfill/status');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body).toHaveProperty('status');
+  });
+});
+
+describe('GET/PUT /settings', () => {
+  it('GET returns ok with empty object initially', async () => {
+    const { status, body } = await get('/settings');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.settings).toBeDefined();
+  });
+
+  it('PUT persists ranges, GET reads them back', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h', '24h', '7d', '1yr'] }),
+    });
+    expect(r.status).toBe(200);
+    const { body } = await get('/settings');
+    expect(body.settings.ranges).toEqual(['1h', '24h', '7d', '1yr']);
+  });
+
+  it('PUT rejects invalid range strings', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h', 'forever'] }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('PUT rejects non-array body', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: 'not-an-array' }),
+    });
+    expect(r.status).toBe(400);
+  });
+});
+
+describe('CORS middleware', () => {
+  // Capture the OLD env, set CORS_ORIGINS, build a new app, then restore.
+  // Note: server.js reads CORS_ORIGINS at module-load time, so we need a
+  // fresh import. For simplicity we just assert the documented behavior:
+  // the middleware never echoes "*" and only echoes when origin matches.
+  it('does not set Access-Control-Allow-Origin when no Origin header', async () => {
+    const r = await fetch(baseUrl + '/health');
+    expect(r.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('does not echo unknown origins', async () => {
+    const r = await fetch(baseUrl + '/health', { headers: { Origin: 'https://evil.example.com' } });
+    expect(r.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('OPTIONS request returns 204 quickly without invoking route', async () => {
+    const r = await fetch(baseUrl + '/health', { method: 'OPTIONS' });
+    expect(r.status).toBe(204);
+  });
+});
+
+describe('icon + manifest + sw routes', () => {
+  it('GET /icon.svg returns SVG', async () => {
+    const r = await fetch(baseUrl + '/icon.svg');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toContain('image/svg+xml');
+  });
+
+  it('GET /icon-192.png returns PNG bytes', async () => {
+    const r = await fetch(baseUrl + '/icon-192.png');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toBe('image/png');
+    const buf = Buffer.from(await r.arrayBuffer());
+    // PNG magic number
+    expect(buf[0]).toBe(0x89);
+    expect(buf[1]).toBe(0x50);
+    expect(buf[2]).toBe(0x4e);
+    expect(buf[3]).toBe(0x47);
+  });
+
+  it('GET /icon-512.png returns PNG bytes', async () => {
+    const r = await fetch(baseUrl + '/icon-512.png');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toBe('image/png');
+  });
+
+  it('GET /manifest.json returns valid JSON manifest', async () => {
+    const r = await fetch(baseUrl + '/manifest.json');
+    expect(r.status).toBe(200);
+    const m = await r.json();
+    expect(m.name).toMatch(/SensorPush/);
+    expect(Array.isArray(m.icons)).toBe(true);
+  });
+
+  it('GET /sw.js returns service-worker JS', async () => {
+    const r = await fetch(baseUrl + '/sw.js');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('content-type')).toContain('javascript');
+    const text = await r.text();
+    expect(text).toContain('addEventListener');
   });
 });

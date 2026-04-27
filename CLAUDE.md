@@ -31,13 +31,13 @@ The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js po
 ## Layout
 
 ```
-server.js       — Express bootstrap, all routes, CORS middleware, PWA assets
-config.js       — loadConfig() reads /config/config.local.js via new Function sandbox
-db.js           — node:sqlite schema + queries; excluded flag + migrations
-sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples (2-day chunks, limit 10000)
-poller.js       — 5-min poll loop, 24h lookback, 30-day initial backfill, triggerBackfill
-ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom)
-tests/          — 103 vitest tests; in-memory SQLite + http.createServer for route tests
+server.js       — Express bootstrap, all routes, CORS middleware, PWA assets, procedural PNG icons
+config.js       — loadConfig() reads /config/config.local.js via new Function sandbox; parseConfig() exported for tests
+db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking
+sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
+poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted), gateway-status recording + 30-day prune
+ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom, analytics view with gateway panel + per-gap gateway annotation)
+tests/          — 179 vitest tests; in-memory SQLite + http.createServer for route tests
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
@@ -52,21 +52,36 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 
 ## Routes
 
-`/`, `/health`, `/:id/history`, `/:id/history/all`, `/:id/gaps`, `/:id/readings/exclude` (PATCH), `/:id/hourly/exclude` (PATCH), `/poll` (POST), `/backfill` (POST), `/backfill/status`, `/settings` (GET/PUT), `/ui`, `/icon.svg`, `/icon-{192,512}.png`, `/sw.js`, `/manifest.json`.
+- **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
+- **Gateways**: `GET /gateways`
+- **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
+- **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
+- **Settings**: `GET /settings`, `PUT /settings`
+- **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
 
 `GET /` content-negotiates: `Accept: text/html` → Explorer UI; otherwise JSON sensor list. This lets the root URL serve both API callers and browsers landing at the public hostname.
+
+## Schema (key invariants)
+
+- `readings (sensor_id, ts, …, gateway_id, dewpoint, vpd, excluded)` — `UNIQUE(sensor_id, ts)` + `INSERT OR IGNORE` makes re-fetching free. `gateway_id` is the raw `;`-separated string from the API (multi-gateway reception).
+- `hourly_agg (sensor_id, hour_ts, *_avg, *_min, *_max, dewpoint_avg, vpd_avg, sample_count, excluded)` — recomputed by `recomputeHourlyAgg()` after any reading change. **Empty hours are DELETEd, not persisted as sample_count=0** (otherwise they'd show up as sparseHours forever).
+- `sensors (id, name, type, active, battery_voltage, alerts, rssi, address, device_id, last_updated)` — upserted from `/devices/sensors` each poll.
+- `gateways (id, name, last_seen, last_alert, version, paired, message, last_synced)` — current state, upserted each poll.
+- `gateway_status (gateway_id, polled_at, last_seen)` — append-only per poll, pruned to 30 days. Used by `gatewayOnlineDuringWindow()` to answer "was this gateway online during this gap?"
 
 ## Testing
 
 ```bash
-npm test                       # all 103 tests
+npm test                       # all 179 tests
 npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
+- `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.
 - Module-level caches (`_tokenCache` in `sensorpush.js`, `_lastPollTime` etc. in `poller.js`) persist across tests in the same file — use `_resetTokenCache()` / `_resetPollerState()` between tests.
+- Server-test `db` is shared module-wide. Tests asserting on empty state (e.g. "GET / returns empty sensors list") only pass because they run before any `upsertSensors` — be careful adding new tests above them.
 
 ## Deployment
 
@@ -86,9 +101,33 @@ git pull && docker compose up -d --build
 
 ## Known issues / tricky bits
 
-- **SensorPush OAuth is two-step**: `/oauth/authorize` returns an `authorization` code; `/oauth/accesstoken` exchanges it for an 11h-cached token. Don't try to skip the first step.
-- **Sample API has a 10000-row hard limit** — `fetchSamples` chunks into 2-day windows.
+- **SensorPush OAuth is two-step**: `/oauth/authorize` returns an `authorization` code; `/oauth/accesstoken` exchanges it for an 11h-cached token. There is no `/oauth/refresh` — we redo the full 2-step on cache expiry.
+- **Sample API has a 10000-row hard limit** — `fetchSamples` chunks into 2-day windows. HTP sensors emit more series than HT1, so 2-day is a safe ceiling.
 - **Always look back 24h on incremental polls** — the SensorPush cloud sometimes publishes readings minutes-to-hours late; `INSERT OR IGNORE` makes the overlap free.
 - **`getLatestTs` filters `excluded = 0`** so excluded readings never push the poll window past valid data.
-- **Hourly aggregates auto-recompute** when readings or hourly buckets are excluded — `setReadingExcluded` calls `recomputeHourlyAgg`.
+- **Hourly aggregates auto-recompute** when readings or hourly buckets are excluded — `setReadingExcluded` calls `recomputeHourlyAgg`. `setHourlyExcluded` does NOT recompute and is a manual override (it'll be reset on the next reading-driven recompute).
+- **`recomputeHourlyAgg` deletes empty hours** instead of leaving sample_count=0 ghosts; otherwise those rows surface as sparseHours forever.
+- **`getGaps` detects leading + trailing gaps** by checking `MIN(ts) - startTs` and `now - MAX(ts)` against the gap threshold; without this, a dead sensor reports 100% coverage.
+- **Per-sample `gateway_id`** is the raw API value (semicolon-separated when multiple gateways heard the same sample). `getSensorPrimaryGateway` takes the most-frequent first segment over the last 7d.
+- **`gatewayOnlineDuringWindow` widens lookup by ±5 min** (one poll interval) so sub-poll-interval gaps can still be answered using polls just before/after.
+- **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a PT host.
 - **CORS sends echoed origin, not `*`** — adding a new caller means adding it to `CORS_ORIGINS` (or running behind a same-origin reverse proxy that strips/sets CORS itself).
+- **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
+
+## SensorPush API surface — what we use vs. don't
+
+**Used**:
+- `/oauth/authorize` + `/oauth/accesstoken` — auth (2-step)
+- `/devices/sensors` — full mapping incl. rssi, address, deviceId, alerts
+- `/devices/gateways` — current status incl. last_seen
+- `/samples` — samples incl. dewpoint, vpd, gateways (per-sample gateway attribution)
+
+**Available but unused** (low value):
+- `/reports/list` — empty for users who haven't configured reports in the SensorPush app
+- `/tags` — endpoint exists but minimal API surface
+- Sample fields `altitude` and `altimeter_pressure` (barometer-derived, sparse use case)
+- Sensor `calibration` offsets (already applied server-side to samples, informational only)
+- Top-level `last_time` on `/samples` responses (duplicate of local `MAX(ts)`)
+
+**Doesn't exist** (probed and confirmed 400 from API Gateway):
+- `/oauth/refresh`, `/devices`, `/alerts`, `/notifications`, `/users/me`, per-sensor edit routes, push subscription, CSV export
