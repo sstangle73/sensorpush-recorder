@@ -30,8 +30,9 @@ export function startPoller(db, config) {
 }
 
 // scheduleDaily(hour, minute, fn) — runs `fn` once per day at the next
-// occurrence of the given local-time clock position, then every 24h after.
-// Local time matches the host TZ; on docker2 (UTC) 03:00 fires at 03:00 UTC.
+// occurrence of the given clock position in the host's local time zone,
+// then every 24h after. (Container hosts running UTC will see 03:00 fire
+// at 03:00 UTC; set TZ in compose if you want a different anchor.)
 // We use a one-shot setTimeout that re-arms on completion so the schedule
 // stays aligned even if the host clock drifts or `fn` runs long.
 function scheduleDaily(hour, minute, fn) {

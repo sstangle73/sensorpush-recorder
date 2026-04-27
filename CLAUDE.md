@@ -1,32 +1,22 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in this repository.
+Guidance for Claude Code (and other AI agents) working in this repository.
 
 ## What this is
 
-A standalone Node service that polls the SensorPush cloud every 5 minutes, stores readings in SQLite, and exposes a REST API + self-contained Explorer UI on port 3003. Originally extracted from [storie-dashboard](https://gitlab.com/sstangle73/storie-dashboard); the dashboard's frontend pane fetches from this service cross-origin at `https://sensors.sstangle.in`.
+A standalone Node service that polls the SensorPush cloud every 5 minutes, stores readings in SQLite, and exposes a REST API + self-contained Explorer UI on port 3003.
 
-## Production deployment
+## Deployment
 
-- **Repo**: <https://gitlab.com/sstangle73/sensorpush-recorder> (private)
-- **Host**: docker2 VM (Proxmox), at `/home/sstangle73/stacks/sensorpush-recorder`
-- **Container**: `sensorpush-recorder` listening on `0.0.0.0:3003`
-- **Public URL**: `https://sensors.sstangle.in` via Cloudflare Tunnel → docker2:3003
-- **DB**: `./data/sensorpush.db` (relative to the compose file)
-- **Allowed CORS origins** (set via `CORS_ORIGINS` env var in compose):
-  - `https://dashboard.sstangle.in` (production dashboard)
-  - `http://10.73.37.22:8080` (LAN kiosk)
-  - `http://localhost:8080` (local dev)
-
-Add a new caller by appending its origin to `CORS_ORIGINS` in `docker-compose.yml`, then `docker compose up -d` to recreate the container with the new env.
-
-After source changes:
+Runs as a single-container compose stack. After source changes:
 
 ```bash
-ssh sstangle73@docker2 "cd ~/stacks/sensorpush-recorder && git pull && docker compose up -d --build"
+git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js ui.html ./` list — adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+
+CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
 ## Layout
 
@@ -36,9 +26,9 @@ config.js       — loadConfig() reads /config/config.local.js via new Function 
 db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
 poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune
-.gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom, analytics view with gateway panel + per-gap gateway annotation)
 tests/          — 192 vitest tests; in-memory SQLite + http.createServer for route tests
+.gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
@@ -46,7 +36,7 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 
 ## Configuration
 
-- `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password } }`. Format kept compatible with the dashboard's config.local.js so the same file can be reused if desired.
+- `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern; only `sensorpush.email` and `sensorpush.password` are read.
 - `CORS_ORIGINS` env var — comma-separated allowlist. The middleware echoes the request `Origin` only when it matches an entry; never sends `*`.
 - `DB_PATH` (default `/data/sensorpush.db`)
 - `PORT` (default `3003`)
@@ -57,11 +47,11 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 - **Gateways**: `GET /gateways`
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
-- **Export**: `GET /:id/history.csv?range=7d`
 - **Settings**: `GET /settings`, `PUT /settings`
+- **Export**: `GET /:id/history.csv?range=7d`
 - **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
 
-`GET /` content-negotiates: `Accept: text/html` → Explorer UI; otherwise JSON sensor list. This lets the root URL serve both API callers and browsers landing at the public hostname.
+`GET /` content-negotiates: `Accept: text/html` → Explorer UI; otherwise JSON sensor list. This lets the root URL serve both API callers and browsers landing at the same hostname.
 
 ## Schema (key invariants)
 
@@ -85,22 +75,6 @@ npm run test:watch
 - Module-level caches (`_tokenCache` in `sensorpush.js`, `_lastPollTime` etc. in `poller.js`) persist across tests in the same file — use `_resetTokenCache()` / `_resetPollerState()` between tests.
 - Server-test `db` is shared module-wide. Tests asserting on empty state (e.g. "GET / returns empty sensors list") only pass because they run before any `upsertSensors` — be careful adding new tests above them.
 
-## Deployment
-
-Run as its own compose stack:
-
-```bash
-docker compose up -d --build
-```
-
-After source changes:
-
-```bash
-git pull && docker compose up -d --build
-```
-
-**Dockerfile gotcha**: uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js ui.html ./` list, not `COPY . .`. Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.
-
 ## Known issues / tricky bits
 
 - **SensorPush OAuth is two-step**: `/oauth/authorize` returns an `authorization` code; `/oauth/accesstoken` exchanges it for an 11h-cached token. There is no `/oauth/refresh` — we redo the full 2-step on cache expiry.
@@ -113,10 +87,10 @@ git pull && docker compose up -d --build
 - **`getGaps` detects leading + trailing gaps** by checking `MIN(ts) - startTs` and `now - MAX(ts)` against the gap threshold; without this, a dead sensor reports 100% coverage.
 - **Per-sample `gateway_id`** is the raw API value (semicolon-separated when multiple gateways heard the same sample). `getSensorPrimaryGateway` takes the most-frequent first segment over the last 7d.
 - **`gatewayOnlineDuringWindow` only consults post-gap polls.** Because gateway `last_seen` is monotonically non-decreasing, only a poll at or after gap-start can carry a `last_seen` value reaching the gap; pre-gap polls' freshness is information about pre-gap state, not gap state. Returns true iff some recorded `last_seen ≥ startTs`. POST_GAP_LOOKAHEAD (5 min) extends the upper bound so a gap shorter than the poll cadence can still be answered by the first poll after it.
-- **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a PT host.
+- **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a local-TZ host.
 - **CORS sends echoed origin, not `*`** — adding a new caller means adding it to `CORS_ORIGINS` (or running behind a same-origin reverse proxy that strips/sets CORS itself).
 - **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
-- **Scheduled jobs** (`scheduleDaily` in poller.js) align to host-local clock time, not relative offsets. On docker2 (UTC) "03:00" fires at 03:00 UTC. The schedule re-arms after each run so a long-running job doesn't drift the cadence.
+- **Scheduled jobs** (`scheduleDaily` in poller.js) align to host-local clock time, not relative offsets. The schedule re-arms after each run so a long-running job doesn't drift the cadence.
 - **Daily snapshots use `VACUUM INTO`** which produces a clean single-file copy of the SQLite DB without taking a long write lock. Files land in `/data/backups/sensorpush-YYYY-MM-DD.db`; only the 7 most recent are kept (mtime-sorted, then unlinked beyond 7).
 - **Auto gap-fill (03:00) skips silently** if a manual `/backfill` or `/backfill-gaps` is already running — it doesn't queue or retry.
 

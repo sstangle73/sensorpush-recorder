@@ -9,8 +9,12 @@ services:
     environment:
       # Allowlist of origins permitted to call this API cross-origin.
       # Comma-separated, no spaces. Each value must match a request's
-      # Origin header exactly (scheme + host + port).
-      CORS_ORIGINS: "https://dashboard.sstangle.in,http://10.73.37.22:8080,http://localhost:8080"
+      # Origin header exactly (scheme + host + port). Leave empty if you
+      # only call this service from same-origin or via a reverse proxy
+      # that handles CORS itself.
+      # Example:
+      #   CORS_ORIGINS: "https://dashboard.example.com,http://localhost:8080"
+      CORS_ORIGINS: ""
     volumes:
       - ./config.local.js:/config/config.local.js:ro
       - ./data:/data

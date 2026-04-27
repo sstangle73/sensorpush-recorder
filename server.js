@@ -126,7 +126,7 @@ self.addEventListener('fetch',e=>{
 });
 `;
 
-// CORS_ORIGINS=https://dashboard.sstangle.in,http://10.73.37.22:8080,...
+// Comma-separated allowlist, e.g. CORS_ORIGINS="https://app.example.com,http://localhost:8080".
 // Echoes the request Origin only when it's in the allowlist; never sends "*".
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -159,8 +159,8 @@ export function createApp(db, config = null) {
   });
 
   // GET / → sensors list (JSON) for fetch() callers, ui.html for browsers.
-  // The Accept-header check lets sensors.sstangle.in serve the Explorer UI
-  // at the root while still answering API calls at the same URL.
+  // The Accept-header check lets a single hostname serve both the Explorer UI
+  // (for human visitors) and the API (for fetch() callers) at the root URL.
   app.get('/', (req, res) => {
     if ((req.headers.accept || '').includes('text/html')) {
       return res.setHeader('Content-Type', 'text/html').send(UI_HTML);
