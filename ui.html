@@ -824,6 +824,10 @@ async function refreshChart() {
     };
   });
 
+  // Re-render the sidebar so capability-gated toggles (dewpoint/heat-index/VPD,
+  // pressure for HTP sensors) appear once we know what fields the data has.
+  renderSidebar();
+
   if (_editMode) return;
   renderChart();
 }
