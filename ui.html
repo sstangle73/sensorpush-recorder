@@ -529,6 +529,8 @@ let _series    = {};   // id → Set of active series names
 let _range     = '24h';
 let _colorMap  = {};
 let _chartData = {};   // id → { name, color, samples, resolution }
+let _refreshSeq = 0;   // request token: refreshChart() resolves only when its seq is still current
+let _autoRefreshInFlight = false;
 
 // Interaction state
 let _editMode  = false;
@@ -731,6 +733,11 @@ function updateLastUpdatedLabel() {
 }
 
 async function autoRefreshTick() {
+  // Skip if a previous tick is still in flight — slow networks or a running
+  // backfill can stretch a tick past the 60s interval, and overlapping ticks
+  // race to write _chartData with stale order-dependent results.
+  if (_autoRefreshInFlight) return;
+  _autoRefreshInFlight = true;
   try {
     const sr = await fetch(`${API_BASE}/`).then(r => r.json());
     if (!sr.ok) return;
@@ -753,6 +760,8 @@ async function autoRefreshTick() {
     updateLastUpdatedLabel();
   } catch (e) {
     console.warn('Auto-refresh failed:', e);
+  } finally {
+    _autoRefreshInFlight = false;
   }
 }
 
@@ -799,6 +808,11 @@ async function init() {
 }
 
 async function refreshChart() {
+  // Each call gets a sequence number; if a newer call has started by the
+  // time we resolve, drop our results so the user's most recent intent
+  // (e.g. clicked "7d" while "30d" was in flight) wins.
+  const seq = ++_refreshSeq;
+
   const ids = [..._selected];
   if (!ids.length) {
     document.getElementById('chart-svg-wrap').innerHTML = '';
@@ -812,6 +826,8 @@ async function refreshChart() {
     fetch(`${API_BASE}/${encodeURIComponent(id)}/history/all?range=${_range}`)
       .then(r => r.json()).catch(() => null)
   ));
+
+  if (seq !== _refreshSeq) return; // superseded — discard
 
   _chartData = {};
   results.forEach((d, i) => {

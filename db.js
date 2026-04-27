@@ -186,31 +186,35 @@ export function getGateways(db) {
   return db.prepare(`SELECT id, name, last_seen, last_alert, version, paired, message, last_synced FROM gateways ORDER BY name`).all();
 }
 
-// For a [startTs, endTs] window, return whether a gateway was "fresh" (polled
-// with last_seen within FRESH_THRESHOLD of polled_at) at any point covering
-// the window. If gatewayId is provided, only that gateway counts; otherwise any.
-//   true  → was online during the window
-//   false → polled during the window, stale every time
-//   null  → no poll data within the window (can't tell)
+// For a [startTs, endTs] window, return whether a gateway was online at any
+// point within the window. If gatewayId is provided, only that gateway
+// counts; otherwise any gateway.
 //
-// FRESH_THRESHOLD (10 min) is generous compared to SensorPush's typical ~60s
-// gateway heartbeat; the slack keeps us from false-positive "offline" on
-// momentary network blips between gateway and cloud.
+//   true  → some recorded last_seen falls in [startTs, ∞), i.e. the gateway
+//           was alive at or after gap-start, proving it was online at least
+//           briefly during the gap
+//   false → polls covering the area exist, but every recorded last_seen is
+//           strictly before startTs (gateway was already down before gap)
+//   null  → no poll data covers the area (can't tell — gap predates tracking
+//           or is so recent no post-gap poll has happened yet)
 //
-// LOOKUP_PAD (one poll interval) widens the window so a gap shorter than the
-// 5-min poll cadence can still be answered: a poll just before or after the
-// gap proves the gateway's state continuously, since gateway last_seen is
-// monotonic. Without the pad, sub-5-min gaps return null spuriously.
-const FRESH_THRESHOLD = 600;
-const LOOKUP_PAD      = 5 * 60;
+// Why only post-gap polls inform the answer:
+// gateway_status.last_seen is monotonically non-decreasing per gateway (it's
+// the high-water mark of "I heard the gateway at time T"). A poll BEFORE the
+// gap necessarily has last_seen ≤ polled_at < startTs, so it can never prove
+// the gateway was alive ≥ startTs. Only a poll *after* gap-start can carry a
+// last_seen value reaching into the gap. POST_GAP_LOOKAHEAD widens the
+// upstream bound so a sub-poll-interval gap can be answered by the first
+// poll after it lands.
+const POST_GAP_LOOKAHEAD = 5 * 60;
 export function gatewayOnlineDuringWindow(db, startTs, endTs, gatewayId = null) {
-  const lo = startTs - LOOKUP_PAD, hi = endTs + LOOKUP_PAD;
+  const hi = endTs + POST_GAP_LOOKAHEAD;
   const rows = gatewayId
-    ? db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ? AND gateway_id = ?`).all(lo, hi, gatewayId)
-    : db.prepare(`SELECT polled_at, last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ?`).all(lo, hi);
+    ? db.prepare(`SELECT last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ? AND gateway_id = ?`).all(startTs, hi, gatewayId)
+    : db.prepare(`SELECT last_seen FROM gateway_status WHERE polled_at >= ? AND polled_at <= ?`).all(startTs, hi);
   if (!rows.length) return null;
   for (const r of rows) {
-    if (r.last_seen != null && (r.polled_at - r.last_seen) <= FRESH_THRESHOLD) return true;
+    if (r.last_seen != null && r.last_seen >= startTs) return true;
   }
   return false;
 }
@@ -288,19 +292,26 @@ export function recomputeHourlyAgg(db, sensorId, hourTs) {
     return;
   }
 
+  // Preserve a manual setHourlyExcluded(..., true) override across recomputes —
+  // INSERT OR REPLACE would otherwise silently flip excluded back to 0 on the
+  // next late sample arriving in this hour.
+  const existing = db.prepare(`SELECT excluded FROM hourly_agg WHERE sensor_id = ? AND hour_ts = ?`).get(sensorId, hourTs);
+  const excluded = existing?.excluded ?? 0;
+
   db.prepare(`
     INSERT OR REPLACE INTO hourly_agg
-      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, sample_count)
+      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, sample_count, excluded)
     SELECT ?, ?,
       AVG(temperature), MIN(temperature), MAX(temperature),
       AVG(humidity),    MIN(humidity),    MAX(humidity),
       AVG(baro_pressure),
       AVG(dewpoint),
       AVG(vpd),
-      COUNT(*)
+      COUNT(*),
+      ?
     FROM readings
     WHERE sensor_id = ? AND ts >= ? AND ts < ? AND excluded = 0
-  `).run(sensorId, hourTs, sensorId, hourTs, hourTs + 3600);
+  `).run(sensorId, hourTs, excluded, sensorId, hourTs, hourTs + 3600);
 }
 
 export function getSensors(db) {
@@ -406,12 +417,12 @@ export function setReadingExcluded(db, sensorId, ts, excluded) {
   recomputeHourlyAgg(db, sensorId, ts - (ts % 3600));
 }
 
-// Hourly-bucket exclusion is an explicit override and does NOT recompute —
-// callers may want to mask out a noisy hour without touching individual
-// readings. A subsequent recomputeHourlyAgg() (e.g. after new readings land
-// in the same hour) WILL overwrite the row via INSERT OR REPLACE, which
-// resets excluded to 0. If you need durable hour-level exclusion, exclude
-// the underlying readings instead.
+// Hourly-bucket exclusion is an explicit override that masks a whole hour
+// from charts/aggregates without touching individual readings. The override
+// survives subsequent recomputeHourlyAgg() calls — recompute reads the
+// existing excluded flag and preserves it. The override is lost only if the
+// hour empties out entirely (all underlying readings excluded), in which
+// case recompute DELETEs the row.
 export function setHourlyExcluded(db, sensorId, hourTs, excluded) {
   db.prepare('UPDATE hourly_agg SET excluded = ? WHERE sensor_id = ? AND hour_ts = ?')
     .run(excluded ? 1 : 0, sensorId, hourTs);
@@ -459,14 +470,17 @@ export function getGaps(db, sensorId, range) {
       FROM h WHERE prev_hour_ts IS NOT NULL AND hour_ts - prev_hour_ts > ?
       ORDER BY durationSecs DESC
     `).all(sensorId, startTs, gapThreshold);
-
-    sparseHours = db.prepare(`
-      SELECT hour_ts AS hourTs, sample_count AS sampleCount
-      FROM hourly_agg
-      WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ? AND sample_count < 20
-      ORDER BY sample_count ASC
-    `).all(sensorId, startTs);
   }
+
+  // Sparse hours come from hourly_agg regardless of the chosen range —
+  // even at raw-resolution ranges, "hours with fewer readings than expected"
+  // is useful diagnostic info for the analytics view.
+  sparseHours = db.prepare(`
+    SELECT hour_ts AS hourTs, sample_count AS sampleCount
+    FROM hourly_agg
+    WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ? AND sample_count < 20
+    ORDER BY sample_count ASC
+  `).all(sensorId, startTs);
 
   // Detect leading + trailing gaps using min/max in the window.
   const bounds = useRaw

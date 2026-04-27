@@ -442,6 +442,22 @@ describe('getGaps', () => {
       expect(leading.durationSecs).toBeGreaterThan(86000);
     });
 
+    it('returns sparseHours even at raw resolution (≤24h ranges)', () => {
+      const db = sensorDb();
+      const hour = NOW - 3600;
+      const hourTs = hour - (hour % 3600);
+      // Insert a sparse hour (5 readings) — should appear in sparseHours
+      // regardless of whether the requested range uses raw or hourly path.
+      db.prepare(`
+        INSERT OR REPLACE INTO hourly_agg
+          (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count)
+        VALUES ('g1', ?, 70, 68, 72, 50, 48, 52, null, 5)
+      `).run(hourTs);
+
+      const { sparseHours } = getGaps(db, 'g1', '24h');
+      expect(sparseHours.some(h => h.hourTs === hourTs && h.sampleCount === 5)).toBe(true);
+    });
+
     it('detects a trailing gap when last reading is well before now', () => {
       const db = sensorDb();
       // Single reading at start of window — trailing gap should cover ~24h
@@ -677,6 +693,28 @@ describe('per-sample gateway + dewpoint/vpd capture', () => {
   });
 });
 
+describe('recomputeHourlyAgg preserves setHourlyExcluded override', () => {
+  it('keeps excluded=1 across a recompute triggered by a new reading', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's_pres', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    const hour = Math.floor(Date.now() / 1000);
+    const hourTs = hour - (hour % 3600);
+    insertReadings(db, 's_pres', [{ observed: new Date((hourTs + 60) * 1000).toISOString(), temperature: 70, humidity: 50 }]);
+    recomputeHourlyAgg(db, 's_pres', hourTs);
+
+    // User excludes the noisy hour
+    setHourlyExcluded(db, 's_pres', hourTs, true);
+    expect(db.prepare(`SELECT excluded FROM hourly_agg WHERE sensor_id=? AND hour_ts=?`).get('s_pres', hourTs).excluded).toBe(1);
+
+    // Late sample arrives → poller calls recompute
+    insertReadings(db, 's_pres', [{ observed: new Date((hourTs + 120) * 1000).toISOString(), temperature: 71, humidity: 51 }]);
+    recomputeHourlyAgg(db, 's_pres', hourTs);
+
+    // Override must survive
+    expect(db.prepare(`SELECT excluded FROM hourly_agg WHERE sensor_id=? AND hour_ts=?`).get('s_pres', hourTs).excluded).toBe(1);
+  });
+});
+
 describe('recomputeHourlyAgg zombie-row prevention', () => {
   it('DELETEs the hourly_agg row when no non-excluded readings remain', () => {
     const db = makeDb();
@@ -694,29 +732,48 @@ describe('recomputeHourlyAgg zombie-row prevention', () => {
   });
 });
 
-describe('gatewayOnlineDuringWindow lookup padding', () => {
-  it('answers a sub-poll-interval gap using a poll just before/after', () => {
+describe('gatewayOnlineDuringWindow post-gap lookup semantics', () => {
+  it('uses a post-gap poll whose last_seen reaches into the gap (sub-poll-interval gap)', () => {
     const db = makeDb();
     const NOW = Math.floor(Date.now() / 1000);
-    // Gap is 60s long. Poll happens 200s before the gap's start, with fresh gateway.
-    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW - 60 }], NOW);
-    // Window entirely after the recorded poll, but within the LOOKUP_PAD (5 min).
+    // Gap is 60s long ([NOW+100, NOW+160]). Poll lands 40s after gap end, with
+    // last_seen reaching back into the gap → proves the gateway was alive then.
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW + 110 }], NOW + 200);
     expect(gatewayOnlineDuringWindow(db, NOW + 100, NOW + 160, 'gw1')).toBe(true);
   });
 
-  it('still returns null when no poll covers the padded window', () => {
+  it('returns false when the only post-gap poll has last_seen before the gap', () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    // Poll just after the gap, but the gateway's last_seen is from before the
+    // gap — gateway was already offline before the gap and didn't recover.
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW + 50 }], NOW + 200);
+    expect(gatewayOnlineDuringWindow(db, NOW + 100, NOW + 160, 'gw1')).toBe(false);
+  });
+
+  it('returns null when no poll covers the post-gap lookahead', () => {
     const db = makeDb();
     const NOW = Math.floor(Date.now() / 1000);
     recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW }], NOW);
-    // Window is 1 hour after the poll — well outside the 5-min pad.
+    // Window is 1 hour after the poll — way past POST_GAP_LOOKAHEAD (5 min).
     expect(gatewayOnlineDuringWindow(db, NOW + 3600, NOW + 3700, 'gw1')).toBeNull();
   });
 
-  it('treats null last_seen as not-fresh (gateway never reported)', () => {
+  it('ignores pre-gap polls (their last_seen necessarily predates startTs)', () => {
     const db = makeDb();
     const NOW = Math.floor(Date.now() / 1000);
-    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, NULL)`).run('gw1', NOW);
-    expect(gatewayOnlineDuringWindow(db, NOW - 100, NOW + 100, 'gw1')).toBe(false);
+    // Only evidence is a poll BEFORE the gap with a fresh-looking last_seen —
+    // but that last_seen is inherently < startTs, so it can't prove the
+    // gateway was alive during the gap.
+    recordGatewayStatus(db, [{ id: 'gw1', lastSeen: NOW + 50 }], NOW + 60);
+    expect(gatewayOnlineDuringWindow(db, NOW + 100, NOW + 160, 'gw1')).toBeNull();
+  });
+
+  it('treats null last_seen as not-online (gateway never reported)', () => {
+    const db = makeDb();
+    const NOW = Math.floor(Date.now() / 1000);
+    db.prepare(`INSERT INTO gateway_status (gateway_id, polled_at, last_seen) VALUES (?, ?, NULL)`).run('gw1', NOW + 50);
+    expect(gatewayOnlineDuringWindow(db, NOW, NOW + 30, 'gw1')).toBe(false);
   });
 });
 

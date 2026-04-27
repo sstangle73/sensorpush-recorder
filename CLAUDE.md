@@ -37,7 +37,7 @@ db.js           — node:sqlite schema + queries; migrations on every openDb(); 
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
 poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted), gateway-status recording + 30-day prune
 ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom, analytics view with gateway panel + per-gap gateway annotation)
-tests/          — 179 vitest tests; in-memory SQLite + http.createServer for route tests
+tests/          — 183 vitest tests; in-memory SQLite + http.createServer for route tests
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
@@ -72,7 +72,7 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 ## Testing
 
 ```bash
-npm test                       # all 179 tests
+npm test                       # all 183 tests
 npx vitest run tests/db.test.js
 npm run test:watch
 ```
@@ -107,9 +107,10 @@ git pull && docker compose up -d --build
 - **`getLatestTs` filters `excluded = 0`** so excluded readings never push the poll window past valid data.
 - **Hourly aggregates auto-recompute** when readings or hourly buckets are excluded — `setReadingExcluded` calls `recomputeHourlyAgg`. `setHourlyExcluded` does NOT recompute and is a manual override (it'll be reset on the next reading-driven recompute).
 - **`recomputeHourlyAgg` deletes empty hours** instead of leaving sample_count=0 ghosts; otherwise those rows surface as sparseHours forever.
+- **`recomputeHourlyAgg` preserves the `excluded` flag** set by `setHourlyExcluded` — without this, every late-arriving sample would silently flip excluded=0 via INSERT OR REPLACE and erase the user's hourly override.
 - **`getGaps` detects leading + trailing gaps** by checking `MIN(ts) - startTs` and `now - MAX(ts)` against the gap threshold; without this, a dead sensor reports 100% coverage.
 - **Per-sample `gateway_id`** is the raw API value (semicolon-separated when multiple gateways heard the same sample). `getSensorPrimaryGateway` takes the most-frequent first segment over the last 7d.
-- **`gatewayOnlineDuringWindow` widens lookup by ±5 min** (one poll interval) so sub-poll-interval gaps can still be answered using polls just before/after.
+- **`gatewayOnlineDuringWindow` only consults post-gap polls.** Because gateway `last_seen` is monotonically non-decreasing, only a poll at or after gap-start can carry a `last_seen` value reaching the gap; pre-gap polls' freshness is information about pre-gap state, not gap state. Returns true iff some recorded `last_seen ≥ startTs`. POST_GAP_LOOKAHEAD (5 min) extends the upper bound so a gap shorter than the poll cadence can still be answered by the first poll after it.
 - **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a PT host.
 - **CORS sends echoed origin, not `*`** — adding a new caller means adding it to `CORS_ORIGINS` (or running behind a same-origin reverse proxy that strips/sets CORS itself).
 - **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
