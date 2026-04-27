@@ -139,7 +139,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 // and toggle exclusions. Backwards compatible: leave the env unset for
 // LAN-only deploys to keep auth disabled.
 const RECORDER_TOKEN = process.env.RECORDER_TOKEN || '';
-const PUBLIC_PATHS = new Set(['/health', '/ui', '/icon.svg', '/icon-192.png', '/icon-512.png', '/sw.js', '/manifest.json']);
+const PUBLIC_PATHS = new Set(['/health', '/ui', '/icon.svg', '/icon-192.png', '/icon-512.png', '/sw.js', '/manifest.json', '/favicon.ico']);
 
 export function createApp(db, config = null) {
   const app = express();
@@ -157,16 +157,21 @@ export function createApp(db, config = null) {
     next();
   });
 
-  // Bearer-token gate. Only enforced when RECORDER_TOKEN is set. Public
-  // paths (health, UI assets) stay open so Cloudflare Tunnel health checks
-  // and browser UI loads work without credentials. UI HTML loaded via Accept:
-  // text/html on `/` is also exempt — adding the token check there would
-  // break direct browser navigation to sensors.sstangle.in.
+  // Bearer-token gate. Only enforced when RECORDER_TOKEN is set. Bypasses:
+  //   1. Public paths (health, UI assets, manifest, sw) — Cloudflare Tunnel
+  //      health checks + browser asset loads need no credentials.
+  //   2. HTML GET / — the Explorer UI itself loads via direct browser nav.
+  //   3. Same-origin requests (Sec-Fetch-Site: same-origin) — fetches from
+  //      the Explorer UI's own JS context. Browsers set Sec-Fetch-Site
+  //      automatically and JS cannot override it, so cross-origin
+  //      attackers can't spoof it. Cross-origin programmatic access still
+  //      needs the bearer. The dashboard pane goes through user-api's
+  //      proxy which injects the bearer server-side.
   if (RECORDER_TOKEN) {
     app.use((req, res, next) => {
       if (PUBLIC_PATHS.has(req.path)) return next();
-      // Root path serves UI for browsers — let HTML clients through unauth.
       if (req.path === '/' && (req.headers.accept || '').includes('text/html')) return next();
+      if (req.headers['sec-fetch-site'] === 'same-origin') return next();
       const auth = req.headers.authorization || '';
       const m = /^Bearer\s+(.+)$/i.exec(auth);
       if (!m || m[1] !== RECORDER_TOKEN) {
