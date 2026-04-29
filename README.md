@@ -39,13 +39,38 @@ The first poll backfills 30 days of history; subsequent polls run every 5 minute
 
 | Source | Purpose |
 |---|---|
-| `config.local.js` (mounted to `/config/config.local.js`) | SensorPush credentials |
+| `config.local.js` (mounted to `/config/config.local.js`) | SensorPush credentials — file mode |
+| `SENSORPUSH_EMAIL` + `SENSORPUSH_PASSWORD` env vars | SensorPush credentials — env mode (preferred for managed deploys; wins over the file when both set) |
 | `CORS_ORIGINS` env var | Comma-separated allowlist of origins permitted cross-origin |
 | `RECORDER_TOKEN` env var | Optional shared bearer (alternative to UI-managed file token) |
 | `DB_PATH` env var (default `/data/sensorpush.db`) | SQLite location |
 | `PORT` env var (default `3003`) | HTTP port |
 
 CORS: only origins listed in `CORS_ORIGINS` get an `Access-Control-Allow-Origin` header. The header is never `*` — each origin is echoed exactly when it matches.
+
+### SensorPush credentials — file vs env
+
+The recorder needs your `sensorpush.com` login to call SensorPush's cloud API. Two ways to provide it:
+
+**File mode** (LAN / single-host self-host):
+
+```js
+// /config/config.local.js
+window.DASHBOARD_CONFIG = {
+  sensorpush: { email: 'you@example.com', password: 'yourpassword' }
+};
+```
+
+Mount that file at `/config/config.local.js`. Same shape the original storie-dashboard used; copy/paste compatible.
+
+**Env-var mode** (managed Fly / Kubernetes / any container env that injects secrets):
+
+```bash
+SENSORPUSH_EMAIL=you@example.com
+SENSORPUSH_PASSWORD=yourpassword
+```
+
+Env vars take precedence over the file when both are set, so a managed deploy can override stale mounted state without touching the file.
 
 ### Auth (bearer token)
 

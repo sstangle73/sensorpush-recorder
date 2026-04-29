@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { parseConfig } from '../config.js';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { parseConfig, loadConfig } from '../config.js';
 
 describe('parseConfig', () => {
   it('extracts DASHBOARD_CONFIG when present', () => {
@@ -26,5 +26,35 @@ describe('parseConfig', () => {
     // assignments to `window.X` should NOT leak into our process's globals.
     parseConfig(`window.LEAKED = 'oops';`);
     expect(globalThis.LEAKED).toBeUndefined();
+  });
+});
+
+describe('loadConfig — env-var fallback', () => {
+  let savedEmail, savedPassword;
+  beforeEach(() => {
+    savedEmail = process.env.SENSORPUSH_EMAIL;
+    savedPassword = process.env.SENSORPUSH_PASSWORD;
+    delete process.env.SENSORPUSH_EMAIL;
+    delete process.env.SENSORPUSH_PASSWORD;
+  });
+  afterEach(() => {
+    if (savedEmail !== undefined) process.env.SENSORPUSH_EMAIL = savedEmail;
+    else delete process.env.SENSORPUSH_EMAIL;
+    if (savedPassword !== undefined) process.env.SENSORPUSH_PASSWORD = savedPassword;
+    else delete process.env.SENSORPUSH_PASSWORD;
+  });
+
+  it('uses env vars when both SENSORPUSH_EMAIL and SENSORPUSH_PASSWORD are set', () => {
+    process.env.SENSORPUSH_EMAIL = 'env@example.com';
+    process.env.SENSORPUSH_PASSWORD = 'envpw';
+    const cfg = loadConfig();
+    expect(cfg.sensorpush).toEqual({ email: 'env@example.com', password: 'envpw' });
+  });
+
+  it('falls back to file (which is missing in tests) when only one env var is set', () => {
+    process.env.SENSORPUSH_EMAIL = 'only-email@example.com';
+    // No password set — env path should not match.
+    const cfg = loadConfig();
+    expect(cfg.sensorpush).toBeUndefined();
   });
 });
