@@ -557,6 +557,7 @@ let _series    = {};   // id → Set of active series names
 let _range     = '24h';
 let _colorMap  = {};
 let _chartData = {};   // id → { name, color, samples, resolution }
+let _chartDataRange = null;  // range that _chartData was fetched for; mismatch → invalidate cache
 let _refreshSeq = 0;   // request token: refreshChart() resolves only when its seq is still current
 let _autoRefreshInFlight = false;
 
@@ -783,7 +784,7 @@ async function autoRefreshTick() {
       if (seen) { seen.textContent = timeAgo(s.lastSeen); seen.className = 'sensor-seen ' + seenClass(s.lastSeen); }
     });
 
-    await refreshChart();
+    await refreshChart({ force: true });
     if (_currentView === 'analytics') await loadAnalytics();
     updateLastUpdatedLabel();
   } catch (e) {
@@ -835,14 +836,19 @@ async function init() {
   }
 }
 
-async function refreshChart() {
+async function refreshChart({ force = false } = {}) {
   // Each call gets a sequence number; if a newer call has started by the
   // time we resolve, drop our results so the user's most recent intent
   // (e.g. clicked "7d" while "30d" was in flight) wins.
   const seq = ++_refreshSeq;
-
   const ids = [..._selected];
+
+  // Always refresh the sidebar so toggle states track _selected immediately.
+  renderSidebar();
+
   if (!ids.length) {
+    _chartData = {};
+    _chartDataRange = null;
     document.getElementById('chart-svg-wrap').innerHTML = '';
     document.getElementById('empty').style.display = 'flex';
     document.getElementById('legend').innerHTML = '';
@@ -850,19 +856,37 @@ async function refreshChart() {
   }
   document.getElementById('empty').style.display = 'none';
 
-  const results = await Promise.all(ids.map(id =>
+  // Range change invalidates everything; otherwise reuse cached samples
+  // and just drop entries the user has deselected.
+  if (_chartDataRange !== _range) {
+    _chartData = {};
+    _chartDataRange = _range;
+  }
+  for (const id of Object.keys(_chartData)) {
+    if (!_selected.has(id)) delete _chartData[id];
+  }
+
+  const needFetch = force ? ids : ids.filter(id => !_chartData[id]);
+
+  // Render whatever's already cached so removals and re-orderings paint
+  // before any network round-trip.
+  if (!_editMode) renderChart();
+
+  if (needFetch.length === 0) return;
+
+  const results = await Promise.all(needFetch.map(id =>
     fetch(`${API_BASE}/${encodeURIComponent(id)}/history/all?range=${_range}`)
       .then(r => r.json()).catch(() => null)
   ));
 
   if (seq !== _refreshSeq) return; // superseded — discard
 
-  _chartData = {};
   results.forEach((d, i) => {
     if (!d?.ok) return;
-    _chartData[ids[i]] = {
-      name:       _sensors[ids[i]]?.name || ids[i],
-      color:      _colorMap[ids[i]],
+    const id = needFetch[i];
+    _chartData[id] = {
+      name:       _sensors[id]?.name || id,
+      color:      _colorMap[id],
       samples:    d.samples,
       resolution: d.resolution,
     };
@@ -963,7 +987,6 @@ async function toggleSensor(id) {
     _selected.add(id);
     if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
   }
-  renderSidebar();
   await refreshChart();
   if (_currentView === 'analytics') loadAnalytics();
 }
@@ -974,7 +997,6 @@ function soloSensor(id) {
   if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
   // Auto-enable thresholds when isolating a sensor
   if (_sensors[id]?.alerts) _showThresholds[id] = true;
-  renderSidebar();
   refreshChart();
   if (_currentView === 'analytics') loadAnalytics();
 }
@@ -984,8 +1006,8 @@ function toggleThresholds(cb) {
   renderChart();
 }
 
-function selectAll()  { Object.keys(_sensors).forEach(id => { _selected.add(id); if(!_series[id]) _series[id]=new Set(['temp','humidity','pressure']); }); renderSidebar(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
-function selectNone() { _selected.clear(); renderSidebar(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
+function selectAll()  { Object.keys(_sensors).forEach(id => { _selected.add(id); if(!_series[id]) _series[id]=new Set(['temp','humidity','pressure']); }); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
+function selectNone() { _selected.clear(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
 
 // ── Range & zoom controls ──────────────────────────────────────────────────
 
