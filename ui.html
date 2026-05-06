@@ -173,6 +173,28 @@ header .spacer { flex: 1; }
 .tt-vals { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; }
 .tt-excl { color: var(--excl); font-size: 10px; margin-left: 3px; }
 
+/* ── Series toggles (bulk on/off across all selected sensors) ── */
+#series-toggles {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  align-items: center;
+}
+#series-toggles:empty { display: none; }
+.series-toggle {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg2);
+  color: var(--text3); cursor: pointer; font-size: 12px;
+  font-family: inherit; transition: color .15s, border-color .15s;
+}
+.series-toggle:hover { color: var(--text); }
+.series-toggle.all  { color: var(--accent); border-color: var(--accent); }
+.series-toggle.some { color: var(--warn);   border-color: var(--warn); }
+.series-toggle .stg { font-family: monospace; font-size: 13px; line-height: 1; }
+#series-toggles-label {
+  font-size: 11px; color: var(--text3);
+  margin-right: 2px; user-select: none;
+}
+
 /* ── Legend ── */
 #legend {
   display: flex; flex-wrap: wrap; gap: 10px 18px;
@@ -396,6 +418,7 @@ header .spacer { flex: 1; }
       <input type="datetime-local" id="custom-end">
       <button class="range-btn" onclick="applyCustomRange()">Apply</button>
     </div>
+    <div id="series-toggles"></div>
     <div id="chart-wrap">
       <div id="chart-svg-wrap"></div>
       <div id="tooltip"></div>
@@ -852,6 +875,7 @@ async function refreshChart({ force = false } = {}) {
     document.getElementById('chart-svg-wrap').innerHTML = '';
     document.getElementById('empty').style.display = 'flex';
     document.getElementById('legend').innerHTML = '';
+    document.getElementById('series-toggles').innerHTML = '';
     return;
   }
   document.getElementById('empty').style.display = 'none';
@@ -953,6 +977,7 @@ function renderSidebar() {
       </div>${serRows}`;
     }).join('');
   renderSensorChips();
+  renderSeriesToggles();
 }
 
 function renderSensorChips() {
@@ -976,7 +1001,84 @@ function toggleSeries(cb) {
   const id = cb.dataset.id, ser = cb.dataset.ser;
   if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
   if (cb.checked) _series[id].add(ser); else _series[id].delete(ser);
+  renderSeriesToggles();
   renderChart();
+}
+
+// ── Bulk series toggles ────────────────────────────────────────────────────
+// Returns 'all' | 'some' | 'none' across the currently-selected sensors.
+function seriesState(seriesType) {
+  const ids = [..._selected];
+  if (!ids.length) return 'none';
+  let on = 0;
+  for (const id of ids) {
+    if ((_series[id] || new Set()).has(seriesType)) on++;
+  }
+  if (on === 0) return 'none';
+  if (on === ids.length) return 'all';
+  return 'some';
+}
+
+// True if any selected sensor's data (or sensor-meta) supports this series.
+function seriesAvailable(seriesType) {
+  const ids = [..._selected];
+  if (!ids.length) return false;
+  if (seriesType === 'temp' || seriesType === 'humidity') return true;
+  if (seriesType === 'pressure') {
+    return ids.some(id =>
+      _sensors[id]?.baroPressure != null ||
+      (_chartData[id]?.samples || []).some(s => s.baroPressure != null));
+  }
+  if (seriesType === 'dewpoint') {
+    return ids.some(id => (_chartData[id]?.samples || []).some(s => s.dewpoint != null));
+  }
+  if (seriesType === 'heatindex') {
+    return ids.some(id => (_chartData[id]?.samples || []).some(s => s.temperature != null && s.humidity != null));
+  }
+  if (seriesType === 'vpd') {
+    return ids.some(id => (_chartData[id]?.samples || []).some(s => s.vpd != null));
+  }
+  return false;
+}
+
+function toggleAllSeries(seriesType) {
+  const state = seriesState(seriesType);
+  const ids = [..._selected];
+  // 'all' → off; 'some' / 'none' → on (treat partial as "promote to all")
+  const turnOn = state !== 'all';
+  for (const id of ids) {
+    if (!_series[id]) _series[id] = new Set(['temp', 'humidity', 'pressure']);
+    if (turnOn) _series[id].add(seriesType); else _series[id].delete(seriesType);
+  }
+  renderSidebar();
+  renderSeriesToggles();
+  renderChart();
+}
+
+function renderSeriesToggles() {
+  const el = document.getElementById('series-toggles');
+  if (!el) return;
+  if (_selected.size === 0) { el.innerHTML = ''; return; }
+
+  const types = [
+    { key: 'temp',      label: 'Temperature' },
+    { key: 'humidity',  label: 'Humidity' },
+    { key: 'pressure',  label: 'Pressure' },
+    { key: 'dewpoint',  label: 'Dew point' },
+    { key: 'heatindex', label: 'Heat index' },
+    { key: 'vpd',       label: 'VPD' },
+  ];
+  const items = types.filter(t => seriesAvailable(t.key)).map(t => {
+    const state = seriesState(t.key);
+    const glyph = state === 'all' ? '■' : state === 'some' ? '▣' : '□';
+    const title = state === 'all'
+      ? `Hide ${t.label} on all selected sensors`
+      : `Show ${t.label} on all selected sensors`;
+    return `<button class="series-toggle ${state}" onclick="toggleAllSeries('${t.key}')" title="${title}"><span class="stg">${glyph}</span>${t.label}</button>`;
+  });
+  el.innerHTML = items.length
+    ? `<span id="series-toggles-label">Show:</span>` + items.join('')
+    : '';
 }
 
 async function toggleSensor(id) {
