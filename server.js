@@ -105,9 +105,13 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v7';
+const CACHE='sensorpush-v8';
+// Pre-cache the root with an explicit Accept: text/html so the server's
+// content negotiation returns the Explorer HTML, not the JSON sensor list.
+// Without this, the install fetch goes out as Accept: */*, the cached entry
+// at '/' is JSON, and the next navigation gets served JSON from cache.
 self.addEventListener('install',e=>{
-  e.waitUntil(caches.open(CACHE).then(c=>c.add(new Request(self.registration.scope,{cache:'reload'}))).catch(()=>{}));
+  e.waitUntil(caches.open(CACHE).then(c=>c.add(new Request(self.registration.scope,{cache:'reload',headers:{'Accept':'text/html'}}))).catch(()=>{}));
   self.skipWaiting();
 });
 self.addEventListener('activate',e=>{
