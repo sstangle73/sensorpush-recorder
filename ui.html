@@ -317,6 +317,19 @@ header .spacer { flex: 1; }
 #realtime-grid {
   display: flex; flex-direction: column; gap: 18px;
 }
+/* Two-column layout on wide screens — left column = House, right column =
+ * Outside + Appliances + Other. Toggled by JS, only when both sides have
+ * content; if one side is empty the whole view stays single-column so we
+ * don't end up with a yawning empty half. */
+@media (min-width: 1100px) {
+  #realtime-grid.two-col {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+  }
+}
+.rt-col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .rt-group { display: flex; flex-direction: column; gap: 10px; }
 .rt-group-title {
   display: flex; align-items: baseline; gap: 8px;
@@ -1248,10 +1261,15 @@ function renderRealtime() {
     return tb - ta;
   };
 
-  const sections = [];
+  // Build each group's HTML once, then split into left (House) vs right
+  // (Outside + Appliances + Other) so the two columns can sit side-by-side
+  // on wide screens.
+  const houseSections = [];
+  const otherSections = [];
   for (const grp of RT_GROUPS) {
     const groupBuckets = bucketed[grp.key];
     if (!groupBuckets) continue;
+    let sectionHTML = '';
 
     if (grp.subgroups) {
       // Render each non-empty subgroup as its own card grid under one group header.
@@ -1277,22 +1295,38 @@ function renderRealtime() {
         </div>`);
       }
       if (!subSections.length) continue;
-      sections.push(`<section class="rt-group">
+      sectionHTML = `<section class="rt-group">
         <div class="rt-group-title">${esc(grp.label)} <span class="rt-group-count">${total}</span></div>
         ${subSections.join('')}
-      </section>`);
+      </section>`;
     } else {
       // Flat group — single card grid, no subgroup headers.
       const allIds = Object.values(groupBuckets).flat().slice().sort(sortFn);
       if (!allIds.length) continue;
-      sections.push(`<section class="rt-group">
+      sectionHTML = `<section class="rt-group">
         <div class="rt-group-title">${esc(grp.label)} <span class="rt-group-count">${allIds.length}</span></div>
         <div class="rt-grid">${allIds.map(renderRtCard).join('')}</div>
-      </section>`);
+      </section>`;
     }
+
+    if (grp.key === 'house') houseSections.push(sectionHTML);
+    else                     otherSections.push(sectionHTML);
   }
 
-  grid.innerHTML = sections.join('') || `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+  // Two-col only when both sides have content. Otherwise fall back to a
+  // single column so we don't render a huge empty half.
+  const useTwoCol = houseSections.length > 0 && otherSections.length > 0;
+  grid.classList.toggle('two-col', useTwoCol);
+
+  if (!houseSections.length && !otherSections.length) {
+    grid.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+  } else if (useTwoCol) {
+    grid.innerHTML =
+      `<div class="rt-col">${houseSections.join('')}</div>` +
+      `<div class="rt-col">${otherSections.join('')}</div>`;
+  } else {
+    grid.innerHTML = houseSections.concat(otherSections).join('');
+  }
 }
 
 // ── Stats view ────────────────────────────────────────────────────────────
