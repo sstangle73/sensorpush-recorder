@@ -405,6 +405,73 @@ header .spacer { flex: 1; }
   .rt-row-val { font-size: 18px; }
 }
 
+/* ── Stats view ── */
+#view-stats {
+  flex: 1; overflow-y: auto; padding: 14px 16px 24px;
+  display: none; flex-direction: column; gap: 14px;
+  background: var(--bg);
+}
+#view-stats .an-range-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.stats-highlights {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+.stats-h-card {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 3px;
+  min-width: 0;
+}
+.stats-h-label {
+  font-size: 10px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.stats-h-value {
+  font-size: 18px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.stats-h-sensor {
+  font-size: 11px; color: var(--text2);
+  display: flex; align-items: center; gap: 5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stats-h-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.stats-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 6px; vertical-align: middle;
+}
+.stats-up   { color: var(--warn); }     /* rising — orange */
+.stats-down { color: var(--accent); }   /* falling — blue */
+.stats-flat { color: var(--text3); }
+.stats-group-row td {
+  padding-top: 10px !important;
+  font-size: 10px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .05em;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.stats-group-row.first td { padding-top: 0 !important; }
+.stats-table-wrap { overflow-x: auto; }
+#view-stats .an-table { min-width: 540px; font-variant-numeric: tabular-nums; }
+#view-stats .an-table td:not(:first-child),
+#view-stats .an-table th:not(:first-child) { text-align: right; }
+.stats-footnote { color: var(--text3); font-size: 10px; margin-top: 8px; }
+.stats-io-line  { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.stats-io-line b { color: var(--text); font-weight: 600; }
+
+@media (max-width: 640px) {
+  #view-stats { padding: 8px; gap: 10px; }
+  .stats-highlights { grid-template-columns: 1fr 1fr; gap: 6px; }
+  .stats-h-card { padding: 8px 10px; }
+  .stats-h-value { font-size: 15px; }
+  #view-stats .an-table { font-size: 11px; }
+  #view-stats .an-table th, #view-stats .an-table td { padding: 4px 6px; }
+}
+
 /* ── Settings view ── */
 #view-settings {
   flex: 1; overflow-y: auto; padding: 16px;
@@ -489,6 +556,7 @@ header .spacer { flex: 1; }
 <header>
   <h1>SensorPush Explorer</h1>
   <button class="tab-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
+  <button class="tab-btn"        data-view="stats"     onclick="switchView('stats')">Stats</button>
   <button class="tab-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="tab-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="tab-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
@@ -564,6 +632,17 @@ header .spacer { flex: 1; }
   </div>
 </div>
 
+<div id="view-stats" style="display:none">
+  <div id="stats-range-row" class="an-range-row">
+    <span style="font-size:11px;color:var(--text2)">Range:</span>
+    <button class="an-range-btn"        data-range="24h" onclick="setStatsRange('24h')">24 h</button>
+    <button class="an-range-btn active" data-range="7d"  onclick="setStatsRange('7d')">7 d</button>
+    <button class="an-range-btn"        data-range="30d" onclick="setStatsRange('30d')">30 d</button>
+    <button class="an-range-btn"        data-range="90d" onclick="setStatsRange('90d')">90 d</button>
+  </div>
+  <div id="stats-content"><div class="rt-empty">Loading…</div></div>
+</div>
+
 <div id="view-settings" style="display:none">
   <div class="set-section">
     <h2>Range Buttons</h2>
@@ -610,6 +689,7 @@ header .spacer { flex: 1; }
 <div id="toast"></div>
 <nav id="bottom-nav">
   <button class="nav-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
+  <button class="nav-btn"        data-view="stats"     onclick="switchView('stats')">Stats</button>
   <button class="nav-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="nav-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="nav-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
@@ -736,12 +816,13 @@ let _realtimeLoading      = false;
 
 function switchView(name) {
   _currentView = name;
-  // Sidebar stays visible for explorer and analytics (desktop); realtime and settings get full width.
+  // Sidebar stays visible for explorer and analytics (desktop); realtime, stats, and settings get full width.
   const bodyVisible = name === 'explorer' || name === 'analytics';
   document.getElementById('body').style.display           = bodyVisible          ? 'flex' : 'none';
   document.getElementById('chart-area').style.display     = name === 'explorer'  ? 'flex' : 'none';
   document.getElementById('view-analytics').style.display = name === 'analytics' ? 'flex' : 'none';
   document.getElementById('view-realtime').style.display  = name === 'realtime'  ? 'flex' : 'none';
+  document.getElementById('view-stats').style.display     = name === 'stats'     ? 'flex' : 'none';
   document.getElementById('view-settings').style.display  = name === 'settings'  ? 'flex' : 'none';
   // Mobile chips are for sensor selection in explorer — irrelevant for full-page views.
   const chips = document.getElementById('sensor-chips');
@@ -751,6 +832,7 @@ function switchView(name) {
   if (name === 'analytics') loadAnalytics();
   if (name === 'settings')  renderSettings();
   if (name === 'realtime')  loadRealtime();
+  if (name === 'stats')     loadStats();
 }
 
 function setAnalyticsRange(r) {
@@ -1216,6 +1298,384 @@ function renderRealtime() {
   grid.innerHTML = sections.join('') || `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
 }
 
+// ── Stats view ────────────────────────────────────────────────────────────
+// Comfort thresholds — applied to House-classified sensors only. Outside and
+// Appliance groups skip the "in comfort" stat since the thresholds don't
+// represent anything meaningful for them.
+const TEMP_COMFORT = { lo: 68, hi: 76 };   // °F
+const HUM_COMFORT  = { lo: 30, hi: 60 };   // % RH
+
+let _statsRange   = '7d';
+let _statsHistory = {};        // id → samples[]
+let _statsLoading = false;
+
+// ── stats math ─────────────────────────────────────────────────────────────
+function _mean(xs) {
+  if (!xs.length) return null;
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+// Sample stddev (Bessel-corrected). null for <2 values — no spread without ≥2 pts.
+function _stddev(xs) {
+  if (xs.length < 2) return null;
+  const m = _mean(xs);
+  const v = xs.reduce((acc, x) => acc + (x - m) ** 2, 0) / (xs.length - 1);
+  return Math.sqrt(v);
+}
+// Simple linear regression slope, returns units per day (samples have ts in seconds).
+// 3-point minimum so a single anomaly can't drag the slope.
+function _slopePerDay(samples, field) {
+  const pts = samples.filter(s => s[field] != null);
+  if (pts.length < 3) return null;
+  const xs = pts.map(s => s.ts / 86400);
+  const ys = pts.map(s => s[field]);
+  const xm = _mean(xs), ym = _mean(ys);
+  let num = 0, den = 0;
+  for (let i = 0; i < xs.length; i++) {
+    num += (xs[i] - xm) * (ys[i] - ym);
+    den += (xs[i] - xm) ** 2;
+  }
+  return den === 0 ? null : num / den;
+}
+// Average of (daily high - daily low). Uses tempMin/tempMax from hourly
+// aggregates when present, so the swing reflects within-hour extremes, not
+// just hourly averages.
+function _dailySwing(samples, field, minField, maxField) {
+  if (!samples.length) return null;
+  const byDay = {};
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    const day = Math.floor(s.ts / 86400);
+    const lo = (minField && s[minField] != null) ? s[minField] : s[field];
+    const hi = (maxField && s[maxField] != null) ? s[maxField] : s[field];
+    if (!byDay[day]) byDay[day] = { lo, hi };
+    else {
+      if (lo < byDay[day].lo) byDay[day].lo = lo;
+      if (hi > byDay[day].hi) byDay[day].hi = hi;
+    }
+  }
+  const swings = Object.values(byDay).map(d => d.hi - d.lo);
+  return _mean(swings);
+}
+// Fraction of samples (or hours, for hourly aggregates) within [lo, hi].
+function _inRangePct(samples, field, lo, hi) {
+  let total = 0, hits = 0;
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    total++;
+    if (s[field] >= lo && s[field] <= hi) hits++;
+  }
+  return total ? hits / total : null;
+}
+// Overall min/max across all samples. Looks at min/max sidecar fields when
+// they exist (hourly aggregates carry tempMin/tempMax); raw samples fall
+// back to the field itself.
+function _extremeRange(samples, field, minField, maxField) {
+  let lo = Infinity, hi = -Infinity, n = 0;
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    n++;
+    const sLo = (minField && s[minField] != null) ? s[minField] : s[field];
+    const sHi = (maxField && s[maxField] != null) ? s[maxField] : s[field];
+    if (sLo < lo) lo = sLo;
+    if (sHi > hi) hi = sHi;
+  }
+  return n ? { lo, hi } : null;
+}
+
+function computeSensorStats(samples) {
+  const tempVals  = samples.map(s => s.temperature).filter(v => v != null);
+  const humVals   = samples.map(s => s.humidity).filter(v => v != null);
+  const tempRange = _extremeRange(samples, 'temperature', 'tempMin', 'tempMax');
+  const humRange  = _extremeRange(samples, 'humidity',    'humMin',  'humMax');
+  return {
+    sampleCount:    samples.length,
+    tempAvg:        _mean(tempVals),
+    tempMin:        tempRange?.lo ?? null,
+    tempMax:        tempRange?.hi ?? null,
+    tempStddev:     _stddev(tempVals),
+    tempDailySwing: _dailySwing(samples, 'temperature', 'tempMin', 'tempMax'),
+    tempComfortPct: _inRangePct(samples, 'temperature', TEMP_COMFORT.lo, TEMP_COMFORT.hi),
+    tempSlope:      _slopePerDay(samples, 'temperature'),
+    humAvg:         _mean(humVals),
+    humMin:         humRange?.lo ?? null,
+    humMax:         humRange?.hi ?? null,
+    humStddev:      _stddev(humVals),
+    humDailySwing:  _dailySwing(samples, 'humidity', 'humMin', 'humMax'),
+    humComfortPct:  _inRangePct(samples, 'humidity',  HUM_COMFORT.lo,  HUM_COMFORT.hi),
+    humSlope:       _slopePerDay(samples, 'humidity'),
+  };
+}
+
+// ── fetch / dispatch ───────────────────────────────────────────────────────
+async function loadStats() {
+  if (_statsLoading) return;
+  _statsLoading = true;
+  try {
+    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    if (sr?.ok) _sensors = sr.sensors;
+    Object.keys(_sensors).forEach((id, i) => {
+      if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
+    });
+    const ids = Object.keys(_sensors);
+    const results = await Promise.all(ids.map(id =>
+      fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
+        .then(r => r.json()).catch(() => null)
+    ));
+    _statsHistory = {};
+    results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
+    renderStats();
+  } finally {
+    _statsLoading = false;
+  }
+}
+
+function setStatsRange(r) {
+  _statsRange = r;
+  document.querySelectorAll('#stats-range-row [data-range]').forEach(b =>
+    b.classList.toggle('active', b.dataset.range === r));
+  loadStats();
+}
+
+// ── formatting helpers ────────────────────────────────────────────────────
+function fmtNum(v, decimals = 1) {
+  if (v == null || !isFinite(v)) return '—';
+  return v.toFixed(decimals);
+}
+function fmtPct(v) {
+  if (v == null || !isFinite(v)) return '—';
+  return Math.round(v * 100) + '%';
+}
+function fmtSlope(v, unit) {
+  if (v == null || !isFinite(v)) return '—';
+  const sign = v > 0 ? '+' : v < 0 ? '−' : '';
+  return `${sign}${Math.abs(v).toFixed(2)}${unit}/d`;
+}
+
+// Build a Highlights card. `trendDir` shades the value when set.
+function _hCard(label, value, x, valueClass) {
+  const color = _colorMap[x.id] || '#888';
+  const cls = valueClass ? `stats-h-value ${valueClass}` : 'stats-h-value';
+  return `<div class="stats-h-card">
+    <div class="stats-h-label">${esc(label)}</div>
+    <div class="${cls}">${esc(value)}</div>
+    <div class="stats-h-sensor"><span class="stats-h-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
+  </div>`;
+}
+
+function renderStatsHighlights(all, valid) {
+  if (!valid.length) return '';
+  const liveT = all.filter(x => x.sensor.temperature != null);
+  const liveH = all.filter(x => x.sensor.humidity    != null);
+  const max = (arr, fn) => arr.length ? arr.reduce((a, b) => fn(a) >= fn(b) ? a : b) : null;
+  const min = (arr, fn) => arr.length ? arr.reduce((a, b) => fn(a) <= fn(b) ? a : b) : null;
+
+  const cards = [];
+  if (liveT.length) {
+    const hot  = max(liveT, x => x.sensor.temperature);
+    const cold = min(liveT, x => x.sensor.temperature);
+    cards.push(_hCard('Warmest now', `${hot.sensor.temperature.toFixed(1)}°F`,  hot, 'stats-up'));
+    cards.push(_hCard('Coolest now', `${cold.sensor.temperature.toFixed(1)}°F`, cold, 'stats-down'));
+  }
+  if (liveH.length) {
+    const wet = max(liveH, x => x.sensor.humidity);
+    const dry = min(liveH, x => x.sensor.humidity);
+    cards.push(_hCard('Most humid now', `${Math.round(wet.sensor.humidity)}% RH`, wet));
+    cards.push(_hCard('Driest now',     `${Math.round(dry.sensor.humidity)}% RH`, dry));
+  }
+  const withSig = valid.filter(x => x.stats.tempStddev != null);
+  if (withSig.length >= 2) {
+    const most  = max(withSig, x => x.stats.tempStddev);
+    const least = min(withSig, x => x.stats.tempStddev);
+    cards.push(_hCard('Most variable T', `σ ${most.stats.tempStddev.toFixed(2)}°F`, most));
+    cards.push(_hCard('Steadiest T',     `σ ${least.stats.tempStddev.toFixed(2)}°F`, least));
+  }
+  const withSwing = valid.filter(x => x.stats.tempDailySwing != null);
+  if (withSwing.length) {
+    const biggest = max(withSwing, x => x.stats.tempDailySwing);
+    cards.push(_hCard('Biggest daily swing', `±${biggest.stats.tempDailySwing.toFixed(1)}°F`, biggest));
+  }
+  const withSlope = valid.filter(x => x.stats.tempSlope != null);
+  if (withSlope.length) {
+    const up = max(withSlope, x => x.stats.tempSlope);
+    const dn = min(withSlope, x => x.stats.tempSlope);
+    if (up.stats.tempSlope >  0.1) cards.push(_hCard('Warming fastest', fmtSlope(up.stats.tempSlope, '°F'), up, 'stats-up'));
+    if (dn.stats.tempSlope < -0.1) cards.push(_hCard('Cooling fastest', fmtSlope(dn.stats.tempSlope, '°F'), dn, 'stats-down'));
+  }
+  // Best/worst comfort — only across House sensors (where comfort is meaningful).
+  const houseComfort = valid.filter(x => x.group.group === 'house' && x.stats.tempComfortPct != null);
+  if (houseComfort.length >= 2) {
+    const best  = max(houseComfort, x => x.stats.tempComfortPct);
+    const worst = min(houseComfort, x => x.stats.tempComfortPct);
+    cards.push(_hCard('Most in comfort', fmtPct(best.stats.tempComfortPct),  best));
+    cards.push(_hCard('Least in comfort', fmtPct(worst.stats.tempComfortPct), worst));
+  }
+
+  return `<div class="an-section"><h2>Highlights (${_statsRange})</h2>
+    <div class="stats-highlights">${cards.join('')}</div>
+  </div>`;
+}
+
+function renderIndoorOutdoor(all) {
+  const outside = all.filter(x => x.group.group === 'outside' && x.stats.tempAvg != null);
+  const house   = all.filter(x => x.group.group === 'house'   && x.stats.tempAvg != null);
+  if (!outside.length || !house.length) return '';
+
+  const outAvg = _mean(outside.map(x => x.stats.tempAvg));
+  const inAvg  = _mean(house.map(x   => x.stats.tempAvg));
+  const delta  = inAvg - outAvg;
+  const outSwing = _mean(outside.filter(x => x.stats.tempDailySwing != null).map(x => x.stats.tempDailySwing));
+  const inSwing  = _mean(house.filter(x   => x.stats.tempDailySwing != null).map(x => x.stats.tempDailySwing));
+
+  // Humidity delta where both sides have it
+  const outHum = outside.filter(x => x.stats.humAvg != null);
+  const inHum  = house.filter(x   => x.stats.humAvg != null);
+  let humLine = '';
+  if (outHum.length && inHum.length) {
+    const oH = _mean(outHum.map(x => x.stats.humAvg));
+    const iH = _mean(inHum.map(x  => x.stats.humAvg));
+    const dH = iH - oH;
+    const arrowH = dH > 1 ? '↑' : dH < -1 ? '↓' : '≈';
+    const cls = dH > 1 ? 'stats-up' : dH < -1 ? 'stats-down' : 'stats-flat';
+    humLine = `<div class="stats-io-line">
+      <span class="rt-dim">Humidity:</span>
+      <b>${Math.round(iH)}% RH</b> <span class="${cls}">${arrowH} ${Math.abs(dH).toFixed(0)}%</span>
+      <span class="rt-dim">vs outdoor</span> <b>${Math.round(oH)}% RH</b>
+    </div>`;
+  }
+
+  // Swing dampening — how much do interior walls/insulation smooth diurnal swings.
+  let dampLine = '';
+  if (outSwing && inSwing && outSwing > 0) {
+    const ratio = inSwing / outSwing;
+    const pct   = Math.round(ratio * 100);
+    const summary = pct < 50 ? 'well-insulated'
+                  : pct < 80 ? 'moderately insulated'
+                  : 'poorly insulated';
+    dampLine = `<div class="stats-io-line">
+      <span class="rt-dim">Daily swing:</span>
+      <b>${inSwing.toFixed(1)}°F</b> indoor vs <b>${outSwing.toFixed(1)}°F</b> outdoor —
+      house dampens to <b>${pct}%</b> <span class="rt-dim">(${summary})</span>
+    </div>`;
+  }
+
+  const arrow = delta > 0 ? '↑' : delta < 0 ? '↓' : '=';
+  const cls   = delta > 0 ? 'stats-up' : delta < 0 ? 'stats-down' : 'stats-flat';
+
+  return `<div class="an-section"><h2>Indoor vs Outdoor (${_statsRange})</h2>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      <div class="stats-io-line">
+        <span class="rt-dim">Temperature:</span>
+        <b>${inAvg.toFixed(1)}°F</b> <span class="${cls}">${arrow} ${Math.abs(delta).toFixed(1)}°F</span>
+        <span class="rt-dim">vs outdoor</span> <b>${outAvg.toFixed(1)}°F</b>
+      </div>
+      ${humLine}
+      ${dampLine}
+    </div>
+  </div>`;
+}
+
+// Sort sensors by classification → subgroup → name. Matches the Live page's
+// ordering so users see the same arrangement on both views.
+const _STATS_GROUP_ORDER = { house: 0, outside: 1, appliance: 2, other: 3 };
+const _STATS_SUB_ORDER   = { attic: 0, bedrooms: 1, living: 2, basement: 3, _: 4 };
+const _STATS_GROUP_LABEL = { house: 'House', outside: 'Outside', appliance: 'Appliances', other: 'Other' };
+const _STATS_SUB_LABEL   = { attic: 'Attic', bedrooms: 'Bedrooms', living: 'Living rooms', basement: 'Basement' };
+
+function _sortStats(a, b) {
+  const ga = _STATS_GROUP_ORDER[a.group.group] ?? 9;
+  const gb = _STATS_GROUP_ORDER[b.group.group] ?? 9;
+  if (ga !== gb) return ga - gb;
+  const sa = _STATS_SUB_ORDER[a.group.subgroup || '_'] ?? 9;
+  const sb = _STATS_SUB_ORDER[b.group.subgroup || '_'] ?? 9;
+  if (sa !== sb) return sa - sb;
+  return (a.sensor.name || '').localeCompare(b.sensor.name || '');
+}
+
+function renderStatsTable(all, kind) {
+  const sorted = all.slice().sort(_sortStats);
+  const isTemp = kind === 'temperature';
+  const title  = isTemp ? `Temperature (${_statsRange})` : `Humidity (${_statsRange})`;
+
+  const headers = isTemp
+    ? `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>Swing/day</th><th>In comfort</th><th>Trend</th></tr>`
+    : `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>In comfort</th></tr>`;
+
+  // Insert group rows between sensor rows so the user can see classification
+  // boundaries without a separate legend.
+  const colCount = isTemp ? 7 : 5;
+  let lastGroup = null, lastSub = null, isFirst = true;
+  const rows = sorted.map(x => {
+    const s = x.stats;
+    const color = _colorMap[x.id] || '#888';
+    const isHouse = x.group.group === 'house';
+
+    let groupRow = '';
+    if (x.group.group !== lastGroup || (x.group.group === 'house' && x.group.subgroup !== lastSub)) {
+      const label = x.group.group === 'house'
+        ? `${_STATS_GROUP_LABEL[x.group.group]} — ${_STATS_SUB_LABEL[x.group.subgroup] || 'Unspecified'}`
+        : _STATS_GROUP_LABEL[x.group.group] || 'Other';
+      groupRow = `<tr class="stats-group-row${isFirst ? ' first' : ''}"><td colspan="${colCount}">${esc(label)}</td></tr>`;
+      lastGroup = x.group.group;
+      lastSub   = x.group.subgroup;
+      isFirst = false;
+    }
+
+    if (isTemp) {
+      const slope = s.tempSlope;
+      const slopeCell = slope == null ? '—'
+        : `<span class="${Math.abs(slope) < 0.1 ? 'stats-flat' : slope > 0 ? 'stats-up' : 'stats-down'}">${fmtSlope(slope, '°F')}</span>`;
+      return `${groupRow}<tr>
+        <td><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</td>
+        <td>${s.tempAvg != null ? fmtNum(s.tempAvg) + '°F' : '—'}</td>
+        <td>${s.tempMin != null ? `${fmtNum(s.tempMin)}–${fmtNum(s.tempMax)}` : '—'}</td>
+        <td>${fmtNum(s.tempStddev, 2)}</td>
+        <td>${s.tempDailySwing != null ? fmtNum(s.tempDailySwing) : '—'}</td>
+        <td>${isHouse ? fmtPct(s.tempComfortPct) : '—'}</td>
+        <td>${slopeCell}</td>
+      </tr>`;
+    }
+    return `${groupRow}<tr>
+      <td><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</td>
+      <td>${s.humAvg != null ? Math.round(s.humAvg) + '%' : '—'}</td>
+      <td>${s.humMin != null ? `${Math.round(s.humMin)}–${Math.round(s.humMax)}%` : '—'}</td>
+      <td>${fmtNum(s.humStddev, 2)}</td>
+      <td>${isHouse ? fmtPct(s.humComfortPct) : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  const footnote = isTemp
+    ? `<div class="stats-footnote">Comfort range 68–76°F, applied to House sensors only. σ = standard deviation. Trend = linear regression slope per day.</div>`
+    : `<div class="stats-footnote">Comfort range 30–60% RH (EPA recommended), applied to House sensors only.</div>`;
+
+  return `<div class="an-section"><h2>${title}</h2>
+    <div class="stats-table-wrap"><table class="an-table"><thead>${headers}</thead><tbody>${rows}</tbody></table></div>
+    ${footnote}
+  </div>`;
+}
+
+function renderStats() {
+  const c = document.getElementById('stats-content');
+  if (!c) return;
+  const ids = Object.keys(_sensors);
+  if (!ids.length) {
+    c.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+    return;
+  }
+  const all = ids.map(id => ({
+    id,
+    sensor: _sensors[id],
+    group:  classifySensor(_sensors[id].name),
+    stats:  computeSensorStats(_statsHistory[id] || []),
+  }));
+  const valid = all.filter(x => x.stats.sampleCount > 0);
+  c.innerHTML = [
+    renderStatsHighlights(all, valid),
+    renderIndoorOutdoor(all),
+    renderStatsTable(all, 'temperature'),
+    renderStatsTable(all, 'humidity'),
+  ].filter(Boolean).join('');
+}
+
 // ── Fetch ──────────────────────────────────────────────────────────────────
 
 function updateLastUpdatedLabel() {
@@ -1249,6 +1709,7 @@ async function autoRefreshTick() {
     await refreshChart({ force: true });
     if (_currentView === 'analytics') await loadAnalytics();
     if (_currentView === 'realtime')  await loadRealtime();
+    if (_currentView === 'stats')     await loadStats();
     updateLastUpdatedLabel();
   } catch (e) {
     console.warn('Auto-refresh failed:', e);
