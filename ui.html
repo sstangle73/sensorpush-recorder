@@ -635,10 +635,7 @@ header .spacer { flex: 1; }
 <div id="view-stats" style="display:none">
   <div id="stats-range-row" class="an-range-row">
     <span style="font-size:11px;color:var(--text2)">Range:</span>
-    <button class="an-range-btn"        data-range="24h" onclick="setStatsRange('24h')">24 h</button>
-    <button class="an-range-btn active" data-range="7d"  onclick="setStatsRange('7d')">7 d</button>
-    <button class="an-range-btn"        data-range="30d" onclick="setStatsRange('30d')">30 d</button>
-    <button class="an-range-btn"        data-range="90d" onclick="setStatsRange('90d')">90 d</button>
+    <div id="stats-range-btns" style="display:contents"></div>
   </div>
   <div id="stats-content"><div class="rt-empty">Loading…</div></div>
 </div>
@@ -1411,6 +1408,7 @@ async function loadStats() {
   if (_statsLoading) return;
   _statsLoading = true;
   try {
+    renderStatsRangeBtns();
     const sr = await fetch(`${API_BASE}/`).then(r => r.json());
     if (sr?.ok) _sensors = sr.sensors;
     Object.keys(_sensors).forEach((id, i) => {
@@ -1434,6 +1432,21 @@ function setStatsRange(r) {
   document.querySelectorAll('#stats-range-row [data-range]').forEach(b =>
     b.classList.toggle('active', b.dataset.range === r));
   loadStats();
+}
+
+// Render range buttons from the same _settings.ranges list Explorer uses.
+// Called from loadStats() so the buttons stay in sync if the user edits
+// the range set in Settings and comes back.
+function renderStatsRangeBtns() {
+  const el = document.getElementById('stats-range-btns');
+  if (!el) return;
+  // Drop selected range if the user removed it from settings; otherwise keep it.
+  if (!_settings.ranges.includes(_statsRange)) {
+    _statsRange = _settings.ranges[0] || '7d';
+  }
+  el.innerHTML = _settings.ranges.map(r =>
+    `<button class="an-range-btn${r === _statsRange ? ' active' : ''}" data-range="${esc(r)}">${rangeLabel(r)}</button>`
+  ).join('');
 }
 
 // ── formatting helpers ────────────────────────────────────────────────────
@@ -2044,6 +2057,13 @@ document.getElementById('range-btns').addEventListener('click', e => {
   refreshChart();
 });
 
+// Mirror Explorer's delegated listener for the Stats range buttons.
+document.getElementById('stats-range-btns').addEventListener('click', e => {
+  const btn = e.target.closest('[data-range]');
+  if (!btn) return;
+  setStatsRange(btn.dataset.range);
+});
+
 function resetZoom() {
   _zoomTs = null;
   document.getElementById('zoom-reset').style.display = 'none';
@@ -2267,6 +2287,7 @@ async function saveRangeInput() {
   await saveSettings();
   document.getElementById('ranges-input').value = parsed.join(' ');
   renderRangeBtns();
+  renderStatsRangeBtns();
   showToast('Saved ✓');
 }
 
