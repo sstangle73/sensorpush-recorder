@@ -298,6 +298,93 @@ header .spacer { flex: 1; }
 #custom-range-panel input[type="datetime-local"]:focus { outline: 1px solid var(--accent); }
 #custom-range-panel .range-sep { color: var(--text3); font-size: 12px; }
 
+/* ── Real-time view ── */
+#view-realtime {
+  flex: 1; overflow-y: auto; padding: 14px 16px 24px;
+  display: none; flex-direction: column; gap: 12px;
+  background: var(--bg);
+}
+#realtime-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 11px; color: var(--text2);
+}
+#realtime-head .rt-legend {
+  display: inline-flex; align-items: center; gap: 12px;
+  margin-left: auto;
+}
+#realtime-head .rt-legend span { display: inline-flex; align-items: center; gap: 4px; }
+#realtime-head .rt-legend .stg { font-family: monospace; font-weight: bold; }
+#realtime-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px;
+}
+.rt-empty { color: var(--text2); padding: 32px; text-align: center; grid-column: 1/-1; }
+.rt-card {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  cursor: pointer; transition: border-color .15s, transform .12s;
+}
+.rt-card:hover { border-color: var(--bg4); }
+.rt-card:active { transform: scale(0.99); }
+.rt-card.stale { opacity: 0.6; }
+.rt-head { display: flex; align-items: center; gap: 8px; }
+.rt-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.rt-name {
+  font-weight: 600; font-size: 13px; flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rt-status { font-size: 10.5px; color: var(--text2); white-space: nowrap; }
+.rt-status.warn  { color: var(--warn); }
+.rt-status.stale { color: var(--excl); }
+.rt-rows { display: flex; flex-direction: column; gap: 5px; }
+.rt-row {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 2px 0;
+}
+.rt-row-val {
+  font-variant-numeric: tabular-nums; font-size: 19px; font-weight: 600;
+  line-height: 1.15; color: var(--text);
+}
+.rt-row-unit { font-size: 11px; color: var(--text2); margin-left: 1px; }
+.rt-row-label {
+  font-size: 10px; color: var(--text3); text-transform: uppercase;
+  letter-spacing: .04em; min-width: 28px;
+}
+.rt-trend {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+  padding: 2px 7px; border-radius: 10px;
+  background: var(--bg3); color: var(--text3);
+  white-space: nowrap;
+}
+.rt-trend.up   { color: var(--warn); }    /* rising = warm */
+.rt-trend.down { color: var(--accent); }  /* falling = cool */
+.rt-trend.flat { color: var(--text3); }
+.rt-trend-arrow { font-weight: bold; line-height: 1; font-size: 12px; }
+.rt-spark { display: block; width: 100%; height: 34px; }
+.rt-spark-empty {
+  height: 34px; display: flex; align-items: center; justify-content: center;
+  color: var(--text3); font-size: 10px;
+}
+.rt-meta {
+  font-size: 10.5px; color: var(--text2);
+  border-top: 1px solid var(--border); padding-top: 8px;
+  display: flex; flex-direction: column; gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.rt-meta .rt-meta-line { display: flex; gap: 10px; flex-wrap: wrap; }
+.rt-meta .rt-dim { color: var(--text3); }
+.rt-meta b { color: var(--text); font-weight: 500; }
+@media (max-width: 640px) {
+  #view-realtime { padding: 8px; }
+  #realtime-grid { grid-template-columns: 1fr; gap: 8px; }
+  .rt-card { padding: 10px 12px; }
+  .rt-row-val { font-size: 18px; }
+}
+
 /* ── Settings view ── */
 #view-settings {
   flex: 1; overflow-y: auto; padding: 16px;
@@ -381,6 +468,7 @@ header .spacer { flex: 1; }
 
 <header>
   <h1>SensorPush Explorer</h1>
+  <button class="tab-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
   <button class="tab-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="tab-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="tab-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
@@ -442,6 +530,20 @@ header .spacer { flex: 1; }
   </div>
 </div>
 
+<div id="view-realtime" style="display:none">
+  <div id="realtime-head">
+    <span>Live readings · trend over last 30 min</span>
+    <div class="rt-legend">
+      <span class="rt-trend up" style="background:transparent;padding:0"><span class="rt-trend-arrow stg">▲</span> rising</span>
+      <span class="rt-trend down" style="background:transparent;padding:0"><span class="rt-trend-arrow stg">▼</span> falling</span>
+      <span class="rt-trend flat" style="background:transparent;padding:0"><span class="rt-trend-arrow stg">→</span> steady</span>
+    </div>
+  </div>
+  <div id="realtime-grid">
+    <div class="rt-empty">Loading…</div>
+  </div>
+</div>
+
 <div id="view-settings" style="display:none">
   <div class="set-section">
     <h2>Range Buttons</h2>
@@ -487,6 +589,7 @@ header .spacer { flex: 1; }
 
 <div id="toast"></div>
 <nav id="bottom-nav">
+  <button class="nav-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
   <button class="nav-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="nav-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="nav-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
@@ -604,19 +707,30 @@ let _analyticsData        = {};   // id → { gaps, sparseHours, coveragePct, ra
 let _analyticsSelectedId  = null;
 let _gateways             = [];   // [{ id, name, lastSeen, version, paired, ... }]
 
+// Real-time state — raw history per sensor used for trend + sparkline.
+// _realtimeHistory: id → { samples: [{ ts, temperature, humidity, baroPressure, dewpoint, vpd }] }
+let _realtimeHistory      = {};
+let _realtimeLoading      = false;
+
 // ── Analytics ─────────────────────────────────────────────────────────────
 
 function switchView(name) {
   _currentView = name;
-  // Sidebar stays visible for both explorer and analytics (desktop); settings gets full width.
-  document.getElementById('body').style.display           = name !== 'settings'  ? 'flex' : 'none';
+  // Sidebar stays visible for explorer and analytics (desktop); realtime and settings get full width.
+  const bodyVisible = name === 'explorer' || name === 'analytics';
+  document.getElementById('body').style.display           = bodyVisible          ? 'flex' : 'none';
   document.getElementById('chart-area').style.display     = name === 'explorer'  ? 'flex' : 'none';
   document.getElementById('view-analytics').style.display = name === 'analytics' ? 'flex' : 'none';
+  document.getElementById('view-realtime').style.display  = name === 'realtime'  ? 'flex' : 'none';
   document.getElementById('view-settings').style.display  = name === 'settings'  ? 'flex' : 'none';
+  // Mobile chips are for sensor selection in explorer — irrelevant for full-page views.
+  const chips = document.getElementById('sensor-chips');
+  if (chips) chips.style.display = bodyVisible ? '' : 'none';
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
   document.querySelectorAll('.nav-btn[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === name));
   if (name === 'analytics') loadAnalytics();
   if (name === 'settings')  renderSettings();
+  if (name === 'realtime')  loadRealtime();
 }
 
 function setAnalyticsRange(r) {
@@ -777,6 +891,223 @@ function renderAnalytics() {
     ${gapDetail}`;
 }
 
+// ── Real-time view ────────────────────────────────────────────────────────
+// Compute a trend by comparing recent-window mean vs anchor-window mean.
+// This dampens single-sample noise (SensorPush HT/HTP reports ≈1 sample/min,
+// each ± ~0.1°F jitter). Returns null when there aren't enough samples to
+// make a credible call.
+//
+// Window layout, anchored on the most-recent sample's ts (= "now"):
+//
+//   anchor window           gap        recent window
+//   [now-35m … now-25m]    (skip)    [now-10m … now]
+//
+// rate = (recent_mean - anchor_mean) / (lookback_hours)
+function computeTrend(samples, field, lookbackMin = 30) {
+  if (!samples?.length) return null;
+  const nowSec = samples[samples.length - 1].ts;
+  const recent = [], anchor = [];
+  const recentMin = 10;
+  const anchorStart = nowSec - (lookbackMin + 5) * 60;
+  const anchorEnd   = nowSec - (lookbackMin - 5) * 60;
+  for (const s of samples) {
+    const v = s[field];
+    if (v == null) continue;
+    if (s.ts >= nowSec - recentMin * 60) recent.push(v);
+    if (s.ts >= anchorStart && s.ts <= anchorEnd) anchor.push(v);
+  }
+  if (recent.length < 2 || anchor.length < 2) return null;
+  const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const delta = mean(recent) - mean(anchor);
+  return { delta, ratePerHour: delta / (lookbackMin / 60) };
+}
+
+// Thresholds below which a trend is "flat" — picked to be larger than typical
+// 30-min sensor noise but smaller than a real environmental shift.
+const RT_FLAT = { temperature: 0.15, humidity: 0.4, baroPressure: 0.08 };
+
+function trendPill(trend, field, unit) {
+  if (!trend) return `<span class="rt-trend flat" title="Not enough recent data"><span class="rt-trend-arrow">—</span></span>`;
+  const r = trend.ratePerHour;
+  const flat = Math.abs(r) < (RT_FLAT[field] ?? 0.1);
+  const dir = flat ? 'flat' : r > 0 ? 'up' : 'down';
+  const arrow = flat ? '→' : r > 0 ? '▲' : '▼';
+  const mag = Math.abs(r);
+  // Pick number of decimals so small values still register
+  const decimals = mag >= 10 ? 0 : mag >= 1 ? 1 : 2;
+  const sign = flat ? '' : r > 0 ? '+' : '−';
+  const label = flat
+    ? 'steady'
+    : `${sign}${mag.toFixed(decimals)} ${unit}/hr`;
+  const title = flat
+    ? `Steady over last 30 min (≤ ${RT_FLAT[field] ?? 0.1} ${unit}/hr noise floor)`
+    : `${r > 0 ? 'Rising' : 'Falling'} ≈ ${sign}${mag.toFixed(decimals)} ${unit} per hour (last 30 min)`;
+  return `<span class="rt-trend ${dir}" title="${title}"><span class="rt-trend-arrow">${arrow}</span>${label}</span>`;
+}
+
+// Tiny inline-SVG sparkline. Skips points whose field is null so a sensor
+// with intermittent baro readings doesn't draw zigzags to 0.
+function sparkline(samples, field, color, width = 260, height = 34) {
+  const pts = [];
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    pts.push({ ts: s.ts, v: s[field] });
+  }
+  if (pts.length < 2) return `<div class="rt-spark-empty">no recent data</div>`;
+  const tMin = pts[0].ts, tMax = pts[pts.length - 1].ts;
+  const tSpan = Math.max(tMax - tMin, 1);
+  let vMin = Infinity, vMax = -Infinity;
+  for (const p of pts) { if (p.v < vMin) vMin = p.v; if (p.v > vMax) vMax = p.v; }
+  const vSpan = Math.max(vMax - vMin, 0.5);
+  const pad = 2;
+  const poly = pts.map(p => {
+    const x = ((p.ts - tMin) / tSpan) * (width - pad * 2) + pad;
+    const y = height - pad - ((p.v - vMin) / vSpan) * (height - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  return `<svg class="rt-spark" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+    <polyline points="${poly}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity="0.85"/>
+  </svg>`;
+}
+
+// 24h min/max over raw samples for a field. Returns null if no samples.
+function range24h(samples, field) {
+  const nowSec = samples?.length ? samples[samples.length - 1].ts : Math.floor(Date.now() / 1000);
+  const cutoff = nowSec - 24 * 3600;
+  let lo = Infinity, hi = -Infinity, count = 0;
+  for (const s of samples || []) {
+    if (s.ts < cutoff || s[field] == null) continue;
+    if (s[field] < lo) lo = s[field];
+    if (s[field] > hi) hi = s[field];
+    count++;
+  }
+  return count ? { lo, hi } : null;
+}
+
+async function loadRealtime() {
+  if (_realtimeLoading) return;
+  _realtimeLoading = true;
+  try {
+    // Pull fresh sensor list so values reflect the latest poll
+    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    if (sr?.ok) _sensors = sr.sensors;
+    // Color map for any newly-discovered sensors
+    Object.keys(_sensors).forEach((id, i) => {
+      if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
+    });
+    // Fetch 24h of raw samples per sensor so we get enough for a 30-min trend
+    // AND for 24h min/max in one round-trip. Range '24h' returns 'raw' resolution.
+    const ids = Object.keys(_sensors);
+    const results = await Promise.all(ids.map(id =>
+      fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=24h`)
+        .then(r => r.json()).catch(() => null)
+    ));
+    _realtimeHistory = {};
+    results.forEach((d, i) => {
+      if (d?.ok) _realtimeHistory[ids[i]] = { samples: d.samples || [] };
+    });
+    renderRealtime();
+  } finally {
+    _realtimeLoading = false;
+  }
+}
+
+function realtimeCardClick(id) {
+  if (_longHoldConsumed()) return;
+  soloSensor(id);
+  switchView('explorer');
+}
+
+function renderRealtime() {
+  const grid = document.getElementById('realtime-grid');
+  if (!grid) return;
+  const ids = Object.keys(_sensors);
+  if (!ids.length) {
+    grid.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+    return;
+  }
+  // Newest activity first, with stale sensors sinking to the bottom
+  ids.sort((a, b) => {
+    const ta = _sensors[a].lastSeen ? new Date(_sensors[a].lastSeen).getTime() : 0;
+    const tb = _sensors[b].lastSeen ? new Date(_sensors[b].lastSeen).getTime() : 0;
+    return tb - ta;
+  });
+
+  grid.innerHTML = ids.map(id => {
+    const s = _sensors[id];
+    const hist = _realtimeHistory[id]?.samples || [];
+    const color = _colorMap[id] || '#888';
+    const seenCls = seenClass(s.lastSeen);
+    const stale = seenCls === 'stale';
+
+    // Trends (computed from 30-min window of 24h history)
+    const tT = computeTrend(hist, 'temperature');
+    const tH = computeTrend(hist, 'humidity');
+    const tB = computeTrend(hist, 'baroPressure');
+
+    const tempStr = s.temperature != null ? s.temperature.toFixed(1) : '—';
+    const humStr  = s.humidity    != null ? Math.round(s.humidity)  : '—';
+    const baroStr = s.baroPressure != null ? s.baroPressure.toFixed(1) : null;
+
+    // Capability gates — only render baro row when this sensor has it
+    const hasBaro = s.baroPressure != null ||
+      hist.some(x => x.baroPressure != null);
+
+    // Last raw sample drives the derived metrics so they're consistent with
+    // the trend window (rather than sensors-table values which may be a poll
+    // older).
+    const lastRaw = hist.length ? hist[hist.length - 1] : null;
+    const dew  = lastRaw?.dewpoint ?? null;
+    const vpd  = lastRaw?.vpd ?? null;
+    const hi   = (s.temperature != null && s.humidity != null)
+      ? heatIndex(s.temperature, s.humidity) : null;
+
+    const r24T = range24h(hist, 'temperature');
+    const r24H = range24h(hist, 'humidity');
+
+    const rssi = rssiBadge(s.rssi);
+    const batt = batteryBadge(s.batteryVoltage);
+
+    return `<div class="rt-card ${stale ? 'stale' : ''}" data-id="${esc(id)}" onclick="realtimeCardClick('${esc(id)}')">
+      <div class="rt-head">
+        <span class="rt-dot" style="background:${color}"></span>
+        <span class="rt-name" title="${esc(s.name)}">${esc(s.name)}</span>
+        <span class="rt-status ${seenCls}">${timeAgo(s.lastSeen)}</span>
+      </div>
+      <div class="rt-rows">
+        <div class="rt-row">
+          <span class="rt-row-label">T</span>
+          <span class="rt-row-val">${tempStr}<span class="rt-row-unit">°F</span></span>
+          ${trendPill(tT, 'temperature', '°F')}
+        </div>
+        <div class="rt-row">
+          <span class="rt-row-label">RH</span>
+          <span class="rt-row-val">${humStr}<span class="rt-row-unit">%</span></span>
+          ${trendPill(tH, 'humidity', '%')}
+        </div>
+        ${hasBaro ? `<div class="rt-row">
+          <span class="rt-row-label">P</span>
+          <span class="rt-row-val">${baroStr ?? '—'}<span class="rt-row-unit">hPa</span></span>
+          ${trendPill(tB, 'baroPressure', 'hPa')}
+        </div>` : ''}
+      </div>
+      ${sparkline(hist, 'temperature', color)}
+      <div class="rt-meta">
+        <div class="rt-meta-line">
+          ${dew != null ? `<span><span class="rt-dim">Dew</span> <b>${dew.toFixed(1)}°F</b></span>` : ''}
+          ${hi != null ? `<span><span class="rt-dim">HI</span> <b>${hi.toFixed(1)}°F</b></span>` : ''}
+          ${vpd != null ? `<span><span class="rt-dim">VPD</span> <b>${vpd.toFixed(2)} kPa</b></span>` : ''}
+        </div>
+        <div class="rt-meta-line">
+          ${r24T ? `<span><span class="rt-dim">24h T</span> <b>${r24T.lo.toFixed(1)}–${r24T.hi.toFixed(1)}°F</b></span>` : ''}
+          ${r24H ? `<span><span class="rt-dim">24h RH</span> <b>${Math.round(r24H.lo)}–${Math.round(r24H.hi)}%</b></span>` : ''}
+        </div>
+        ${(rssi || batt) ? `<div class="rt-meta-line">${rssi}${batt}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
 // ── Fetch ──────────────────────────────────────────────────────────────────
 
 function updateLastUpdatedLabel() {
@@ -809,6 +1140,7 @@ async function autoRefreshTick() {
 
     await refreshChart({ force: true });
     if (_currentView === 'analytics') await loadAnalytics();
+    if (_currentView === 'realtime')  await loadRealtime();
     updateLastUpdatedLabel();
   } catch (e) {
     console.warn('Auto-refresh failed:', e);
