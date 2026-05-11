@@ -315,11 +315,30 @@ header .spacer { flex: 1; }
 #realtime-head .rt-legend span { display: inline-flex; align-items: center; gap: 4px; }
 #realtime-head .rt-legend .stg { font-family: monospace; font-weight: bold; }
 #realtime-grid {
+  display: flex; flex-direction: column; gap: 18px;
+}
+.rt-group { display: flex; flex-direction: column; gap: 10px; }
+.rt-group-title {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; font-weight: 600; color: var(--text2);
+  text-transform: uppercase; letter-spacing: .08em;
+  border-bottom: 1px solid var(--border); padding-bottom: 6px;
+}
+.rt-group-title .rt-group-count {
+  font-size: 10.5px; font-weight: 500; color: var(--text3);
+  letter-spacing: normal; text-transform: none;
+}
+.rt-subgroup { display: flex; flex-direction: column; gap: 8px; margin-top: 2px; }
+.rt-subgroup-title {
+  font-size: 10.5px; font-weight: 500; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.rt-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
   gap: 12px;
 }
-.rt-empty { color: var(--text2); padding: 32px; text-align: center; grid-column: 1/-1; }
+.rt-empty { color: var(--text2); padding: 32px; text-align: center; }
 .rt-card {
   background: var(--bg2); border: 1px solid var(--border);
   border-radius: 8px; padding: 12px 14px;
@@ -380,7 +399,8 @@ header .spacer { flex: 1; }
 .rt-meta b { color: var(--text); font-weight: 500; }
 @media (max-width: 640px) {
   #view-realtime { padding: 8px; }
-  #realtime-grid { grid-template-columns: 1fr; gap: 8px; }
+  #realtime-grid { gap: 14px; }
+  .rt-grid { grid-template-columns: 1fr; gap: 8px; }
   .rt-card { padding: 10px 12px; }
   .rt-row-val { font-size: 18px; }
 }
@@ -1018,6 +1038,112 @@ function realtimeCardClick(id) {
   switchView('explorer');
 }
 
+// Group/sub-group structure for the Live view.
+// Order here is the rendering order. Each subgroup's label maps to the
+// keys returned by classifySensor().
+const RT_GROUPS = [
+  { key: 'house', label: 'House', subgroups: [
+    { key: 'attic',    label: 'Attic' },
+    { key: 'bedrooms', label: 'Bedrooms' },
+    { key: 'living',   label: 'Living rooms' },
+    { key: 'basement', label: 'Basement' },
+  ]},
+  { key: 'outside',   label: 'Outside',    subgroups: null },
+  { key: 'appliance', label: 'Appliances', subgroups: null },
+  { key: 'other',     label: 'Other',      subgroups: null },
+];
+
+// Keyword-based classification of a sensor by display name. Order matters:
+// Appliance and Outside are checked before House subgroups so a "Garage
+// Fridge" sensor lands under Appliances, not Outside.
+function classifySensor(name) {
+  const n = name || '';
+  if (/\b(fridge|refrig|freezer|cabinet|rack|server|cooler|wine|incubator|pantry)\b/i.test(n))
+    return { group: 'appliance', subgroup: null };
+  if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
+    return { group: 'outside', subgroup: null };
+  if (/\battic\b/i.test(n))
+    return { group: 'house', subgroup: 'attic' };
+  if (/\b(bedroom|bedrm|bath|nursery|loft|master|kids?)\b/i.test(n))
+    return { group: 'house', subgroup: 'bedrooms' };
+  if (/\b(living|kitchen|dining|family|foyer|den|study|office|main|hallway|entry|mudroom)\b/i.test(n))
+    return { group: 'house', subgroup: 'living' };
+  if (/\b(basement|cellar|crawl)\b/i.test(n))
+    return { group: 'house', subgroup: 'basement' };
+  return { group: 'other', subgroup: null };
+}
+
+function renderRtCard(id) {
+  const s = _sensors[id];
+  const hist = _realtimeHistory[id]?.samples || [];
+  const color = _colorMap[id] || '#888';
+  const seenCls = seenClass(s.lastSeen);
+  const stale = seenCls === 'stale';
+
+  const tT = computeTrend(hist, 'temperature');
+  const tH = computeTrend(hist, 'humidity');
+  const tB = computeTrend(hist, 'baroPressure');
+
+  const tempStr = s.temperature != null ? s.temperature.toFixed(1) : '—';
+  const humStr  = s.humidity    != null ? Math.round(s.humidity)  : '—';
+  const baroStr = s.baroPressure != null ? s.baroPressure.toFixed(1) : null;
+
+  const hasBaro = s.baroPressure != null ||
+    hist.some(x => x.baroPressure != null);
+
+  // Last raw sample drives derived metrics so they're consistent with the
+  // trend window (sensors-table value may be a poll older).
+  const lastRaw = hist.length ? hist[hist.length - 1] : null;
+  const dew  = lastRaw?.dewpoint ?? null;
+  const vpd  = lastRaw?.vpd ?? null;
+  const hi   = (s.temperature != null && s.humidity != null)
+    ? heatIndex(s.temperature, s.humidity) : null;
+
+  const r24T = range24h(hist, 'temperature');
+  const r24H = range24h(hist, 'humidity');
+
+  const rssi = rssiBadge(s.rssi);
+  const batt = batteryBadge(s.batteryVoltage);
+
+  return `<div class="rt-card ${stale ? 'stale' : ''}" data-id="${esc(id)}" onclick="realtimeCardClick('${esc(id)}')">
+    <div class="rt-head">
+      <span class="rt-dot" style="background:${color}"></span>
+      <span class="rt-name" title="${esc(s.name)}">${esc(s.name)}</span>
+      <span class="rt-status ${seenCls}">${timeAgo(s.lastSeen)}</span>
+    </div>
+    <div class="rt-rows">
+      <div class="rt-row">
+        <span class="rt-row-label">T</span>
+        <span class="rt-row-val">${tempStr}<span class="rt-row-unit">°F</span></span>
+        ${trendPill(tT, 'temperature', '°F')}
+      </div>
+      <div class="rt-row">
+        <span class="rt-row-label">RH</span>
+        <span class="rt-row-val">${humStr}<span class="rt-row-unit">%</span></span>
+        ${trendPill(tH, 'humidity', '%')}
+      </div>
+      ${hasBaro ? `<div class="rt-row">
+        <span class="rt-row-label">P</span>
+        <span class="rt-row-val">${baroStr ?? '—'}<span class="rt-row-unit">hPa</span></span>
+        ${trendPill(tB, 'baroPressure', 'hPa')}
+      </div>` : ''}
+    </div>
+    ${sparkline(hist, 'temperature', color)}
+    <div class="rt-meta">
+      <div class="rt-meta-line">
+        ${dew != null ? `<span><span class="rt-dim">Dew</span> <b>${dew.toFixed(1)}°F</b></span>` : ''}
+        ${hi != null ? `<span><span class="rt-dim">HI</span> <b>${hi.toFixed(1)}°F</b></span>` : ''}
+        ${vpd != null ? `<span><span class="rt-dim">VPD</span> <b>${vpd.toFixed(2)} kPa</b></span>` : ''}
+      </div>
+      <div class="rt-meta-line">
+        ${r24T ? `<span><span class="rt-dim">24h T</span> <b>${r24T.lo.toFixed(1)}–${r24T.hi.toFixed(1)}°F</b></span>` : ''}
+        ${r24H ? `<span><span class="rt-dim">24h RH</span> <b>${Math.round(r24H.lo)}–${Math.round(r24H.hi)}%</b></span>` : ''}
+      </div>
+      ${(rssi || batt) ? `<div class="rt-meta-line">${rssi}${batt}</div>` : ''}
+    </div>
+  </div>`;
+}
+
 function renderRealtime() {
   const grid = document.getElementById('realtime-grid');
   if (!grid) return;
@@ -1026,86 +1152,68 @@ function renderRealtime() {
     grid.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
     return;
   }
-  // Newest activity first, with stale sensors sinking to the bottom
-  ids.sort((a, b) => {
+
+  // Bucket sensors: bucketed[group][subgroup||'_'] = [id, ...]
+  const bucketed = {};
+  for (const id of ids) {
+    const { group, subgroup } = classifySensor(_sensors[id].name);
+    const sub = subgroup || '_';
+    (bucketed[group] = bucketed[group] || {});
+    (bucketed[group][sub] = bucketed[group][sub] || []).push(id);
+  }
+
+  // Newest activity first within each bucket; stale sensors sink to the bottom.
+  const sortFn = (a, b) => {
     const ta = _sensors[a].lastSeen ? new Date(_sensors[a].lastSeen).getTime() : 0;
     const tb = _sensors[b].lastSeen ? new Date(_sensors[b].lastSeen).getTime() : 0;
     return tb - ta;
-  });
+  };
 
-  grid.innerHTML = ids.map(id => {
-    const s = _sensors[id];
-    const hist = _realtimeHistory[id]?.samples || [];
-    const color = _colorMap[id] || '#888';
-    const seenCls = seenClass(s.lastSeen);
-    const stale = seenCls === 'stale';
+  const sections = [];
+  for (const grp of RT_GROUPS) {
+    const groupBuckets = bucketed[grp.key];
+    if (!groupBuckets) continue;
 
-    // Trends (computed from 30-min window of 24h history)
-    const tT = computeTrend(hist, 'temperature');
-    const tH = computeTrend(hist, 'humidity');
-    const tB = computeTrend(hist, 'baroPressure');
+    if (grp.subgroups) {
+      // Render each non-empty subgroup as its own card grid under one group header.
+      const subSections = [];
+      let total = 0;
+      for (const sg of grp.subgroups) {
+        const subIds = (groupBuckets[sg.key] || []).slice().sort(sortFn);
+        if (!subIds.length) continue;
+        total += subIds.length;
+        subSections.push(`<div class="rt-subgroup">
+          <div class="rt-subgroup-title">${esc(sg.label)}</div>
+          <div class="rt-grid">${subIds.map(renderRtCard).join('')}</div>
+        </div>`);
+      }
+      // Anything classified to this group but with an unknown subgroup
+      // falls under '_' — render as an unlabeled grid at the end so we
+      // never lose a card.
+      const rest = (groupBuckets['_'] || []).slice().sort(sortFn);
+      if (rest.length) {
+        total += rest.length;
+        subSections.push(`<div class="rt-subgroup">
+          <div class="rt-grid">${rest.map(renderRtCard).join('')}</div>
+        </div>`);
+      }
+      if (!subSections.length) continue;
+      sections.push(`<section class="rt-group">
+        <div class="rt-group-title">${esc(grp.label)} <span class="rt-group-count">${total}</span></div>
+        ${subSections.join('')}
+      </section>`);
+    } else {
+      // Flat group — single card grid, no subgroup headers.
+      const allIds = Object.values(groupBuckets).flat().slice().sort(sortFn);
+      if (!allIds.length) continue;
+      sections.push(`<section class="rt-group">
+        <div class="rt-group-title">${esc(grp.label)} <span class="rt-group-count">${allIds.length}</span></div>
+        <div class="rt-grid">${allIds.map(renderRtCard).join('')}</div>
+      </section>`);
+    }
+  }
 
-    const tempStr = s.temperature != null ? s.temperature.toFixed(1) : '—';
-    const humStr  = s.humidity    != null ? Math.round(s.humidity)  : '—';
-    const baroStr = s.baroPressure != null ? s.baroPressure.toFixed(1) : null;
-
-    // Capability gates — only render baro row when this sensor has it
-    const hasBaro = s.baroPressure != null ||
-      hist.some(x => x.baroPressure != null);
-
-    // Last raw sample drives the derived metrics so they're consistent with
-    // the trend window (rather than sensors-table values which may be a poll
-    // older).
-    const lastRaw = hist.length ? hist[hist.length - 1] : null;
-    const dew  = lastRaw?.dewpoint ?? null;
-    const vpd  = lastRaw?.vpd ?? null;
-    const hi   = (s.temperature != null && s.humidity != null)
-      ? heatIndex(s.temperature, s.humidity) : null;
-
-    const r24T = range24h(hist, 'temperature');
-    const r24H = range24h(hist, 'humidity');
-
-    const rssi = rssiBadge(s.rssi);
-    const batt = batteryBadge(s.batteryVoltage);
-
-    return `<div class="rt-card ${stale ? 'stale' : ''}" data-id="${esc(id)}" onclick="realtimeCardClick('${esc(id)}')">
-      <div class="rt-head">
-        <span class="rt-dot" style="background:${color}"></span>
-        <span class="rt-name" title="${esc(s.name)}">${esc(s.name)}</span>
-        <span class="rt-status ${seenCls}">${timeAgo(s.lastSeen)}</span>
-      </div>
-      <div class="rt-rows">
-        <div class="rt-row">
-          <span class="rt-row-label">T</span>
-          <span class="rt-row-val">${tempStr}<span class="rt-row-unit">°F</span></span>
-          ${trendPill(tT, 'temperature', '°F')}
-        </div>
-        <div class="rt-row">
-          <span class="rt-row-label">RH</span>
-          <span class="rt-row-val">${humStr}<span class="rt-row-unit">%</span></span>
-          ${trendPill(tH, 'humidity', '%')}
-        </div>
-        ${hasBaro ? `<div class="rt-row">
-          <span class="rt-row-label">P</span>
-          <span class="rt-row-val">${baroStr ?? '—'}<span class="rt-row-unit">hPa</span></span>
-          ${trendPill(tB, 'baroPressure', 'hPa')}
-        </div>` : ''}
-      </div>
-      ${sparkline(hist, 'temperature', color)}
-      <div class="rt-meta">
-        <div class="rt-meta-line">
-          ${dew != null ? `<span><span class="rt-dim">Dew</span> <b>${dew.toFixed(1)}°F</b></span>` : ''}
-          ${hi != null ? `<span><span class="rt-dim">HI</span> <b>${hi.toFixed(1)}°F</b></span>` : ''}
-          ${vpd != null ? `<span><span class="rt-dim">VPD</span> <b>${vpd.toFixed(2)} kPa</b></span>` : ''}
-        </div>
-        <div class="rt-meta-line">
-          ${r24T ? `<span><span class="rt-dim">24h T</span> <b>${r24T.lo.toFixed(1)}–${r24T.hi.toFixed(1)}°F</b></span>` : ''}
-          ${r24H ? `<span><span class="rt-dim">24h RH</span> <b>${Math.round(r24H.lo)}–${Math.round(r24H.hi)}%</b></span>` : ''}
-        </div>
-        ${(rssi || batt) ? `<div class="rt-meta-line">${rssi}${batt}</div>` : ''}
-      </div>
-    </div>`;
-  }).join('');
+  grid.innerHTML = sections.join('') || `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
 }
 
 // ── Fetch ──────────────────────────────────────────────────────────────────
