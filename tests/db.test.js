@@ -4,7 +4,7 @@ import {
   recomputeHourlyAgg, getSensors, getHistory, getHistoryAll,
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
-  getSensorPrimaryGateway,
+  getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
 } from '../db.js';
 
 function makeDb() {
@@ -729,6 +729,101 @@ describe('recomputeHourlyAgg zombie-row prevention', () => {
     // a sample_count=0 ghost that surfaces as a sparseHour.
     setReadingExcluded(db, 's_zombie', ts, true);
     expect(db.prepare(`SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id=?`).get('s_zombie').n).toBe(0);
+  });
+});
+
+describe('getGatewayUptime', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+  function gw(id, lastSeen) {
+    return { id, name: id, lastSeen, lastAlert: null, version: '1.0', paired: true, message: null };
+  }
+
+  it('returns null uptime when there is no recorded data in the window', () => {
+    const db = makeDb();
+    const r = getGatewayUptime(db, 'g1', NOW - 86400);
+    expect(r.uptimePct).toBeNull();
+    expect(r.total).toBe(0);
+  });
+
+  it('counts polls where last_seen is fresh as online', () => {
+    const db = makeDb();
+    // 4 polls, 5 min apart. last_seen=fresh on 3 of them, stale on the 4th.
+    recordGatewayStatus(db, [gw('g1', NOW - 60)],     NOW);             // fresh
+    recordGatewayStatus(db, [gw('g1', NOW - 240)],    NOW + 300);       // fresh (300 - (-240) = 540 ≤ 600)
+    recordGatewayStatus(db, [gw('g1', NOW + 540)],    NOW + 600);       // fresh
+    recordGatewayStatus(db, [gw('g1', NOW - 5000)],   NOW + 900);       // stale
+    const r = getGatewayUptime(db, 'g1', NOW - 86400);
+    expect(r.total).toBe(4);
+    expect(r.online).toBe(3);
+    expect(r.uptimePct).toBeCloseTo(0.75, 4);
+  });
+
+  it('respects the freshThresholdSecs parameter', () => {
+    const db = makeDb();
+    // last_seen exactly 1200s old: stale at 600s threshold, fresh at 1800s.
+    recordGatewayStatus(db, [gw('g1', NOW - 1200)], NOW);
+    expect(getGatewayUptime(db, 'g1', NOW - 86400, 600).online).toBe(0);
+    expect(getGatewayUptime(db, 'g1', NOW - 86400, 1800).online).toBe(1);
+  });
+
+  it('treats null last_seen as offline', () => {
+    const db = makeDb();
+    recordGatewayStatus(db, [gw('g1', null)], NOW);
+    const r = getGatewayUptime(db, 'g1', NOW - 86400);
+    expect(r.online).toBe(0);
+    expect(r.total).toBe(1);
+  });
+
+  it('only counts polls inside sinceTs', () => {
+    const db = makeDb();
+    recordGatewayStatus(db, [gw('g1', NOW - 60)], NOW - 86400 * 2); // outside
+    recordGatewayStatus(db, [gw('g1', NOW - 60)], NOW);             // inside
+    const r = getGatewayUptime(db, 'g1', NOW - 86400);
+    expect(r.total).toBe(1);
+  });
+});
+
+describe('countSensorsByPrimaryGateway', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+
+  it('returns 0 when no readings have a matching primary gateway', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 's1', type: 'HT', active: true, batteryVoltage: 2.9 }]);
+    insertReadings(db, 's1', [
+      { observed: new Date(NOW * 1000).toISOString(), temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null, gateways: 'gW;gX', battery_voltage: 2.9 },
+    ]);
+    expect(countSensorsByPrimaryGateway(db, 'gZ')).toBe(0);
+  });
+
+  it('counts each sensor at most once even with many readings', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 's1', type: 'HT', active: true, batteryVoltage: 2.9 }]);
+    insertReadings(db, 's1', [0, 1, 2, 3].map(i => ({
+      observed: new Date((NOW + i) * 1000).toISOString(),
+      temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null,
+      gateways: 'gA;gB', battery_voltage: 2.9,
+    })));
+    expect(countSensorsByPrimaryGateway(db, 'gA')).toBe(1);
+  });
+
+  it('attributes a sensor to its most-frequent first-segment gateway', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 's1', name: 's1', type: 'HT', active: true, batteryVoltage: 2.9 },
+      { id: 's2', name: 's2', type: 'HT', active: true, batteryVoltage: 2.9 },
+    ]);
+    // s1 primarily through gA (2x) over gB (1x)
+    insertReadings(db, 's1', [
+      { observed: new Date((NOW + 1) * 1000).toISOString(), temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null, gateways: 'gA', battery_voltage: 2.9 },
+      { observed: new Date((NOW + 2) * 1000).toISOString(), temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null, gateways: 'gA', battery_voltage: 2.9 },
+      { observed: new Date((NOW + 3) * 1000).toISOString(), temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null, gateways: 'gB', battery_voltage: 2.9 },
+    ]);
+    // s2 primarily through gB
+    insertReadings(db, 's2', [
+      { observed: new Date((NOW + 4) * 1000).toISOString(), temperature: 70, humidity: 50, baro_pressure: null, dewpoint: null, vpd: null, gateways: 'gB', battery_voltage: 2.9 },
+    ]);
+    expect(countSensorsByPrimaryGateway(db, 'gA')).toBe(1);
+    expect(countSensorsByPrimaryGateway(db, 'gB')).toBe(1);
   });
 });
 

@@ -994,8 +994,9 @@ function setAnalyticsRange(r) {
 async function loadAnalytics() {
   const ids = [..._selected];
   // Gateways load regardless of selection — the panel is always useful.
+  // Pass ?range to get uptime % and per-gateway sensor counts.
   try {
-    const gw = await fetch(`${API_BASE}/gateways`).then(r => r.json());
+    const gw = await fetch(`${API_BASE}/gateways?range=${encodeURIComponent(_analyticsRange)}`).then(r => r.json());
     _gateways = gw?.ok ? gw.gateways : [];
   } catch (_) { _gateways = []; }
   if (!ids.length) { renderAnalytics(); return; }
@@ -1030,25 +1031,46 @@ function selectAnalyticsSensor(id) {
 
 function renderGatewaysPanel() {
   if (!_gateways.length) return '';
+  // Uptime + sensor-count columns are populated only when the /gateways
+  // request included ?range= (which loadAnalytics does). Falls back gracefully
+  // when those fields are absent (older payloads or future caller drops them).
+  const hasUptime = _gateways.some(g => g.uptime?.uptimePct != null || g.primaryFor != null);
   const rows = _gateways.map(g => {
     const mins = g.lastSeen ? (Date.now() - new Date(g.lastSeen).getTime()) / 60000 : null;
     const status = mins == null ? { text: 'unknown', color: 'var(--text2)' }
                 : mins < 10     ? { text: 'online',  color: 'var(--green)' }
                 : mins < 60     ? { text: 'stale',   color: 'var(--warn)'  }
                 :                 { text: 'offline', color: 'var(--excl)'  };
+    let extra = '';
+    if (hasUptime) {
+      const up = g.uptime;
+      const upPct = up?.uptimePct != null ? Math.round(up.uptimePct * 1000) / 10 : null;
+      const upCell = upPct == null
+        ? '<td style="color:var(--text3)">—</td>'
+        : `<td style="color:${upPct >= 95 ? 'var(--green)' : upPct >= 80 ? 'var(--warn)' : 'var(--excl)'}" title="${up.online}/${up.total} polls reachable in ${_analyticsRange}">${upPct.toFixed(1)}%</td>`;
+      const primaryCell = g.primaryFor != null
+        ? `<td title="Sensors whose most-frequent first-segment gateway is this one over the last 7 days">${g.primaryFor}</td>`
+        : '<td style="color:var(--text3)">—</td>';
+      extra = upCell + primaryCell;
+    }
     return `<tr>
       <td>${esc(g.name)}</td>
       <td><span style="color:${status.color}">● ${status.text}</span></td>
       <td>${timeAgo(g.lastSeen)}</td>
+      ${extra}
       <td style="color:var(--text2)">${esc(g.version || '')}</td>
     </tr>`;
   }).join('');
+  const headers = hasUptime
+    ? `<th>Name</th><th>Status</th><th>Last seen</th><th>Uptime</th><th>Primary for</th><th>Version</th>`
+    : `<th>Name</th><th>Status</th><th>Last seen</th><th>Version</th>`;
   return `<div class="an-section">
     <h2>Gateways</h2>
     <table class="an-table">
-      <thead><tr><th>Name</th><th>Status</th><th>Last seen</th><th>Version</th></tr></thead>
+      <thead><tr>${headers}</tr></thead>
       <tbody>${rows}</tbody>
     </table>
+    ${hasUptime ? `<div class="stats-footnote">Uptime = polls where the gateway was reachable (last_seen within 10 min of the poll) ÷ total polls in the selected range. "Primary for" counts sensors whose most-frequent first-segment gateway is this one over the last 7 days.</div>` : ''}
   </div>`;
 }
 
