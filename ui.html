@@ -372,6 +372,15 @@ header .spacer { flex: 1; }
   white-space: nowrap;
 }
 .rt-alert-glyph { font-weight: bold; line-height: 1; }
+.rt-anomaly {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10.5px; font-weight: 500;
+  padding: 3px 7px; border-radius: 4px;
+  background: rgba(240, 185, 66, 0.08);
+  color: var(--warn);
+  border: 1px solid rgba(240, 185, 66, 0.30);
+  white-space: nowrap;
+}
 .rt-head { display: flex; align-items: center; gap: 8px; }
 .rt-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .rt-name {
@@ -833,6 +842,18 @@ let _gateways             = [];   // [{ id, name, lastSeen, version, paired, ...
 let _realtimeHistory      = {};
 let _realtimeLoading      = false;
 
+// Hour-of-day baselines (14-day rolling) used to flag readings that are
+// unusual for *this* time of day. Refreshed once an hour — baselines change
+// slowly so we don't need to refetch every 60s poll tick.
+let _liveBaselines        = {};   // id → { 0..23: { tempMean, tempSd, humMean, humSd, nT, nH } }
+let _liveBaselinesAt      = 0;
+const BASELINE_TTL_MS     = 60 * 60 * 1000;
+// Floor sigma so a perfectly stable room doesn't fire on every tenth of a
+// degree. ±2σ is the anomaly threshold; for T we floor σ at 0.4°F so the
+// window is at least ±0.8°F, and at 1.0 %RH similarly.
+const ANOMALY_TEMP_SD_FLOOR = 0.4;
+const ANOMALY_HUM_SD_FLOOR  = 1.0;
+
 // ── Analytics ─────────────────────────────────────────────────────────────
 
 function switchView(name) {
@@ -1129,10 +1150,95 @@ async function loadRealtime() {
     results.forEach((d, i) => {
       if (d?.ok) _realtimeHistory[ids[i]] = { samples: d.samples || [] };
     });
+    // Refresh baselines in the background — gated by TTL inside the call
+    // so this is a no-op most ticks. Doesn't block the render.
+    loadLiveBaselines().catch(() => {});
     renderRealtime();
   } finally {
     _realtimeLoading = false;
   }
+}
+
+// Fetch 14-day hourly histories per sensor and roll them into per-hour-of-day
+// baselines (mean + sample stddev). Cached for an hour — baselines drift on
+// a seasonal timescale, not minute-to-minute, so this is cheap to amortize.
+async function loadLiveBaselines() {
+  if (_liveBaselinesAt && (Date.now() - _liveBaselinesAt) < BASELINE_TTL_MS) return;
+  const ids = Object.keys(_sensors);
+  if (!ids.length) return;
+  const results = await Promise.all(ids.map(id =>
+    fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=14d`)
+      .then(r => r.json()).catch(() => null)
+  ));
+  _liveBaselines = {};
+  results.forEach((d, i) => {
+    if (!d?.ok) return;
+    // Accumulators per hour: sum, sum², count for T and H separately.
+    const acc = {};
+    for (let h = 0; h < 24; h++) acc[h] = { sumT: 0, sumT2: 0, sumH: 0, sumH2: 0, nT: 0, nH: 0 };
+    for (const s of (d.samples || [])) {
+      const hour = new Date(s.ts * 1000).getHours();
+      const a = acc[hour];
+      if (s.temperature != null) { a.sumT += s.temperature; a.sumT2 += s.temperature * s.temperature; a.nT++; }
+      if (s.humidity    != null) { a.sumH += s.humidity;    a.sumH2 += s.humidity    * s.humidity;    a.nH++; }
+    }
+    const stats = {};
+    for (let h = 0; h < 24; h++) {
+      const a = acc[h];
+      // Bessel-corrected sample variance; guard against floating-point negatives.
+      const tVar = a.nT > 1 ? Math.max(0, (a.sumT2 - a.sumT * a.sumT / a.nT) / (a.nT - 1)) : null;
+      const hVar = a.nH > 1 ? Math.max(0, (a.sumH2 - a.sumH * a.sumH / a.nH) / (a.nH - 1)) : null;
+      stats[h] = {
+        tempMean: a.nT > 0 ? a.sumT / a.nT : null,
+        tempSd:   tVar != null ? Math.sqrt(tVar) : null,
+        humMean:  a.nH > 0 ? a.sumH / a.nH : null,
+        humSd:    hVar != null ? Math.sqrt(hVar) : null,
+        nT: a.nT, nH: a.nH,
+      };
+    }
+    _liveBaselines[ids[i]] = stats;
+  });
+  _liveBaselinesAt = Date.now();
+}
+
+// For a fresh sensor reading, return any "this is unusual for this hour"
+// notes. Returns null when sensor is stale (last-seen baseline irrelevant)
+// or no baseline is available yet.
+function anomaliesForSensor(s, seenCls) {
+  if (seenCls === 'stale') return null;
+  const baseline = _liveBaselines[s.id];
+  if (!baseline) return null;
+  const hour = new Date().getHours();
+  const b = baseline[hour];
+  if (!b) return null;
+  const notes = [];
+  const hourStr = `${hour}:00`;
+
+  if (s.temperature != null && b.tempMean != null && b.tempSd != null && b.nT >= 5) {
+    const sd  = Math.max(b.tempSd, ANOMALY_TEMP_SD_FLOOR);
+    const dev = s.temperature - b.tempMean;
+    if (Math.abs(dev) >= 2 * sd) {
+      const sign = dev > 0 ? 'warm' : 'cool';
+      notes.push({
+        kind:  'temp',
+        short: `Unusually ${sign}`,
+        label: `T ${dev > 0 ? 'higher' : 'lower'} than typical ${hourStr}: now ${s.temperature.toFixed(1)}°F vs typical ${b.tempMean.toFixed(1)}°F (σ ${b.tempSd.toFixed(1)}, n=${b.nT})`,
+      });
+    }
+  }
+  if (s.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
+    const sd  = Math.max(b.humSd, ANOMALY_HUM_SD_FLOOR);
+    const dev = s.humidity - b.humMean;
+    if (Math.abs(dev) >= 2 * sd) {
+      const sign = dev > 0 ? 'humid' : 'dry';
+      notes.push({
+        kind:  'hum',
+        short: `Unusually ${sign}`,
+        label: `RH ${dev > 0 ? 'higher' : 'lower'} than typical ${hourStr}: now ${Math.round(s.humidity)}% vs typical ${Math.round(b.humMean)}% (σ ${b.humSd.toFixed(1)}, n=${b.nH})`,
+      });
+    }
+  }
+  return notes.length ? notes : null;
 }
 
 // Returns an array of {label} for each currently-breached SensorPush alert
@@ -1238,7 +1344,8 @@ function renderRtCard(id) {
 
   const rssi = rssiBadge(s.rssi);
   const batt = batteryBadge(s.batteryVoltage);
-  const breaches = alertBreaches(s);
+  const breaches  = alertBreaches(s);
+  const anomalies = anomaliesForSensor(s, seenCls) || [];
 
   return `<div class="rt-card ${stale ? 'stale' : ''}" data-id="${esc(id)}" onclick="realtimeCardClick('${esc(id)}')">
     <div class="rt-head">
@@ -1246,9 +1353,15 @@ function renderRtCard(id) {
       <span class="rt-name" title="${esc(s.name)}">${esc(s.name)}</span>
       <span class="rt-status ${seenCls}">${timeAgo(s.lastSeen)}</span>
     </div>
-    ${breaches.length ? `<div class="rt-alerts">${breaches.map(b =>
-      `<span class="rt-alert" title="SensorPush alert threshold breached"><span class="rt-alert-glyph">⚠</span>${esc(b.label)}</span>`
-    ).join('')}</div>` : ''}
+    ${(breaches.length || anomalies.length) ? `<div class="rt-alerts">${
+      breaches.map(b =>
+        `<span class="rt-alert" title="SensorPush alert threshold breached"><span class="rt-alert-glyph">⚠</span>${esc(b.label)}</span>`
+      ).concat(
+        anomalies.map(n =>
+          `<span class="rt-anomaly" title="${esc(n.label)}">${esc(n.short)}</span>`
+        )
+      ).join('')
+    }</div>` : ''}
     <div class="rt-rows">
       <div class="rt-row">
         <span class="rt-row-label">T</span>
