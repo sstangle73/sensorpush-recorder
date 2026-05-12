@@ -148,6 +148,45 @@ const PUBLIC_PATHS = new Set([
   '/sw.js', '/manifest.json', '/favicon.ico',
 ]);
 
+// ── Comfort-config validation ───────────────────────────────────────────────
+// Used by PUT /settings to reject malformed comfort blobs before they hit
+// the meta JSON column. Shape:
+//   { groups?: { [groupKey]: ComfortEntry|null }, sensors?: { [id]: ComfortEntry|null } }
+// where a ComfortEntry is { temp?: { lo?: number, hi?: number }, hum?: same }
+// (null disables comfort for that group/sensor; absent fields fall through).
+function _validRange(r) {
+  if (r == null) return true;
+  if (typeof r !== 'object' || Array.isArray(r)) return false;
+  for (const k of Object.keys(r)) {
+    if (k !== 'lo' && k !== 'hi') return false;
+    if (r[k] != null && (typeof r[k] !== 'number' || !isFinite(r[k]))) return false;
+  }
+  return true;
+}
+function _validComfortEntry(e) {
+  if (e == null) return true;
+  if (typeof e !== 'object' || Array.isArray(e)) return false;
+  for (const k of Object.keys(e)) {
+    if (k !== 'temp' && k !== 'hum') return false;
+    if (!_validRange(e[k])) return false;
+  }
+  return true;
+}
+function _validComfortConfig(c) {
+  if (c == null) return true;
+  if (typeof c !== 'object' || Array.isArray(c)) return false;
+  for (const k of Object.keys(c)) {
+    if (k !== 'groups' && k !== 'sensors') return false;
+    const v = c[k];
+    if (v == null) continue;
+    if (typeof v !== 'object' || Array.isArray(v)) return false;
+    for (const k2 of Object.keys(v)) {
+      if (!_validComfortEntry(v[k2])) return false;
+    }
+  }
+  return true;
+}
+
 export function createApp(db, config = null) {
   const app = express();
   app.use(express.json());
@@ -394,11 +433,19 @@ export function createApp(db, config = null) {
   });
 
   app.put('/settings', (req, res) => {
-    const { ranges } = req.body ?? {};
+    const { ranges, comfort } = req.body ?? {};
     if (!Array.isArray(ranges) || !ranges.every(r => /^\d+(h|d|yr)$/.test(r))) {
-      return res.status(400).json({ ok: false, error: 'Invalid settings' });
+      return res.status(400).json({ ok: false, error: 'Invalid settings: ranges' });
     }
-    setUiSettings(db, { ranges });
+    if (comfort !== undefined && !_validComfortConfig(comfort)) {
+      return res.status(400).json({ ok: false, error: 'Invalid settings: comfort' });
+    }
+    // Merge with whatever else is in the meta blob (future fields stay untouched
+    // even when the client only sends ranges, and vice versa).
+    const existing = getUiSettings(db) || {};
+    const payload = { ...existing, ranges };
+    if (comfort !== undefined) payload.comfort = comfort;
+    setUiSettings(db, payload);
     res.json({ ok: true });
   });
 

@@ -438,6 +438,48 @@ header .spacer { flex: 1; }
   .rt-row-val { font-size: 18px; }
 }
 
+/* ── Comfort preset editor (in Settings) ── */
+.comfort-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.comfort-table th, .comfort-table td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.comfort-table th {
+  color: var(--text2); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.comfort-table th:not(:first-child), .comfort-table td:not(:first-child) {
+  text-align: center;
+}
+.comfort-table tr:last-child td { border-bottom: none; }
+.comfort-input {
+  width: 56px; padding: 4px 6px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text);
+  font: inherit; font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.comfort-input:focus { border-color: var(--accent); outline: none; }
+.comfort-input::-webkit-inner-spin-button,
+.comfort-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.set-subheader {
+  font-size: 11px; color: var(--text2);
+  text-transform: uppercase; letter-spacing: .04em;
+  margin: 14px 0 6px; font-weight: 600;
+}
+.set-subheader:first-child { margin-top: 0; }
+.comfort-group-label { font-weight: 500; }
+.comfort-sensor-label {
+  display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.comfort-sensor-label .stats-dot { margin: 0; }
+.comfort-sensor-sub {
+  font-size: 10px; color: var(--text3);
+}
+
 /* ── Stats view ── */
 #view-stats {
   flex: 1; overflow-y: auto; padding: 14px 16px 24px;
@@ -683,6 +725,24 @@ header .spacer { flex: 1; }
     <div id="ranges-preview" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px"></div>
     <p class="set-hint" style="margin-top:8px">Space-separated. Resolution is determined by unit: <b>h</b> = raw readings · <b>d</b> = hourly averages · <b>yr</b> = daily averages.</p>
   </div>
+  <div class="set-section">
+    <h2>Comfort Presets</h2>
+    <p class="set-hint" style="margin-bottom:10px">Sets the temperature/humidity range counted as "in comfort" on the Stats tab. Sensors inherit their group's defaults; per-sensor entries override the group. Blank = no comfort metric.</p>
+    <div class="set-subheader">Group defaults</div>
+    <table class="comfort-table"><thead>
+      <tr><th>Group</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th></tr>
+    </thead><tbody id="comfort-groups-body"></tbody></table>
+    <div class="set-subheader">Per-sensor overrides</div>
+    <p class="set-hint" style="margin:-2px 0 6px">Blank = use group default. Useful for fridges, freezers, wine cellars, etc.</p>
+    <table class="comfort-table"><thead>
+      <tr><th>Sensor</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th></tr>
+    </thead><tbody id="comfort-sensors-body"></tbody></table>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="set-btn" onclick="saveComfortPresets()">Save</button>
+      <button class="set-btn" onclick="resetComfortPresets()">Reset to defaults</button>
+    </div>
+  </div>
+
   <div class="set-section">
     <h2>Backfill Historical Data</h2>
     <p class="set-hint" style="margin-bottom:10px">Re-fetch all sensor readings from SensorPush from a start date to now. Safe to run anytime — existing data is never overwritten.</p>
@@ -1490,11 +1550,36 @@ function renderRealtime() {
 }
 
 // ── Stats view ────────────────────────────────────────────────────────────
-// Comfort thresholds — applied to House-classified sensors only. Outside and
-// Appliance groups skip the "in comfort" stat since the thresholds don't
-// represent anything meaningful for them.
-const TEMP_COMFORT = { lo: 68, hi: 76 };   // °F
-const HUM_COMFORT  = { lo: 30, hi: 60 };   // % RH
+// Defaults applied when no comfort config has been saved yet. House gets the
+// standard human-comfort window (68–76°F, 30–60% RH); other groups stay null
+// so we don't show a comfort % for sensors where the concept is meaningless
+// (fridge, outdoor) until the user explicitly sets a preset for them.
+const DEFAULT_COMFORT = {
+  groups: {
+    house:     { temp: { lo: 68, hi: 76 }, hum: { lo: 30, hi: 60 } },
+    outside:   null,
+    appliance: null,
+    other:     null,
+  },
+  sensors: {},
+};
+
+// Resolve effective comfort for a sensor: per-sensor override fields layered
+// on top of the group default. Returns { temp, hum } where each is
+// { lo, hi } or null. A missing sub-field (e.g. only temp configured)
+// leaves the other null.
+function resolveComfort(sensorId) {
+  const sensor = _sensors[sensorId];
+  if (!sensor) return { temp: null, hum: null };
+  const groupKey   = classifySensor(sensor.name).group;
+  const c          = _settings.comfort || DEFAULT_COMFORT;
+  const grpDefault = c.groups?.[groupKey] || null;
+  const override   = c.sensors?.[sensorId] || null;
+  return {
+    temp: override?.temp ?? grpDefault?.temp ?? null,
+    hum:  override?.hum  ?? grpDefault?.hum  ?? null,
+  };
+}
 
 let _statsRange   = '7d';
 let _statsHistory = {};        // id → samples[]
@@ -1600,11 +1685,15 @@ function _alertPct(samples, alerts) {
   return total ? breached / total : null;
 }
 
-function computeSensorStats(samples) {
+function computeSensorStats(samples, comfort) {
   const tempVals  = samples.map(s => s.temperature).filter(v => v != null);
   const humVals   = samples.map(s => s.humidity).filter(v => v != null);
   const tempRange = _extremeRange(samples, 'temperature', 'tempMin', 'tempMax');
   const humRange  = _extremeRange(samples, 'humidity',    'humMin',  'humMax');
+  // Comfort %: only meaningful when bounds are configured for this sensor.
+  // _inRangePct treats null lo/hi as ±Infinity, so we gate at the call site.
+  const tempC = comfort?.temp;
+  const humC  = comfort?.hum;
   return {
     sampleCount:    samples.length,
     tempAvg:        _mean(tempVals),
@@ -1612,14 +1701,14 @@ function computeSensorStats(samples) {
     tempMax:        tempRange?.hi ?? null,
     tempStddev:     _stddev(tempVals),
     tempDailySwing: _dailySwing(samples, 'temperature', 'tempMin', 'tempMax'),
-    tempComfortPct: _inRangePct(samples, 'temperature', TEMP_COMFORT.lo, TEMP_COMFORT.hi),
+    tempComfortPct: tempC ? _inRangePct(samples, 'temperature', tempC.lo ?? -Infinity, tempC.hi ?? Infinity) : null,
     tempSlope:      _slopePerDay(samples, 'temperature'),
     humAvg:         _mean(humVals),
     humMin:         humRange?.lo ?? null,
     humMax:         humRange?.hi ?? null,
     humStddev:      _stddev(humVals),
     humDailySwing:  _dailySwing(samples, 'humidity', 'humMin', 'humMax'),
-    humComfortPct:  _inRangePct(samples, 'humidity',  HUM_COMFORT.lo,  HUM_COMFORT.hi),
+    humComfortPct:  humC ? _inRangePct(samples, 'humidity', humC.lo ?? -Infinity, humC.hi ?? Infinity) : null,
     humSlope:       _slopePerDay(samples, 'humidity'),
   };
 }
@@ -1735,11 +1824,12 @@ function renderStatsHighlights(all, valid) {
     if (up.stats.tempSlope >  0.1) cards.push(_hCard('Warming fastest', fmtSlope(up.stats.tempSlope, '°F'), up, 'stats-up'));
     if (dn.stats.tempSlope < -0.1) cards.push(_hCard('Cooling fastest', fmtSlope(dn.stats.tempSlope, '°F'), dn, 'stats-down'));
   }
-  // Best/worst comfort — only across House sensors (where comfort is meaningful).
-  const houseComfort = valid.filter(x => x.group.group === 'house' && x.stats.tempComfortPct != null);
-  if (houseComfort.length >= 2) {
-    const best  = max(houseComfort, x => x.stats.tempComfortPct);
-    const worst = min(houseComfort, x => x.stats.tempComfortPct);
+  // Best/worst comfort — across any sensor with a configured comfort range
+  // (default seeds House, but presets can extend it to fridge/wine cellar/etc).
+  const withComfort = valid.filter(x => x.stats.tempComfortPct != null);
+  if (withComfort.length >= 2) {
+    const best  = max(withComfort, x => x.stats.tempComfortPct);
+    const worst = min(withComfort, x => x.stats.tempComfortPct);
     cards.push(_hCard('Most in comfort', fmtPct(best.stats.tempComfortPct),  best));
     cards.push(_hCard('Least in comfort', fmtPct(worst.stats.tempComfortPct), worst));
   }
@@ -1873,6 +1963,11 @@ function renderStatsTable(all, kind) {
           ? `<td class="stats-up">${fmtPct(s.alertPct)}</td>`
           : `<td>${fmtPct(s.alertPct)}</td>`);
 
+    // Comfort cells render only when a comfort range is configured for this
+    // sensor (via group default or per-sensor override) — otherwise "—".
+    const tempComfortCell = x.comfort?.temp ? fmtPct(s.tempComfortPct) : '—';
+    const humComfortCell  = x.comfort?.hum  ? fmtPct(s.humComfortPct)  : '—';
+
     if (isTemp) {
       const slope = s.tempSlope;
       const slopeCell = slope == null ? '—'
@@ -1883,7 +1978,7 @@ function renderStatsTable(all, kind) {
         <td>${s.tempMin != null ? `${fmtNum(s.tempMin)}–${fmtNum(s.tempMax)}` : '—'}</td>
         <td>${fmtNum(s.tempStddev, 2)}</td>
         <td>${s.tempDailySwing != null ? fmtNum(s.tempDailySwing) : '—'}</td>
-        <td>${isHouse ? fmtPct(s.tempComfortPct) : '—'}</td>
+        <td>${tempComfortCell}</td>
         ${alertCell}
         <td>${slopeCell}</td>
       </tr>`;
@@ -1893,14 +1988,14 @@ function renderStatsTable(all, kind) {
       <td>${s.humAvg != null ? Math.round(s.humAvg) + '%' : '—'}</td>
       <td>${s.humMin != null ? `${Math.round(s.humMin)}–${Math.round(s.humMax)}%` : '—'}</td>
       <td>${fmtNum(s.humStddev, 2)}</td>
-      <td>${isHouse ? fmtPct(s.humComfortPct) : '—'}</td>
+      <td>${humComfortCell}</td>
       ${alertCell}
     </tr>`;
   }).join('');
 
   const footnote = isTemp
-    ? `<div class="stats-footnote">Comfort range 68–76°F, applied to House sensors only. σ = standard deviation. Trend = linear regression slope per day.</div>`
-    : `<div class="stats-footnote">Comfort range 30–60% RH (EPA recommended), applied to House sensors only.</div>`;
+    ? `<div class="stats-footnote">Comfort range is configured per group (and optionally overridden per sensor) in Settings → Comfort Presets. σ = standard deviation. Trend = linear regression slope per day.</div>`
+    : `<div class="stats-footnote">Comfort range is configured per group (and optionally overridden per sensor) in Settings → Comfort Presets.</div>`;
 
   return `<div class="an-section"><h2>${title}</h2>
     <div class="stats-table-wrap"><table class="an-table"><thead>${headers}</thead><tbody>${rows}</tbody></table></div>
@@ -1918,12 +2013,14 @@ function renderStats() {
   }
   const all = ids.map(id => {
     const samples = _statsHistory[id] || [];
+    const comfort = resolveComfort(id);
     return {
       id,
       sensor: _sensors[id],
       group:  classifySensor(_sensors[id].name),
+      comfort,
       stats:  {
-        ...computeSensorStats(samples),
+        ...computeSensorStats(samples, comfort),
         alertPct: _alertPct(samples, _sensors[id].alerts),
       },
     };
@@ -2390,8 +2487,15 @@ function showToast(msg) {
 async function loadSettings() {
   try {
     const resp = await fetch(`${API_BASE}/settings`).then(r => r.json());
-    if (resp.ok && Array.isArray(resp.settings?.ranges) && resp.settings.ranges.length) {
-      _settings.ranges = resp.settings.ranges.filter(r => /^\d+(h|d|yr)$/.test(r));
+    if (resp.ok && resp.settings) {
+      if (Array.isArray(resp.settings.ranges) && resp.settings.ranges.length) {
+        _settings.ranges = resp.settings.ranges.filter(r => /^\d+(h|d|yr)$/.test(r));
+      }
+      // Comfort: take whatever the server has (server validates on PUT, so we
+      // can trust the shape here). Falls through to DEFAULT_COMFORT when null.
+      if (resp.settings.comfort !== undefined) {
+        _settings.comfort = resp.settings.comfort;
+      }
       return;
     }
   } catch(e) {}
@@ -2419,6 +2523,7 @@ async function saveSettings() {
 async function renderSettings() {
   document.getElementById('ranges-input').value = _settings.ranges.join(' ');
   previewRanges();
+  renderComfortPresets();
   // Resume progress display if a backfill is already in progress
   try {
     const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
@@ -2426,6 +2531,120 @@ async function renderSettings() {
     if (state.status === 'running') _schedulePollBackfill();
   } catch(e) {}
   renderAuthSection();
+}
+
+// ── Comfort presets editor ────────────────────────────────────────────────
+const _COMFORT_GROUP_LABEL = {
+  house: 'House', outside: 'Outside', appliance: 'Appliances', other: 'Other',
+};
+
+function _comfortNumInput(value, group, sensorId, field) {
+  // value may be a number or null/undefined. Empty input = inherit/disabled.
+  const v = (typeof value === 'number' && isFinite(value)) ? value : '';
+  const key = sensorId
+    ? `data-sensor="${esc(sensorId)}"`
+    : `data-group="${esc(group)}"`;
+  return `<input type="number" class="comfort-input" step="0.5" ${key} data-field="${field}" value="${v}">`;
+}
+
+function renderComfortPresets() {
+  const c = _settings.comfort || DEFAULT_COMFORT;
+  const groupsBody  = document.getElementById('comfort-groups-body');
+  const sensorsBody = document.getElementById('comfort-sensors-body');
+  if (!groupsBody || !sensorsBody) return;
+
+  // Group rows: one per known group key, in declared order
+  groupsBody.innerHTML = Object.keys(_COMFORT_GROUP_LABEL).map(g => {
+    const e = c.groups?.[g] || null;
+    return `<tr>
+      <td class="comfort-group-label">${esc(_COMFORT_GROUP_LABEL[g])}</td>
+      <td>${_comfortNumInput(e?.temp?.lo, g, null, 'tempLo')}</td>
+      <td>${_comfortNumInput(e?.temp?.hi, g, null, 'tempHi')}</td>
+      <td>${_comfortNumInput(e?.hum?.lo,  g, null, 'humLo')}</td>
+      <td>${_comfortNumInput(e?.hum?.hi,  g, null, 'humHi')}</td>
+    </tr>`;
+  }).join('');
+
+  // Sensor rows: one per sensor, grouped/sorted same way as the Live tab
+  const sensorOrder = Object.keys(_sensors).map(id => ({
+    id,
+    sensor: _sensors[id],
+    group:  classifySensor(_sensors[id].name),
+  })).sort(_sortStats);
+
+  if (!sensorOrder.length) {
+    sensorsBody.innerHTML = `<tr><td colspan="5" style="color:var(--text3)">No sensors registered yet.</td></tr>`;
+    return;
+  }
+
+  sensorsBody.innerHTML = sensorOrder.map(x => {
+    const ov  = c.sensors?.[x.id] || null;
+    const color = _colorMap[x.id] || '#888';
+    const grpLabel = x.group.group === 'house' && x.group.subgroup
+      ? `${_COMFORT_GROUP_LABEL[x.group.group]} · ${x.group.subgroup}`
+      : _COMFORT_GROUP_LABEL[x.group.group] || x.group.group;
+    return `<tr>
+      <td><div class="comfort-sensor-label"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div><div class="comfort-sensor-sub">${esc(grpLabel)}</div></td>
+      <td>${_comfortNumInput(ov?.temp?.lo, null, x.id, 'tempLo')}</td>
+      <td>${_comfortNumInput(ov?.temp?.hi, null, x.id, 'tempHi')}</td>
+      <td>${_comfortNumInput(ov?.hum?.lo,  null, x.id, 'humLo')}</td>
+      <td>${_comfortNumInput(ov?.hum?.hi,  null, x.id, 'humHi')}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Read every input and rebuild the comfort config. Returns the new config
+// without saving; saveComfortPresets() actually persists and re-renders.
+function _collectComfortFromInputs() {
+  const result = { groups: {}, sensors: {} };
+  document.querySelectorAll('#comfort-groups-body .comfort-input').forEach(inp => {
+    const g = inp.dataset.group, f = inp.dataset.field;
+    const v = inp.value === '' ? null : parseFloat(inp.value);
+    if (v == null || isNaN(v)) return;
+    const entry = result.groups[g] = result.groups[g] || {};
+    if (f === 'tempLo') (entry.temp = entry.temp || {}).lo = v;
+    if (f === 'tempHi') (entry.temp = entry.temp || {}).hi = v;
+    if (f === 'humLo')  (entry.hum  = entry.hum  || {}).lo = v;
+    if (f === 'humHi')  (entry.hum  = entry.hum  || {}).hi = v;
+  });
+  document.querySelectorAll('#comfort-sensors-body .comfort-input').forEach(inp => {
+    const id = inp.dataset.sensor, f = inp.dataset.field;
+    const v = inp.value === '' ? null : parseFloat(inp.value);
+    if (v == null || isNaN(v)) return;
+    const entry = result.sensors[id] = result.sensors[id] || {};
+    if (f === 'tempLo') (entry.temp = entry.temp || {}).lo = v;
+    if (f === 'tempHi') (entry.temp = entry.temp || {}).hi = v;
+    if (f === 'humLo')  (entry.hum  = entry.hum  || {}).lo = v;
+    if (f === 'humHi')  (entry.hum  = entry.hum  || {}).hi = v;
+  });
+  // Drop empty group/sensor objects to keep storage tidy.
+  for (const k of Object.keys(result.groups))  if (!Object.keys(result.groups[k]).length)  delete result.groups[k];
+  for (const k of Object.keys(result.sensors)) if (!Object.keys(result.sensors[k]).length) delete result.sensors[k];
+  return result;
+}
+
+async function saveComfortPresets() {
+  const comfort = _collectComfortFromInputs();
+  _settings.comfort = comfort;
+  try {
+    const r = await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_settings),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    showToast('Comfort presets saved ✓');
+  } catch (e) {
+    showToast('Save failed: ' + e.message);
+  }
+}
+
+function resetComfortPresets() {
+  if (!confirm('Reset comfort presets to defaults? Per-sensor overrides will be cleared.')) return;
+  _settings.comfort = JSON.parse(JSON.stringify(DEFAULT_COMFORT));
+  renderComfortPresets();
+  saveComfortPresets();
 }
 
 // ── Security: bearer token lifecycle ───────────────────────────────────────
