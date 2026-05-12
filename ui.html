@@ -361,6 +361,17 @@ header .spacer { flex: 1; }
 .rt-card:hover { border-color: var(--bg4); }
 .rt-card:active { transform: scale(0.99); }
 .rt-card.stale { opacity: 0.6; }
+.rt-alerts { display: flex; flex-wrap: wrap; gap: 4px; }
+.rt-alert {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10.5px; font-weight: 500;
+  padding: 3px 7px; border-radius: 4px;
+  background: rgba(255, 92, 92, 0.10);
+  color: var(--excl);
+  border: 1px solid rgba(255, 92, 92, 0.30);
+  white-space: nowrap;
+}
+.rt-alert-glyph { font-weight: bold; line-height: 1; }
 .rt-head { display: flex; align-items: center; gap: 8px; }
 .rt-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .rt-name {
@@ -1124,6 +1135,28 @@ async function loadRealtime() {
   }
 }
 
+// Returns an array of {label} for each currently-breached SensorPush alert
+// threshold on this sensor. Empty when no alerts are configured or all
+// current readings are within bounds.
+function alertBreaches(s) {
+  const a = s.alerts;
+  if (!a) return [];
+  const out = [];
+  if (a.temperature?.enabled && s.temperature != null) {
+    if (a.temperature.min != null && s.temperature < a.temperature.min)
+      out.push({ label: `T ${s.temperature.toFixed(1)}°F < ${a.temperature.min}°F` });
+    if (a.temperature.max != null && s.temperature > a.temperature.max)
+      out.push({ label: `T ${s.temperature.toFixed(1)}°F > ${a.temperature.max}°F` });
+  }
+  if (a.humidity?.enabled && s.humidity != null) {
+    if (a.humidity.min != null && s.humidity < a.humidity.min)
+      out.push({ label: `RH ${Math.round(s.humidity)}% < ${a.humidity.min}%` });
+    if (a.humidity.max != null && s.humidity > a.humidity.max)
+      out.push({ label: `RH ${Math.round(s.humidity)}% > ${a.humidity.max}%` });
+  }
+  return out;
+}
+
 function realtimeCardClick(id) {
   if (_longHoldConsumed()) return;
   soloSensor(id);
@@ -1205,6 +1238,7 @@ function renderRtCard(id) {
 
   const rssi = rssiBadge(s.rssi);
   const batt = batteryBadge(s.batteryVoltage);
+  const breaches = alertBreaches(s);
 
   return `<div class="rt-card ${stale ? 'stale' : ''}" data-id="${esc(id)}" onclick="realtimeCardClick('${esc(id)}')">
     <div class="rt-head">
@@ -1212,6 +1246,9 @@ function renderRtCard(id) {
       <span class="rt-name" title="${esc(s.name)}">${esc(s.name)}</span>
       <span class="rt-status ${seenCls}">${timeAgo(s.lastSeen)}</span>
     </div>
+    ${breaches.length ? `<div class="rt-alerts">${breaches.map(b =>
+      `<span class="rt-alert" title="SensorPush alert threshold breached"><span class="rt-alert-glyph">⚠</span>${esc(b.label)}</span>`
+    ).join('')}</div>` : ''}
     <div class="rt-rows">
       <div class="rt-row">
         <span class="rt-row-label">T</span>
@@ -1423,6 +1460,33 @@ function _extremeRange(samples, field, minField, maxField) {
   return n ? { lo, hi } : null;
 }
 
+// Fraction of samples that crossed any configured SensorPush alert threshold.
+// Returns null when no alerts are configured (so the UI renders "—" instead
+// of misleadingly displaying 0%, which would imply "all good" when really
+// the user just hasn't set any thresholds).
+function _alertPct(samples, alerts) {
+  if (!alerts) return null;
+  const tempEn = alerts.temperature?.enabled;
+  const humEn  = alerts.humidity?.enabled;
+  if (!tempEn && !humEn) return null;
+  let total = 0, breached = 0;
+  for (const s of samples) {
+    if (s.temperature == null && s.humidity == null) continue;
+    total++;
+    let breach = false;
+    if (tempEn && s.temperature != null) {
+      if (alerts.temperature.min != null && s.temperature < alerts.temperature.min) breach = true;
+      if (alerts.temperature.max != null && s.temperature > alerts.temperature.max) breach = true;
+    }
+    if (humEn && s.humidity != null) {
+      if (alerts.humidity.min != null && s.humidity < alerts.humidity.min) breach = true;
+      if (alerts.humidity.max != null && s.humidity > alerts.humidity.max) breach = true;
+    }
+    if (breach) breached++;
+  }
+  return total ? breached / total : null;
+}
+
 function computeSensorStats(samples) {
   const tempVals  = samples.map(s => s.temperature).filter(v => v != null);
   const humVals   = samples.map(s => s.humidity).filter(v => v != null);
@@ -1566,6 +1630,13 @@ function renderStatsHighlights(all, valid) {
     cards.push(_hCard('Most in comfort', fmtPct(best.stats.tempComfortPct),  best));
     cards.push(_hCard('Least in comfort', fmtPct(worst.stats.tempComfortPct), worst));
   }
+  // Sensors that breached their SensorPush alert thresholds — only useful
+  // if at least one sensor exceeded its bounds during the range.
+  const withAlerts = valid.filter(x => x.stats.alertPct != null && x.stats.alertPct > 0);
+  if (withAlerts.length) {
+    const worst = max(withAlerts, x => x.stats.alertPct);
+    cards.push(_hCard('Most time in alert', fmtPct(worst.stats.alertPct), worst, 'stats-up'));
+  }
 
   return `<div class="an-section"><h2>Highlights (${_statsRange})</h2>
     <div class="stats-highlights">${cards.join('')}</div>
@@ -1653,13 +1724,17 @@ function renderStatsTable(all, kind) {
   const isTemp = kind === 'temperature';
   const title  = isTemp ? `Temperature (${_statsRange})` : `Humidity (${_statsRange})`;
 
+  // Show the alert column only when at least one sensor has alerts configured.
+  // Otherwise it would just be a column of "—" everywhere.
+  const showAlert = sorted.some(x => x.stats.alertPct != null);
+
   const headers = isTemp
-    ? `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>Swing/day</th><th>In comfort</th><th>Trend</th></tr>`
-    : `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>In comfort</th></tr>`;
+    ? `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>Swing/day</th><th>In comfort</th>${showAlert ? '<th>In alert</th>' : ''}<th>Trend</th></tr>`
+    : `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>In comfort</th>${showAlert ? '<th>In alert</th>' : ''}</tr>`;
 
   // Insert group rows between sensor rows so the user can see classification
   // boundaries without a separate legend.
-  const colCount = isTemp ? 7 : 5;
+  const colCount = (isTemp ? 7 : 5) + (showAlert ? 1 : 0);
   let lastGroup = null, lastSub = null, isFirst = true;
   const rows = sorted.map(x => {
     const s = x.stats;
@@ -1677,6 +1752,14 @@ function renderStatsTable(all, kind) {
       isFirst = false;
     }
 
+    // Render alert cell. Color it warn when there's any breach so the eye
+    // is drawn to the row; "—" stays dim for unconfigured sensors.
+    const alertCell = !showAlert ? '' :
+      (s.alertPct == null ? '<td>—</td>'
+        : s.alertPct > 0
+          ? `<td class="stats-up">${fmtPct(s.alertPct)}</td>`
+          : `<td>${fmtPct(s.alertPct)}</td>`);
+
     if (isTemp) {
       const slope = s.tempSlope;
       const slopeCell = slope == null ? '—'
@@ -1688,6 +1771,7 @@ function renderStatsTable(all, kind) {
         <td>${fmtNum(s.tempStddev, 2)}</td>
         <td>${s.tempDailySwing != null ? fmtNum(s.tempDailySwing) : '—'}</td>
         <td>${isHouse ? fmtPct(s.tempComfortPct) : '—'}</td>
+        ${alertCell}
         <td>${slopeCell}</td>
       </tr>`;
     }
@@ -1697,6 +1781,7 @@ function renderStatsTable(all, kind) {
       <td>${s.humMin != null ? `${Math.round(s.humMin)}–${Math.round(s.humMax)}%` : '—'}</td>
       <td>${fmtNum(s.humStddev, 2)}</td>
       <td>${isHouse ? fmtPct(s.humComfortPct) : '—'}</td>
+      ${alertCell}
     </tr>`;
   }).join('');
 
@@ -1718,12 +1803,18 @@ function renderStats() {
     c.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
     return;
   }
-  const all = ids.map(id => ({
-    id,
-    sensor: _sensors[id],
-    group:  classifySensor(_sensors[id].name),
-    stats:  computeSensorStats(_statsHistory[id] || []),
-  }));
+  const all = ids.map(id => {
+    const samples = _statsHistory[id] || [];
+    return {
+      id,
+      sensor: _sensors[id],
+      group:  classifySensor(_sensors[id].name),
+      stats:  {
+        ...computeSensorStats(samples),
+        alertPct: _alertPct(samples, _sensors[id].alerts),
+      },
+    };
+  });
   const valid = all.filter(x => x.stats.sampleCount > 0);
   c.innerHTML = [
     renderStatsHighlights(all, valid),
