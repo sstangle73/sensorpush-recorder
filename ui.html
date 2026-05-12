@@ -535,6 +535,46 @@ header .spacer { flex: 1; }
 #view-stats .an-table td:not(:first-child),
 #view-stats .an-table th:not(:first-child) { text-align: right; }
 .stats-footnote { color: var(--text3); font-size: 10px; margin-top: 8px; }
+.hod-rows { display: flex; flex-direction: column; gap: 5px; }
+.hod-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.hod-label {
+  flex: 0 0 140px; display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hod-label .stats-dot { margin-right: 0; }
+.hod-cells {
+  flex: 1; display: grid; grid-template-columns: repeat(24, 1fr);
+  gap: 1px; border-radius: 3px; overflow: hidden;
+  min-width: 0; background: var(--border);
+}
+.hod-cell { height: 18px; }
+.hod-cell.empty { background: var(--bg3) !important; }
+.hod-range {
+  flex: 0 0 70px; font-variant-numeric: tabular-nums;
+  color: var(--text2); text-align: right; font-size: 10.5px;
+}
+.hod-axis { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.hod-axis-spacer { flex: 0 0 140px; }
+.hod-axis-end    { flex: 0 0 70px; }
+.hod-axis-ticks  {
+  flex: 1; position: relative; height: 12px;
+  font-size: 9px; color: var(--text3);
+}
+.hod-tick { position: absolute; transform: translateX(-50%); }
+.hod-legend {
+  display: flex; align-items: center; gap: 6px; margin-top: 6px;
+  font-size: 10px; color: var(--text3);
+}
+.hod-legend-bar {
+  height: 8px; width: 100px; border-radius: 2px;
+  background: linear-gradient(to right, rgb(77,184,255), rgb(240,240,240), rgb(240,160,60));
+}
+@media (max-width: 640px) {
+  .hod-label { flex: 0 0 95px; font-size: 10px; }
+  .hod-axis-spacer { flex: 0 0 95px; }
+  .hod-range, .hod-axis-end { flex: 0 0 55px; font-size: 9px; }
+  .hod-cell { height: 14px; }
+}
 .stats-io-line  { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .stats-io-line b { color: var(--text); font-weight: 600; }
 
@@ -2003,6 +2043,86 @@ function renderStatsTable(all, kind) {
   </div>`;
 }
 
+// Compute hour-of-day means for a single field across all samples. Uses local
+// browser time so the pattern reflects the user's clock (3pm here, not UTC).
+function hourOfDayMeans(samples, field) {
+  const sum = new Array(24).fill(0);
+  const n   = new Array(24).fill(0);
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    const h = new Date(s.ts * 1000).getHours();
+    sum[h] += s[field]; n[h]++;
+  }
+  return sum.map((v, h) => n[h] ? v / n[h] : null);
+}
+
+// Diverging blue→neutral→orange scale, CB-safe (no red). t in [0, 1].
+function _hodColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  // Two-stop gradient through a neutral grey midpoint.
+  const cool = [77, 184, 255], mid = [220, 220, 220], hot = [240, 160, 60];
+  let r, g, b;
+  if (t < 0.5) {
+    const u = t / 0.5;
+    r = Math.round(cool[0] + (mid[0] - cool[0]) * u);
+    g = Math.round(cool[1] + (mid[1] - cool[1]) * u);
+    b = Math.round(cool[2] + (mid[2] - cool[2]) * u);
+  } else {
+    const u = (t - 0.5) / 0.5;
+    r = Math.round(mid[0] + (hot[0] - mid[0]) * u);
+    g = Math.round(mid[1] + (hot[1] - mid[1]) * u);
+    b = Math.round(mid[2] + (hot[2] - mid[2]) * u);
+  }
+  return `rgb(${r},${g},${b})`;
+}
+
+function renderHourOfDay(all) {
+  // Only render sensors with at least 2 distinct hours of data — anything
+  // less can't reveal a pattern.
+  const rows = all.slice().sort(_sortStats).map(x => {
+    const samples = _statsHistory[x.id] || [];
+    const means   = hourOfDayMeans(samples, 'temperature');
+    const valid   = means.filter(v => v != null);
+    if (valid.length < 2) return null;
+    const lo   = Math.min(...valid);
+    const hi   = Math.max(...valid);
+    const span = Math.max(hi - lo, 0.5);
+    const color = _colorMap[x.id] || '#888';
+
+    const cells = means.map((m, h) => {
+      if (m == null) return `<div class="hod-cell empty" title="${h}:00 — no data"></div>`;
+      const bg = _hodColor((m - lo) / span);
+      return `<div class="hod-cell" style="background:${bg}" title="${h}:00 — avg ${m.toFixed(1)}°F"></div>`;
+    }).join('');
+
+    return `<div class="hod-row">
+      <div class="hod-label" title="${esc(x.sensor.name)}"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
+      <div class="hod-cells">${cells}</div>
+      <div class="hod-range">${lo.toFixed(0)}–${hi.toFixed(0)}°F</div>
+    </div>`;
+  }).filter(Boolean).join('');
+
+  if (!rows) return '';
+
+  const xLabels = [0, 6, 12, 18, 23].map(h =>
+    `<div class="hod-tick" style="left:${(h / 23) * 100}%">${h}:00</div>`
+  ).join('');
+
+  return `<div class="an-section"><h2>Hour-of-day temperature pattern (${_statsRange})</h2>
+    <div class="hod-axis">
+      <div class="hod-axis-spacer"></div>
+      <div class="hod-axis-ticks">${xLabels}</div>
+      <div class="hod-axis-end"></div>
+    </div>
+    <div class="hod-rows">${rows}</div>
+    <div class="hod-legend">
+      Each row scaled to its own sensor's min–max:
+      <span>cool</span><div class="hod-legend-bar"></div><span>warm</span>
+    </div>
+    <div class="stats-footnote">Cell = mean temperature in that local-time hour, averaged across the range. Per-sensor scaling reveals the daily pattern even for rooms with narrow swings. Best at 7d+ ranges where each hour has multiple days of data.</div>
+  </div>`;
+}
+
 function renderStats() {
   const c = document.getElementById('stats-content');
   if (!c) return;
@@ -2031,6 +2151,7 @@ function renderStats() {
     renderIndoorOutdoor(all),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
+    renderHourOfDay(all),
   ].filter(Boolean).join('');
 }
 
