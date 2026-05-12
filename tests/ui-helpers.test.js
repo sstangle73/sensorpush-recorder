@@ -313,6 +313,47 @@ describe('moldRisk', () => {
   });
 });
 
+function minuteOfHourMeans(samples, field) {
+  const sum = new Array(60).fill(0);
+  const n   = new Array(60).fill(0);
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    const m = new Date(s.ts * 1000).getMinutes();
+    sum[m] += s[field]; n[m]++;
+  }
+  return sum.map((v, m) => n[m] ? v / n[m] : null);
+}
+
+describe('minuteOfHourMeans', () => {
+  it('returns a 60-element array with all-null for empty input', () => {
+    const r = minuteOfHourMeans([], 'temperature');
+    expect(r).toHaveLength(60);
+    expect(r.every(v => v === null)).toBe(true);
+  });
+
+  it('places a single sample in its minute slot, leaves the rest null', () => {
+    // 2026-04-19 12:23 local — minute 23.
+    const ts = Math.floor(new Date(2026, 3, 19, 12, 23, 0).getTime() / 1000);
+    const r  = minuteOfHourMeans([{ ts, temperature: 71.5 }], 'temperature');
+    expect(r[23]).toBeCloseTo(71.5);
+    expect(r[22]).toBeNull();
+    expect(r[24]).toBeNull();
+  });
+
+  it('averages across hours: same minute on multiple hours rolls into one bucket', () => {
+    const mk = (h, m, t) => ({ ts: Math.floor(new Date(2026, 3, 19, h, m, 0).getTime() / 1000), temperature: t });
+    // Three samples all at :15 across different hours → mean of the three.
+    const r = minuteOfHourMeans([mk(10, 15, 70), mk(11, 15, 72), mk(12, 15, 74)], 'temperature');
+    expect(r[15]).toBeCloseTo(72);
+  });
+
+  it('ignores samples whose field is null', () => {
+    const ts = Math.floor(new Date(2026, 3, 19, 12, 5, 0).getTime() / 1000);
+    const r  = minuteOfHourMeans([{ ts, temperature: null }, { ts, temperature: 70 }], 'temperature');
+    expect(r[5]).toBeCloseTo(70);
+  });
+});
+
 describe('hvacActivity', () => {
   // 48-hour temperature trace with a configurable per-hour profile.
   function trace(profile) {

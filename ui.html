@@ -2140,6 +2140,21 @@ function hourOfDayMeans(samples, field) {
   return sum.map((v, h) => n[h] ? v / n[h] : null);
 }
 
+// Minute-of-hour analog. Useful at sub-day ranges where there's no day-
+// repetition to roll into the hour-of-day buckets — instead, the chart
+// shows the hourly trace at minute resolution (60 cells), averaged across
+// whichever hours fall in the range.
+function minuteOfHourMeans(samples, field) {
+  const sum = new Array(60).fill(0);
+  const n   = new Array(60).fill(0);
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    const m = new Date(s.ts * 1000).getMinutes();
+    sum[m] += s[field]; n[m]++;
+  }
+  return sum.map((v, m) => n[m] ? v / n[m] : null);
+}
+
 // Diverging blue→neutral→orange scale, CB-safe (no red). t in [0, 1].
 function _hodColor(t) {
   t = Math.max(0, Math.min(1, t));
@@ -2161,11 +2176,30 @@ function _hodColor(t) {
 }
 
 function renderHourOfDay(all) {
-  // Only render sensors with at least 2 distinct hours of data — anything
+  // At sub-day ranges, switch to a 60-cell minute-of-hour view: each cell
+  // is the mean at minute m across whatever hours the range covers. At a
+  // 1h range that's just the trace at minute resolution; at 6h it's the
+  // average of 6 minute-by-minute traces. At 24h+ stay with the
+  // 24-cell hour-of-day pattern.
+  const rangeSecs = rangeToSeconds(_statsRange);
+  const subDay    = rangeSecs > 0 && rangeSecs < 86400;
+  const nCells    = subDay ? 60 : 24;
+  const lastIdx   = nCells - 1;
+  const meansFn   = subDay ? minuteOfHourMeans : hourOfDayMeans;
+  const cellLabel = subDay
+    ? (i, v) => `:${String(i).padStart(2, '0')} — avg ${v.toFixed(1)}°F`
+    : (i, v) => `${i}:00 — avg ${v.toFixed(1)}°F`;
+  const emptyLabel = subDay
+    ? i => `:${String(i).padStart(2, '0')} — no data`
+    : i => `${i}:00 — no data`;
+  const xLabelStops = subDay ? [0, 15, 30, 45, 59] : [0, 6, 12, 18, 23];
+  const xLabelText  = subDay ? h => `:${String(h).padStart(2, '0')}` : h => `${h}:00`;
+
+  // Only render sensors with at least 2 distinct buckets of data — anything
   // less can't reveal a pattern.
   const rows = all.slice().sort(_sortStats).map(x => {
     const samples = _statsHistory[x.id] || [];
-    const means   = hourOfDayMeans(samples, 'temperature');
+    const means   = meansFn(samples, 'temperature');
     const valid   = means.filter(v => v != null);
     if (valid.length < 2) return null;
     const lo   = Math.min(...valid);
@@ -2173,26 +2207,31 @@ function renderHourOfDay(all) {
     const span = Math.max(hi - lo, 0.5);
     const color = _colorMap[x.id] || '#888';
 
-    const cells = means.map((m, h) => {
-      if (m == null) return `<div class="hod-cell empty" title="${h}:00 — no data"></div>`;
+    const cells = means.map((m, i) => {
+      if (m == null) return `<div class="hod-cell empty" title="${emptyLabel(i)}"></div>`;
       const bg = _hodColor((m - lo) / span);
-      return `<div class="hod-cell" style="background:${bg}" title="${h}:00 — avg ${m.toFixed(1)}°F"></div>`;
+      return `<div class="hod-cell" style="background:${bg}" title="${cellLabel(i, m)}"></div>`;
     }).join('');
 
     return `<div class="hod-row">
       <div class="hod-label" title="${esc(x.sensor.name)}"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
-      <div class="hod-cells">${cells}</div>
+      <div class="hod-cells" style="grid-template-columns: repeat(${nCells}, 1fr)">${cells}</div>
       <div class="hod-range">${lo.toFixed(0)}–${hi.toFixed(0)}°F</div>
     </div>`;
   }).filter(Boolean).join('');
 
   if (!rows) return '';
 
-  const xLabels = [0, 6, 12, 18, 23].map(h =>
-    `<div class="hod-tick" style="left:${(h / 23) * 100}%">${h}:00</div>`
+  const xLabels = xLabelStops.map(h =>
+    `<div class="hod-tick" style="left:${(h / lastIdx) * 100}%">${xLabelText(h)}</div>`
   ).join('');
 
-  return `<div class="an-section"><h2>Hour-of-day temperature pattern (${_statsRange})</h2>
+  const title    = subDay ? 'Minute-of-hour temperature pattern' : 'Hour-of-day temperature pattern';
+  const footnote = subDay
+    ? `Cell = mean temperature at that minute-of-hour, averaged across the ${_statsRange} range. Useful for spotting sub-hour patterns like thermostat short-cycling; at exactly 1h it's just the per-minute trace. Empty cells = no sample landed in that minute (typical when the sensor samples every 5 min, not every 1 min).`
+    : `Cell = mean temperature in that local-time hour, averaged across the range. Per-sensor scaling reveals the daily pattern even for rooms with narrow swings. Best at 7d+ ranges where each hour has multiple days of data.`;
+
+  return `<div class="an-section"><h2>${title} (${_statsRange})</h2>
     <div class="hod-axis">
       <div class="hod-axis-spacer"></div>
       <div class="hod-axis-ticks">${xLabels}</div>
@@ -2203,7 +2242,7 @@ function renderHourOfDay(all) {
       Each row scaled to its own sensor's min–max:
       <span>cool</span><div class="hod-legend-bar"></div><span>warm</span>
     </div>
-    <div class="stats-footnote">Cell = mean temperature in that local-time hour, averaged across the range. Per-sensor scaling reveals the daily pattern even for rooms with narrow swings. Best at 7d+ ranges where each hour has multiple days of data.</div>
+    <div class="stats-footnote">${footnote}</div>
   </div>`;
 }
 
