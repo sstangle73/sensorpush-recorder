@@ -1673,6 +1673,7 @@ function resolveComfort(sensorId) {
 
 let _statsRange   = '7d';
 let _statsHistory = {};        // id → samples[]
+let _batteryForecasts = {};    // id → { slopeVPerDay, currentV, daysTo27, daysTo25, daysTo24, sampleDays } | null
 let _statsLoading = false;
 
 // ── stats math ─────────────────────────────────────────────────────────────
@@ -1815,12 +1816,16 @@ async function loadStats() {
       if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
     });
     const ids = Object.keys(_sensors);
-    const results = await Promise.all(ids.map(id =>
-      fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
-        .then(r => r.json()).catch(() => null)
-    ));
+    const [results, batt] = await Promise.all([
+      Promise.all(ids.map(id =>
+        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
+          .then(r => r.json()).catch(() => null)
+      )),
+      fetch(`${API_BASE}/battery`).then(r => r.json()).catch(() => null),
+    ]);
     _statsHistory = {};
     results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
+    _batteryForecasts = (batt?.ok && batt.forecasts) ? batt.forecasts : {};
     renderStats();
   } finally {
     _statsLoading = false;
@@ -2265,6 +2270,85 @@ function renderBreachHistory(all) {
   </div>`;
 }
 
+// Format a projected day-count as a relative phrase + an absolute date so
+// the user can plan ("Replace by Aug 14 — about 92 days"). Returns
+// {  glyph, color, label, dateStr } for the most-actionable threshold this
+// sensor has crossed (2.5V is "replace", 2.7V is "soon", null is "stable").
+//
+// Color choices avoid the standard red/green pairing for CB safety: amber
+// for soon, magenta for urgent, slate for stable. Each is paired with a
+// distinct glyph (◔ / ⚠ / ✓) so the meaning carries through grayscale.
+function _batteryStatus(f) {
+  if (!f) return { glyph: '·', color: 'var(--text3)', label: '—',           dateStr: '' };
+  const d25 = f.daysTo25;
+  const d27 = f.daysTo27;
+  // Stable / no projection → slate dot, no date.
+  if (d25 == null || !isFinite(d25)) return { glyph: '✓', color: 'var(--text2)', label: 'Stable', dateStr: '' };
+
+  const dateForDays = days => {
+    const t = Date.now() + days * 86400 * 1000;
+    return new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+
+  if (d25 <= 14) {
+    return { glyph: '⚠', color: 'var(--excl)', label: `Replace now (~${Math.round(d25)} d)`, dateStr: dateForDays(d25) };
+  }
+  if (d27 != null && d27 <= 30) {
+    return { glyph: '◔', color: 'var(--warn)', label: `Replace soon (~${Math.round(d25)} d)`, dateStr: dateForDays(d25) };
+  }
+  return { glyph: '✓', color: 'var(--text2)', label: `~${Math.round(d25)} d`, dateStr: dateForDays(d25) };
+}
+
+function renderBatteryHealth(all) {
+  // Include every sensor that has a current voltage OR a forecast, even if
+  // the forecast came back null (a freshly-paired sensor with <7 days of
+  // data still wants to show its current voltage and a "—" projection).
+  const rows = all.map(x => {
+    const f = _batteryForecasts[x.id] || null;
+    const liveV = x.sensor.batteryVoltage;
+    const currentV = f?.currentV ?? liveV ?? null;
+    return { x, f, currentV };
+  }).filter(r => r.currentV != null);
+  if (!rows.length) return '';
+
+  // Sort: most urgent (lowest days-to-2.5V) first, then stable, then
+  // unknown. Within each tier, lowest current voltage first.
+  rows.sort((a, b) => {
+    const da = a.f?.daysTo25 ?? Infinity;
+    const db = b.f?.daysTo25 ?? Infinity;
+    if (da !== db) return da - db;
+    return (a.currentV ?? 99) - (b.currentV ?? 99);
+  });
+
+  const cells = rows.map(({ x, f, currentV }) => {
+    const status = _batteryStatus(f);
+    const slopeStr = f?.slopeVPerDay != null
+      ? (f.slopeVPerDay * 1000 * 30).toFixed(1) + ' mV/30d'
+      : '<span class="rt-dim">—</span>';
+    const sampleStr = f?.sampleDays != null
+      ? `<span class="rt-dim" style="font-size:10px">${f.sampleDays}d data</span>`
+      : '<span class="rt-dim" style="font-size:10px">—</span>';
+    return `<tr>
+      <td><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}</td>
+      <td><b>${currentV.toFixed(2)}V</b></td>
+      <td>${slopeStr}</td>
+      <td style="color:${status.color}"><span style="margin-right:4px">${status.glyph}</span>${status.label}</td>
+      <td>${status.dateStr || '<span class="rt-dim">—</span>'}</td>
+      <td>${sampleStr}</td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>Battery health</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr>
+        <th>Sensor</th><th>Voltage</th><th>Trend</th><th>Status</th><th>Replace by</th><th>Fit</th>
+      </tr></thead>
+      <tbody>${cells}</tbody>
+    </table></div>
+    <div class="stats-footnote">SensorPush HT/HTP units use 3V CR2477 cells. Status projects when daily-averaged voltage will fall below 2.5V (replace) at the current decline rate, from the last 30 days of readings. Fresh cells and sensors with under 7 days of data show "—". A jump of more than 0.2V upward is treated as a battery replacement, after which the fit restarts.</div>
+  </div>`;
+}
+
 // Pearson correlation coefficient for two equal-length numeric sequences.
 // Returns null when there's no variance in either column (would divide by 0)
 // or when fewer than 3 paired observations are available.
@@ -2359,6 +2443,95 @@ function renderCorrelation(all) {
   </div>`;
 }
 
+// Pearson r between two hourly-bucketed series with B shifted by `lagSec`.
+// Pairs A[t] with B[t + lagSec] — so a positive lag with high r means B at
+// (t + lag) looks like A at t, i.e. A's signal arrived at B `lag` seconds
+// later (A leads, B follows by `lag`).
+function _laggedR(aMap, bMap, lagSec) {
+  const xs = [], ys = [];
+  for (const [ts, av] of aMap) {
+    const bv = bMap.get(ts + lagSec);
+    if (bv == null) continue;
+    xs.push(av); ys.push(bv);
+  }
+  return pearsonR(xs, ys);
+}
+
+// Sweep lags from −LAG_MAX_H to +LAG_MAX_H hours, return the (lag, r) with
+// the highest |r|. Null when nothing meets pearsonR's ≥3-pair minimum at
+// any lag — happens when the two sensors barely overlap in time.
+//
+// Hourly resolution is set by the data: getHistory at 7d/30d/90d returns
+// hourly_agg rows whose ts is already on an hour boundary, and _hourlyBucket
+// re-buckets raw 24h samples to the same grid. For the '1yr' range, ts is
+// daily-aligned and hour-lag pairs never match — renderLagLead gates on
+// the range to skip this case.
+const LAG_MAX_H = 4;
+function lagLeadFor(idA, idB, field = 'temperature') {
+  const a = _hourlyBucket(_statsHistory[idA] || [], field);
+  const b = _hourlyBucket(_statsHistory[idB] || [], field);
+  if (a.size < 6 || b.size < 6) return null;
+  let best = null;
+  for (let h = -LAG_MAX_H; h <= LAG_MAX_H; h++) {
+    const r = _laggedR(a, b, h * 3600);
+    if (r == null) continue;
+    if (best == null || Math.abs(r) > Math.abs(best.r)) best = { lagH: h, r };
+  }
+  return best;
+}
+
+function renderLagLead(all) {
+  // Daily resolution at *yr ranges — hour lags never align. Skip.
+  // (Matches the server's rangeUnit('yr') case.)
+  if (/^\d+yr$/.test(_statsRange)) return '';
+
+  const valid = all.filter(x => (_statsHistory[x.id] || []).length >= 6);
+  if (valid.length < 2) return '';
+
+  // For each pair, find the peak |r| across lags. Keep only pairs whose peak
+  // (a) sits at a non-zero lag (lag=0 is already in the correlation matrix)
+  // and (b) clears r ≥ 0.5 — below that, the "follow" relationship is too
+  // weak to read as a thermal-coupling story.
+  const pairs = [];
+  for (let i = 0; i < valid.length; i++) {
+    for (let j = i + 1; j < valid.length; j++) {
+      const res = lagLeadFor(valid[i].id, valid[j].id);
+      if (!res || res.lagH === 0 || res.r < 0.5) continue;
+      // Normalize so the reported lag is positive (leader → follower).
+      const leader   = res.lagH > 0 ? valid[i] : valid[j];
+      const follower = res.lagH > 0 ? valid[j] : valid[i];
+      pairs.push({ leader, follower, lagH: Math.abs(res.lagH), r: res.r });
+    }
+  }
+  if (!pairs.length) return '';
+  pairs.sort((a, b) => b.r - a.r);
+
+  // Cap at 12 rows — N² pairs can pile up quickly with many co-moving
+  // sensors and the user is mainly looking for the strongest stories.
+  const rows = pairs.slice(0, 12).map(p => {
+    const arrow = `<span style="color:var(--text2);margin:0 4px">→ ${p.lagH}h</span>`;
+    return `<tr>
+      <td><span class="stats-dot" style="background:${_colorMap[p.leader.id] || '#888'}"></span>${esc(p.leader.sensor.name)}</td>
+      <td style="text-align:center">${arrow}</td>
+      <td><span class="stats-dot" style="background:${_colorMap[p.follower.id] || '#888'}"></span>${esc(p.follower.sensor.name)}</td>
+      <td class="corr-cell" style="background:${_corrColor(p.r)};color:#161616">+${p.r.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+
+  const more = pairs.length > 12
+    ? `<div class="stats-footnote" style="margin-top:4px">${pairs.length - 12} weaker pair(s) hidden.</div>`
+    : '';
+
+  return `<div class="an-section"><h2>Lag &amp; lead (${_statsRange})</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr><th>Leader</th><th></th><th>Follower</th><th>Peak r</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${more}
+    <div class="stats-footnote">For each pair, the hour-shift (±${LAG_MAX_H}h) that makes their temperature traces match best. "A → 1h → B" means B's temperature lags A by about an hour — typical of a downstream HVAC room, a wall away from a heat source, or any sensor that inherits A's signal with delay. Only pairs with peak r ≥ 0.5 and non-zero lag appear here; zero-lag pairs are in the correlation matrix above.</div>
+  </div>`;
+}
+
 // Scan samples for the extreme value of a field. mode='max' uses the
 // hourly/daily max sidecar (tempMax/humMax) when present so the result
 // reflects the within-bucket extreme, not just the bucket mean. ts is
@@ -2443,6 +2616,8 @@ function renderStats() {
     renderRecords(all),
     renderHourOfDay(all),
     renderCorrelation(all),
+    renderLagLead(all),
+    renderBatteryHealth(all),
   ].filter(Boolean).join('');
 }
 

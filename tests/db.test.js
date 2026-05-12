@@ -5,6 +5,7 @@ import {
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
+  getBatteryHistory, computeBatteryForecast,
 } from '../db.js';
 
 function makeDb() {
@@ -884,5 +885,119 @@ describe('sensor migration columns', () => {
     expect(rows[0].rssi).toBe(-75);
     expect(rows[0].address).toBe('AA:BB:CC');
     expect(rows[0].device_id).toBe('512345');
+  });
+});
+
+describe('getBatteryHistory', () => {
+  it('returns voltages within the lookback window, oldest first', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    // 3 in-window readings + 1 stale one outside the 30-day window.
+    insertReadings(db, 's1', [
+      { observed: new Date((now - 31 * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.95 }, // out of window
+      { observed: new Date((now - 5  * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.85 },
+      { observed: new Date((now - 3  * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.83 },
+      { observed: new Date((now - 1  * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.80 },
+    ]);
+    const rows = getBatteryHistory(db, 's1', 30);
+    expect(rows).toHaveLength(3);
+    expect(rows[0].v).toBeCloseTo(2.85);
+    expect(rows[2].v).toBeCloseTo(2.80);
+  });
+
+  it('skips rows with NULL voltage', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    insertReadings(db, 's1', [
+      { observed: new Date((now - 2 * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 1 * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.85 },
+    ]);
+    const rows = getBatteryHistory(db, 's1', 30);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].v).toBeCloseTo(2.85);
+  });
+});
+
+describe('computeBatteryForecast', () => {
+  // Build N daily samples that decline by `slope` V/day from `startV`.
+  function syntheticDaily(days, startV, slopePerDay) {
+    const today = Math.floor(Date.now() / 1000 / 86400);
+    const samples = [];
+    for (let i = 0; i < days; i++) {
+      const day = today - (days - 1) + i;
+      // Two samples per day to make sure daily aggregation works as advertised.
+      const v   = startV + slopePerDay * i;
+      samples.push({ ts: day * 86400 + 100,  v: v + 0.005 });
+      samples.push({ ts: day * 86400 + 50000, v: v - 0.005 });
+    }
+    return samples;
+  }
+
+  it('returns null when there are fewer than 7 daily points', () => {
+    const samples = syntheticDaily(5, 2.95, -0.002);
+    expect(computeBatteryForecast(samples)).toBeNull();
+  });
+
+  it('returns null for empty input', () => {
+    expect(computeBatteryForecast([])).toBeNull();
+    expect(computeBatteryForecast(null)).toBeNull();
+  });
+
+  it('projects days-to-2.5V for a declining battery', () => {
+    // 30 days, dropping 5 mV/day from 2.90V. Today's V ≈ 2.756.
+    // Days to 2.5: (2.5 - 2.90) / -0.005 = 80 days from start, so ~50 from today.
+    const f = computeBatteryForecast(syntheticDaily(30, 2.90, -0.005));
+    expect(f).not.toBeNull();
+    expect(f.slopeVPerDay).toBeCloseTo(-0.005, 3);
+    expect(f.currentV).toBeCloseTo(2.755, 2);
+    expect(f.daysTo25).toBeGreaterThan(40);
+    expect(f.daysTo25).toBeLessThan(60);
+    // Thresholds line up: 2.4 always further than 2.5, 2.7 always closer.
+    expect(f.daysTo24).toBeGreaterThan(f.daysTo25);
+    expect(f.daysTo27).toBeLessThan(f.daysTo25);
+  });
+
+  it('returns null projections when the slope is non-negative', () => {
+    const f = computeBatteryForecast(syntheticDaily(30, 2.90, 0.0));
+    expect(f).not.toBeNull();
+    expect(f.daysTo25).toBeNull();
+    expect(f.daysTo27).toBeNull();
+    expect(f.daysTo24).toBeNull();
+    expect(f.currentV).toBeCloseTo(2.90, 1);
+  });
+
+  it('treats an upward jump > 0.2V as a battery replacement and refits to the new cell', () => {
+    // 25 days of post-replacement decline from 2.95, preceded by 10 days
+    // of an old cell ending at ~2.45 (the replacement bump is ~0.50V).
+    const oldCell = syntheticDaily(10, 2.55, -0.01);  // ends ≈ 2.46
+    const newCell = syntheticDaily(25, 2.95, -0.002); // ends ≈ 2.902
+    // Shift oldCell ts back so newCell starts after it.
+    const offset = 25 * 86400;
+    const combined = [
+      ...oldCell.map(s => ({ ts: s.ts - offset, v: s.v })),
+      ...newCell,
+    ];
+    const f = computeBatteryForecast(combined);
+    expect(f).not.toBeNull();
+    // Slope reflects the new cell (-0.002), not the steeper old cell.
+    expect(f.slopeVPerDay).toBeCloseTo(-0.002, 3);
+    expect(f.currentV).toBeGreaterThan(2.85);
+    // 25 days at -2 mV/day = sample window covers the new cell only.
+    expect(f.sampleDays).toBe(25);
+  });
+
+  it('handles a perfectly flat history (zero variance) by returning null', () => {
+    // All same voltage → linear-regression denominator is 0 → null.
+    const today = Math.floor(Date.now() / 1000 / 86400);
+    const samples = Array.from({ length: 10 }, (_, i) => ({
+      ts: (today - 9 + i) * 86400 + 100,
+      v: 2.85,
+    }));
+    // Note: x-variance is non-zero (different days), y-variance is zero,
+    // so slope = 0 / nonzero = 0 → returned object with null projections.
+    const f = computeBatteryForecast(samples);
+    expect(f).not.toBeNull();
+    expect(f.slopeVPerDay).toBeCloseTo(0);
+    expect(f.daysTo25).toBeNull();
   });
 });

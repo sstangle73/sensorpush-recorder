@@ -373,6 +373,107 @@ export function getSensors(db) {
   `).all();
 }
 
+// Per-reading battery voltage history over the last `lookbackDays` days,
+// non-null voltages only. Used to fit a discharge slope and project a
+// replacement date. Returns `[{ ts, v }]` sorted by ts.
+export function getBatteryHistory(db, sensorId, lookbackDays = 30) {
+  const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
+  return db.prepare(`
+    SELECT ts, battery_voltage AS v
+    FROM readings
+    WHERE sensor_id = ? AND ts >= ? AND battery_voltage IS NOT NULL
+    ORDER BY ts
+  `).all(sensorId, since);
+}
+
+// Fit a linear decline to daily-aggregated battery voltage and project the
+// days remaining until it falls below the warn (2.7V), replace (2.5V), and
+// critical (2.4V) thresholds.
+//
+// Method:
+//   1. Average voltages per UTC day. Daily aggregation washes out the
+//      diurnal cycle (CR2477 voltage dips a bit when the sensor's cold)
+//      and gives the regression evenly-weighted points.
+//   2. Detect battery replacement: if any day-over-day voltage jump is
+//      > 0.2V upward, the cell was swapped — discard everything before
+//      the most recent jump so the fit reflects the current cell only.
+//   3. Fit voltage = slope·day + intercept by least squares. Project the
+//      day on which voltage crosses each threshold and subtract today.
+//
+// Returns null when there's too little post-replacement data (<7 daily
+// points) or the slope is non-negative (battery stable/rising — happens
+// briefly after a fresh cell, or for sensors that just never discharge
+// measurably over the window). A null forecast means "no projection
+// possible right now", not "battery healthy" — callers should still
+// inspect `currentV` for the absolute level.
+export function computeBatteryForecast(samples) {
+  if (!Array.isArray(samples) || samples.length < 7) return null;
+
+  // Daily mean voltage, sorted by day.
+  const byDay = new Map();
+  for (const s of samples) {
+    if (s.v == null) continue;
+    const day = Math.floor(s.ts / 86400);
+    const cur = byDay.get(day) || { sum: 0, n: 0 };
+    cur.sum += s.v; cur.n++;
+    byDay.set(day, cur);
+  }
+  const daily = [...byDay.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([day, agg]) => ({ day, v: agg.sum / agg.n }));
+
+  // Drop everything at or before the most recent ≥0.2V upward jump.
+  let cutIdx = 0;
+  for (let i = 1; i < daily.length; i++) {
+    if (daily[i].v - daily[i - 1].v > 0.2) cutIdx = i;
+  }
+  const trimmed = daily.slice(cutIdx);
+  if (trimmed.length < 7) return null;
+
+  // Least-squares fit: v = slope·day + intercept.
+  const xs = trimmed.map(d => d.day);
+  const ys = trimmed.map(d => d.v);
+  const xm = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const ym = ys.reduce((a, b) => a + b, 0) / ys.length;
+  let num = 0, den = 0;
+  for (let i = 0; i < xs.length; i++) {
+    num += (xs[i] - xm) * (ys[i] - ym);
+    den += (xs[i] - xm) ** 2;
+  }
+  if (den === 0) return null;
+  const slope     = num / den;
+  const intercept = ym - slope * xm;
+  const currentV  = trimmed[trimmed.length - 1].v;
+  const today     = Math.floor(Date.now() / 1000 / 86400);
+
+  if (slope >= 0) {
+    // No discharge detectable over the window.
+    return {
+      slopeVPerDay: slope,
+      currentV,
+      sampleDays:   trimmed.length,
+      daysTo27:     null,
+      daysTo25:     null,
+      daysTo24:     null,
+    };
+  }
+
+  // V_target = slope·day_target + intercept → day_target = (V_target − intercept) / slope
+  const project = vTarget => {
+    const dayTarget = (vTarget - intercept) / slope;
+    return Math.max(0, dayTarget - today);
+  };
+
+  return {
+    slopeVPerDay: slope,
+    currentV,
+    sampleDays:   trimmed.length,
+    daysTo27:     project(2.7),
+    daysTo25:     project(2.5),
+    daysTo24:     project(2.4),
+  };
+}
+
 // Parse e.g. '24h', '7d', '1yr' → seconds. Returns null for invalid input.
 export function rangeToSeconds(range) {
   const m = /^(\d+)(h|d|yr)$/.exec(range);

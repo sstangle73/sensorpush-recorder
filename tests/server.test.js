@@ -704,3 +704,64 @@ describe('icon + manifest + sw routes', () => {
     expect(text).toContain('addEventListener');
   });
 });
+
+describe('GET /battery', () => {
+  it('returns ok:true with a forecasts map keyed by sensor id', async () => {
+    upsertSensors(db, [
+      { id: 'batt-stable',   name: 'Stable',   type: 'HT1', active: true, batteryVoltage: 2.95 },
+      { id: 'batt-falling',  name: 'Falling',  type: 'HT1', active: true, batteryVoltage: 2.75 },
+      { id: 'batt-too-new',  name: 'TooNew',   type: 'HT1', active: true, batteryVoltage: 2.85 },
+    ]);
+    const now = Math.floor(Date.now() / 1000);
+
+    // batt-stable: 30 days flat at 2.95 → forecast returned, no projection.
+    insertReadings(db, 'batt-stable', Array.from({ length: 30 }, (_, i) => ({
+      observed:             new Date((now - (30 - i) * 86400) * 1000).toISOString(),
+      temperature:          70, humidity: 50, barometric_pressure: null,
+      battery_voltage:      2.95,
+    })));
+
+    // batt-falling: 30 days declining 5 mV/day from 2.95.
+    insertReadings(db, 'batt-falling', Array.from({ length: 30 }, (_, i) => ({
+      observed:             new Date((now - (30 - i) * 86400) * 1000).toISOString(),
+      temperature:          70, humidity: 50, barometric_pressure: null,
+      battery_voltage:      2.95 - i * 0.005,
+    })));
+
+    // batt-too-new: only 3 days of data → null forecast.
+    insertReadings(db, 'batt-too-new', Array.from({ length: 3 }, (_, i) => ({
+      observed:             new Date((now - (3 - i) * 86400) * 1000).toISOString(),
+      temperature:          70, humidity: 50, barometric_pressure: null,
+      battery_voltage:      2.85,
+    })));
+
+    const { status, body } = await get('/battery');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.forecasts).toBeTruthy();
+
+    expect(body.forecasts['batt-stable']).toMatchObject({ daysTo25: null });
+    expect(body.forecasts['batt-stable'].currentV).toBeCloseTo(2.95, 2);
+
+    const falling = body.forecasts['batt-falling'];
+    expect(falling).not.toBeNull();
+    expect(falling.daysTo25).toBeGreaterThan(0);
+    expect(falling.slopeVPerDay).toBeLessThan(0);
+
+    expect(body.forecasts['batt-too-new']).toBeNull();
+  });
+
+  it('returns an empty forecasts object when there are no sensors', async () => {
+    // Use a fresh in-memory DB on a separate port so the existing one's
+    // sensors don't pollute the result.
+    const freshDb = (await import('../db.js')).openDb(':memory:');
+    const freshApp = createApp(freshDb);
+    const srv = http.createServer(freshApp);
+    await new Promise(r => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    const res = await fetch(url + '/battery').then(r => r.json());
+    expect(res.ok).toBe(true);
+    expect(res.forecasts).toEqual({});
+    await new Promise(r => srv.close(r));
+  });
+});

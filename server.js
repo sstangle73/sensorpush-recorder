@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
@@ -105,7 +105,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v9';
+const CACHE='sensorpush-v10';
 // Pre-cache the root with an explicit Accept: text/html so the server's
 // content negotiation returns the Explorer HTML, not the JSON sensor list.
 // Without this, the install fetch goes out as Accept: */*, the cached entry
@@ -121,7 +121,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings)\\b/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -354,6 +354,20 @@ export function createApp(db, config = null) {
       gatewayOnline: gatewayOnlineDuringWindow(db, g.startTs, g.endTs, primaryId),
     }));
     res.json({ ok: true, sensorId, range, ...result });
+  });
+
+  // Battery-replacement forecast for every sensor. The body is keyed by
+  // sensor id; values are null when there's too little data (a sensor that
+  // joined < a week ago) or no measurable decline. See computeBatteryForecast
+  // for the projection method.
+  app.get('/battery', (_req, res) => {
+    const sensors  = db.prepare('SELECT id FROM sensors').all();
+    const forecasts = {};
+    for (const { id } of sensors) {
+      const history   = getBatteryHistory(db, id, 30);
+      forecasts[id]   = computeBatteryForecast(history);
+    }
+    res.json({ ok: true, forecasts });
   });
 
   app.get('/gateways', (req, res) => {
