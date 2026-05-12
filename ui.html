@@ -535,6 +535,13 @@ header .spacer { flex: 1; }
 #view-stats .an-table td:not(:first-child),
 #view-stats .an-table th:not(:first-child) { text-align: right; }
 .stats-footnote { color: var(--text3); font-size: 10px; margin-top: 8px; }
+.stats-zone-block { margin-top: 14px; }
+.stats-zone-block:first-child { margin-top: 0; }
+.stats-zone-title {
+  font-size: 11px; color: var(--text3); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em;
+  margin-bottom: 7px;
+}
 .hod-rows { display: flex; flex-direction: column; gap: 5px; }
 .hod-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
 .hod-label {
@@ -1875,21 +1882,28 @@ function _hCard(label, value, x, valueClass) {
   </div>`;
 }
 
-function renderStatsHighlights(all, valid) {
-  if (!valid.length) return '';
-  const liveT = all.filter(x => x.sensor.temperature != null);
-  const liveH = all.filter(x => x.sensor.humidity    != null);
+// Build the highlight cards for one zone's worth of sensors. Returns an
+// array of HTML strings — empty if nothing notable in this zone (e.g. only
+// one sensor, so no comparison is meaningful).
+function _highlightCardsForZone(zoneAll) {
+  // Skip trivial single-sensor zones — "warmest of one sensor is that
+  // sensor" is information theater, not a comparison.
+  if (zoneAll.length < 2) return [];
+
+  const liveT = zoneAll.filter(x => x.sensor.temperature != null);
+  const liveH = zoneAll.filter(x => x.sensor.humidity    != null);
+  const valid = zoneAll.filter(x => x.stats.sampleCount > 0);
   const max = (arr, fn) => arr.length ? arr.reduce((a, b) => fn(a) >= fn(b) ? a : b) : null;
   const min = (arr, fn) => arr.length ? arr.reduce((a, b) => fn(a) <= fn(b) ? a : b) : null;
 
   const cards = [];
-  if (liveT.length) {
+  if (liveT.length >= 2) {
     const hot  = max(liveT, x => x.sensor.temperature);
     const cold = min(liveT, x => x.sensor.temperature);
     cards.push(_hCard('Warmest now', `${hot.sensor.temperature.toFixed(1)}°F`,  hot, 'stats-up'));
     cards.push(_hCard('Coolest now', `${cold.sensor.temperature.toFixed(1)}°F`, cold, 'stats-down'));
   }
-  if (liveH.length) {
+  if (liveH.length >= 2) {
     const wet = max(liveH, x => x.sensor.humidity);
     const dry = min(liveH, x => x.sensor.humidity);
     cards.push(_hCard('Most humid now', `${Math.round(wet.sensor.humidity)}% RH`, wet));
@@ -1903,19 +1917,19 @@ function renderStatsHighlights(all, valid) {
     cards.push(_hCard('Steadiest T',     `σ ${least.stats.tempStddev.toFixed(2)}°F`, least));
   }
   const withSwing = valid.filter(x => x.stats.tempDailySwing != null);
-  if (withSwing.length) {
+  if (withSwing.length >= 2) {
     const biggest = max(withSwing, x => x.stats.tempDailySwing);
     cards.push(_hCard('Biggest daily swing', `±${biggest.stats.tempDailySwing.toFixed(1)}°F`, biggest));
   }
   const withSlope = valid.filter(x => x.stats.tempSlope != null);
-  if (withSlope.length) {
+  if (withSlope.length >= 2) {
     const up = max(withSlope, x => x.stats.tempSlope);
     const dn = min(withSlope, x => x.stats.tempSlope);
     if (up.stats.tempSlope >  0.1) cards.push(_hCard('Warming fastest', fmtSlope(up.stats.tempSlope, '°F'), up, 'stats-up'));
     if (dn.stats.tempSlope < -0.1) cards.push(_hCard('Cooling fastest', fmtSlope(dn.stats.tempSlope, '°F'), dn, 'stats-down'));
   }
-  // Best/worst comfort — across any sensor with a configured comfort range
-  // (default seeds House, but presets can extend it to fridge/wine cellar/etc).
+  // Best/worst comfort — for whichever sensors in this zone have configured
+  // ranges (defaults cover House; presets can extend to fridge/freezer/etc).
   const withComfort = valid.filter(x => x.stats.tempComfortPct != null);
   if (withComfort.length >= 2) {
     const best  = max(withComfort, x => x.stats.tempComfortPct);
@@ -1923,17 +1937,32 @@ function renderStatsHighlights(all, valid) {
     cards.push(_hCard('Most in comfort', fmtPct(best.stats.tempComfortPct),  best));
     cards.push(_hCard('Least in comfort', fmtPct(worst.stats.tempComfortPct), worst));
   }
-  // Sensors that breached their SensorPush alert thresholds — only useful
-  // if at least one sensor exceeded its bounds during the range.
+  // Worst alert-breaching sensor — only when something is actually in alert.
   const withAlerts = valid.filter(x => x.stats.alertPct != null && x.stats.alertPct > 0);
   if (withAlerts.length) {
     const worst = max(withAlerts, x => x.stats.alertPct);
     cards.push(_hCard('Most time in alert', fmtPct(worst.stats.alertPct), worst, 'stats-up'));
   }
+  return cards;
+}
 
-  return `<div class="an-section"><h2>Highlights (${_statsRange})</h2>
-    <div class="stats-highlights">${cards.join('')}</div>
-  </div>`;
+function renderStatsHighlights(all, valid) {
+  if (!valid.length) return '';
+  // One sub-section per zone (House, Outside, Appliances, Other). Zones
+  // are different "kinds of place" — comparing a fridge to the outdoor
+  // sensor isn't a useful comparison, so we don't make it.
+  const blocks = [];
+  for (const grp of RT_GROUPS) {
+    const zoneAll = all.filter(x => x.group.group === grp.key);
+    const cards   = _highlightCardsForZone(zoneAll);
+    if (!cards.length) continue;
+    blocks.push(`<div class="stats-zone-block">
+      <div class="stats-zone-title">${esc(grp.label)}</div>
+      <div class="stats-highlights">${cards.join('')}</div>
+    </div>`);
+  }
+  if (!blocks.length) return '';
+  return `<div class="an-section"><h2>Highlights (${_statsRange})</h2>${blocks.join('')}</div>`;
 }
 
 function renderIndoorOutdoor(all) {
