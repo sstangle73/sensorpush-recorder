@@ -499,6 +499,79 @@ describe('GET/PUT /settings', () => {
     });
     expect(r.status).toBe(400);
   });
+
+  it('PUT persists comfort config alongside ranges', async () => {
+    const comfort = {
+      groups: {
+        house:     { temp: { lo: 68, hi: 76 }, hum: { lo: 30, hi: 60 } },
+        outside:   null,
+        appliance: null,
+      },
+      sensors: {
+        'sensor-abc': { temp: { lo: 35, hi: 40 } },
+      },
+    };
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h', '24h'], comfort }),
+    });
+    expect(r.status).toBe(200);
+    const { body } = await get('/settings');
+    expect(body.settings.comfort).toEqual(comfort);
+    expect(body.settings.ranges).toEqual(['1h', '24h']);
+  });
+
+  it('PUT without comfort preserves existing comfort blob', async () => {
+    // Plant a comfort config, then send a ranges-only update.
+    const planted = { groups: { house: { temp: { lo: 70, hi: 74 } } } };
+    await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['7d'], comfort: planted }),
+    });
+    await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'] }),
+    });
+    const { body } = await get('/settings');
+    expect(body.settings.comfort).toEqual(planted);
+    expect(body.settings.ranges).toEqual(['1h']);
+  });
+
+  it('PUT rejects malformed comfort — wrong types', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h'],
+        comfort: { groups: { house: { temp: { lo: 'not a number' } } } },
+      }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('PUT rejects malformed comfort — unknown keys', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h'],
+        comfort: { unexpected: {} },
+      }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('PUT accepts comfort=null (disables presets)', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'], comfort: null }),
+    });
+    expect(r.status).toBe(200);
+  });
 });
 
 describe('CORS middleware', () => {
