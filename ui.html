@@ -569,6 +569,26 @@ header .spacer { flex: 1; }
   height: 8px; width: 100px; border-radius: 2px;
   background: linear-gradient(to right, rgb(77,184,255), rgb(240,240,240), rgb(240,160,60));
 }
+.breach-row { display: flex; align-items: center; gap: 8px; font-size: 11px; margin-bottom: 5px; }
+.breach-label {
+  flex: 0 0 140px; display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.breach-bar {
+  flex: 1; display: flex; height: 14px; min-width: 0;
+  border-radius: 3px; overflow: hidden; gap: 1px; background: var(--border);
+}
+.breach-slot { flex: 1; min-width: 0; background: var(--bg3); }
+.breach-slot.hit { background: var(--excl); }
+.breach-stats {
+  flex: 0 0 140px; font-variant-numeric: tabular-nums;
+  color: var(--text2); font-size: 10.5px; text-align: right;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+@media (max-width: 640px) {
+  .breach-label { flex: 0 0 95px; font-size: 10px; }
+  .breach-stats { flex: 0 0 80px; font-size: 9.5px; }
+}
 .corr-table { font-variant-numeric: tabular-nums; }
 .corr-table th, .corr-table td { padding: 5px 6px !important; font-size: 11px; }
 .corr-h { font-weight: 500; font-size: 10px; text-align: center !important; }
@@ -2153,6 +2173,98 @@ function renderHourOfDay(all) {
   </div>`;
 }
 
+// Walk the sample timeline and split it into contiguous "breach episodes" —
+// runs of samples where a SensorPush alert threshold was crossed. The next
+// in-bounds sample closes the current episode. Returns [] when no alerts
+// are configured or no sample crossed a bound.
+function findBreachEpisodes(samples, alerts) {
+  if (!alerts) return [];
+  const tempEn = alerts.temperature?.enabled;
+  const humEn  = alerts.humidity?.enabled;
+  if (!tempEn && !humEn) return [];
+  const out = [];
+  let cur = null;
+  for (const s of samples) {
+    let breach = false;
+    if (tempEn && s.temperature != null) {
+      if (alerts.temperature.min != null && s.temperature < alerts.temperature.min) breach = true;
+      if (alerts.temperature.max != null && s.temperature > alerts.temperature.max) breach = true;
+    }
+    if (humEn && s.humidity != null) {
+      if (alerts.humidity.min != null && s.humidity < alerts.humidity.min) breach = true;
+      if (alerts.humidity.max != null && s.humidity > alerts.humidity.max) breach = true;
+    }
+    if (breach) {
+      if (!cur) cur = { startTs: s.ts, endTs: s.ts };
+      else cur.endTs = s.ts;
+    } else if (cur) {
+      out.push(cur);
+      cur = null;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function _breachSlots(episodes, startTs, endTs, N = 80) {
+  const slots = new Array(N).fill(false);
+  if (endTs <= startTs) return slots;
+  const slotSecs = (endTs - startTs) / N;
+  for (const e of episodes) {
+    const s = Math.floor((e.startTs - startTs) / slotSecs);
+    const en = Math.ceil((e.endTs - startTs) / slotSecs);
+    for (let i = Math.max(0, s); i < Math.min(N, en); i++) slots[i] = true;
+  }
+  return slots;
+}
+
+function renderBreachHistory(all) {
+  // Only sensors with alerts configured AND samples in range produce rows;
+  // if no sensor matches, the section disappears entirely.
+  const eligible = all.filter(x => {
+    const a = x.sensor.alerts;
+    return (a?.temperature?.enabled || a?.humidity?.enabled)
+      && (_statsHistory[x.id] || []).length > 0;
+  });
+  if (!eligible.length) return '';
+  const sorted = eligible.slice().sort(_sortStats);
+
+  // Use the union of all sample ts for a stable time axis across rows;
+  // falls back to sensible bounds when something is degenerate.
+  let startTs = Infinity, endTs = -Infinity;
+  for (const x of sorted) {
+    for (const s of _statsHistory[x.id]) {
+      if (s.ts < startTs) startTs = s.ts;
+      if (s.ts > endTs)   endTs   = s.ts;
+    }
+  }
+  if (!isFinite(startTs) || !isFinite(endTs) || endTs <= startTs) return '';
+
+  const rows = sorted.map(x => {
+    const samples = _statsHistory[x.id];
+    const episodes = findBreachEpisodes(samples, x.sensor.alerts);
+    const slots = _breachSlots(episodes, startTs, endTs);
+    const color = _colorMap[x.id] || '#888';
+    const longest = episodes.reduce((m, e) => Math.max(m, e.endTs - e.startTs), 0);
+    const total   = episodes.reduce((m, e) => m + (e.endTs - e.startTs), 0);
+    const stats = episodes.length === 0
+      ? `<span style="color:var(--text3)">no breaches</span>`
+      : `${episodes.length} ep · longest ${fmtDuration(longest)}`;
+    return `<div class="breach-row">
+      <div class="breach-label" title="${esc(x.sensor.name)}"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
+      <div class="breach-bar" title="${episodes.length === 0 ? 'No breaches in range' : episodes.length + ' breach episode' + (episodes.length === 1 ? '' : 's') + ', total ' + fmtDuration(total)}">
+        ${slots.map(hit => `<div class="breach-slot ${hit ? 'hit' : ''}"></div>`).join('')}
+      </div>
+      <div class="breach-stats">${stats}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>Alert breach history (${_statsRange})</h2>
+    ${rows}
+    <div class="stats-footnote">Each bar spans the selected range; red slots mark times the sensor's reading was outside its SensorPush-configured thresholds. Only sensors with at least one alert enabled in the SensorPush app appear here.</div>
+  </div>`;
+}
+
 // Pearson correlation coefficient for two equal-length numeric sequences.
 // Returns null when there's no variance in either column (would divide by 0)
 // or when fewer than 3 paired observations are available.
@@ -2327,6 +2439,7 @@ function renderStats() {
     renderIndoorOutdoor(all),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
+    renderBreachHistory(all),
     renderRecords(all),
     renderHourOfDay(all),
     renderCorrelation(all),
