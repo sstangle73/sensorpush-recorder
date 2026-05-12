@@ -182,6 +182,53 @@ export function pruneGatewayStatus(db, olderThanSecs = 30 * 86400) {
   db.prepare(`DELETE FROM gateway_status WHERE polled_at < ?`).run(cutoff);
 }
 
+// Compute gateway uptime % over the window starting at sinceTs. A poll is
+// counted as "online" when (polled_at - last_seen) ≤ freshThresholdSecs;
+// i.e., the gateway was last heard within freshThresholdSecs of that poll.
+// 10 min default lines up with the 5-min poll cadence + some slack.
+//
+// Returns null uptime when there's no recorded data (gateway wasn't around
+// during the window) — caller distinguishes "0% uptime" from "no data".
+export function getGatewayUptime(db, gatewayId, sinceTs, freshThresholdSecs = 600) {
+  const rows = db.prepare(`
+    SELECT polled_at, last_seen FROM gateway_status
+    WHERE gateway_id = ? AND polled_at >= ?
+  `).all(gatewayId, sinceTs);
+  if (!rows.length) return { uptimePct: null, total: 0, online: 0 };
+  let online = 0;
+  for (const r of rows) {
+    if (r.last_seen != null && r.polled_at - r.last_seen <= freshThresholdSecs) online++;
+  }
+  return {
+    uptimePct: online / rows.length,
+    total:     rows.length,
+    online,
+  };
+}
+
+// Count sensors whose primary gateway resolves to this gatewayId over the
+// last `lookbackSecs`. Lets the UI show "primary for N sensors" so the user
+// knows whose data flow depends on each gateway.
+export function countSensorsByPrimaryGateway(db, gatewayId, lookbackSecs = 7 * 86400) {
+  const since = Math.floor(Date.now() / 1000) - lookbackSecs;
+  // Sensors with at least one reading in the lookback that came through this
+  // gateway (as the most-frequent first segment of the semicolon list).
+  // For each sensor, getSensorPrimaryGateway already encapsulates the logic;
+  // do it inline here for efficiency.
+  const sensors = db.prepare(`SELECT DISTINCT sensor_id FROM readings WHERE ts >= ?`).all(since);
+  let count = 0;
+  for (const { sensor_id } of sensors) {
+    const top = db.prepare(`
+      SELECT TRIM(SUBSTR(gateway_id, 1, INSTR(gateway_id || ';', ';') - 1)) AS gw, COUNT(*) AS n
+      FROM readings
+      WHERE sensor_id = ? AND ts >= ? AND gateway_id IS NOT NULL AND gateway_id != ''
+      GROUP BY gw ORDER BY n DESC LIMIT 1
+    `).get(sensor_id, since);
+    if (top?.gw === gatewayId) count++;
+  }
+  return count;
+}
+
 export function getGateways(db) {
   return db.prepare(`SELECT id, name, last_seen, last_alert, version, paired, message, last_synced FROM gateways ORDER BY name`).all();
 }

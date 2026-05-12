@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
@@ -356,20 +356,35 @@ export function createApp(db, config = null) {
     res.json({ ok: true, sensorId, range, ...result });
   });
 
-  app.get('/gateways', (_req, res) => {
-    const rows = getGateways(db);
+  app.get('/gateways', (req, res) => {
+    const rows  = getGateways(db);
+    // Optional ?range=Xd attaches uptime % and sensor counts. Backward-compatible:
+    // omitting the param keeps the old payload shape.
+    const range = req.query.range;
+    const rangeSecs = range ? rangeToSeconds(range) : null;
+    if (range && !rangeSecs) {
+      return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 24h, 7d, 30d.' });
+    }
+    const since = rangeSecs ? Math.floor(Date.now() / 1000) - rangeSecs : null;
     res.json({
       ok: true,
-      gateways: rows.map(r => ({
-        id:         r.id,
-        name:       r.name,
-        lastSeen:   r.last_seen   ? new Date(r.last_seen   * 1000).toISOString() : null,
-        lastAlert:  r.last_alert  ? new Date(r.last_alert  * 1000).toISOString() : null,
-        version:    r.version,
-        paired:     !!r.paired,
-        message:    r.message,
-        lastSynced: r.last_synced ? new Date(r.last_synced * 1000).toISOString() : null,
-      })),
+      gateways: rows.map(r => {
+        const out = {
+          id:         r.id,
+          name:       r.name,
+          lastSeen:   r.last_seen   ? new Date(r.last_seen   * 1000).toISOString() : null,
+          lastAlert:  r.last_alert  ? new Date(r.last_alert  * 1000).toISOString() : null,
+          version:    r.version,
+          paired:     !!r.paired,
+          message:    r.message,
+          lastSynced: r.last_synced ? new Date(r.last_synced * 1000).toISOString() : null,
+        };
+        if (since !== null) {
+          out.uptime = getGatewayUptime(db, r.id, since);
+          out.primaryFor = countSensorsByPrimaryGateway(db, r.id);
+        }
+        return out;
+      }),
     });
   });
 
