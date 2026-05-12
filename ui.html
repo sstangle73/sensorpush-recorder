@@ -1190,6 +1190,15 @@ function renderRtCard(id) {
   const vpd  = lastRaw?.vpd ?? null;
   const hi   = (s.temperature != null && s.humidity != null)
     ? heatIndex(s.temperature, s.humidity) : null;
+  // Dewpoint depression — how close the air is to saturation. Drives the
+  // "feels" descriptor; small spread = muggy / close to condensing.
+  const spread = (s.temperature != null && dew != null) ? s.temperature - dew : null;
+  const feels  = spread == null ? null
+    : spread <  5 ? 'muggy'
+    : spread < 10 ? 'humid'
+    : spread < 20 ? 'comfortable'
+    : spread < 30 ? 'dry'
+    :               'very dry';
 
   const r24T = range24h(hist, 'temperature');
   const r24H = range24h(hist, 'humidity');
@@ -1224,6 +1233,7 @@ function renderRtCard(id) {
     <div class="rt-meta">
       <div class="rt-meta-line">
         ${dew != null ? `<span><span class="rt-dim">Dew</span> <b>${dew.toFixed(1)}°F</b></span>` : ''}
+        ${feels != null ? `<span title="T − dewpoint spread: ${spread.toFixed(1)}°F. Small spread = air close to saturation."><span class="rt-dim">Feels</span> <b>${feels}</b> <span class="rt-dim">(Δ${spread.toFixed(0)}°F)</span></span>` : ''}
         ${hi != null ? `<span><span class="rt-dim">HI</span> <b>${hi.toFixed(1)}°F</b></span>` : ''}
         ${vpd != null ? `<span><span class="rt-dim">VPD</span> <b>${vpd.toFixed(2)} kPa</b></span>` : ''}
       </div>
