@@ -2561,6 +2561,195 @@ function renderLagLead(all) {
   </div>`;
 }
 
+// ── Mold / condensation risk ─────────────────────────────────────────────
+// Find the longest contiguous run where `pred(sample)` is true and return
+// its duration in seconds. The duration is `lastTs - firstTs` of the run,
+// so it's measured in real wall time regardless of sample cadence (raw 5
+// min vs hourly bucket vs daily). Sample-rate gaps within a "run" are
+// ignored — a sample that satisfies pred is treated as continuing the run
+// even if it's hours after the previous one. For mold risk that's fine:
+// the metric is a rough "how long has it been muggy"; the user can shorten
+// the range if backfill gaps would inflate it.
+function _longestRunSecs(samples, pred) {
+  let best = 0, startTs = null, lastTs = null;
+  for (const s of samples) {
+    if (pred(s)) {
+      if (startTs == null) startTs = s.ts;
+      lastTs = s.ts;
+    } else {
+      if (startTs != null) best = Math.max(best, lastTs - startTs);
+      startTs = null; lastTs = null;
+    }
+  }
+  if (startTs != null) best = Math.max(best, lastTs - startTs);
+  return best;
+}
+
+// Risk tiering from sustained-humidity + close-to-dew metrics:
+//   pct70   = fraction of samples with RH ≥ 70%   (mold growth zone)
+//   pct80   = fraction of samples with RH ≥ 80%   (active mold zone)
+//   spread  = fraction of samples with T − Tdew < 5°F  (surface condensation risk)
+//   runHrs  = longest unbroken stretch ≥ 70% RH, in hours
+//
+// "Low" is dropped from the section entirely so the page doesn't sprout
+// noise for the dry rooms. Pairing each tier with a distinct glyph keeps
+// the levels readable when the color cue is lost (grayscale, CB users).
+function moldRisk(samples) {
+  const validHum    = samples.filter(s => s.humidity != null);
+  const validSpread = samples.filter(s => s.temperature != null && s.dewpoint != null);
+  if (!validHum.length && !validSpread.length) return null;
+
+  const pct70 = validHum.length
+    ? validHum.filter(s => s.humidity >= 70).length / validHum.length : 0;
+  const pct80 = validHum.length
+    ? validHum.filter(s => s.humidity >= 80).length / validHum.length : 0;
+  const spread = validSpread.length
+    ? validSpread.filter(s => s.temperature - s.dewpoint < 5).length / validSpread.length : 0;
+  const runHrs = _longestRunSecs(samples, s => s.humidity != null && s.humidity >= 70) / 3600;
+
+  let level = 'low';
+  if (pct70 >= 0.50 || pct80 >= 0.25 || runHrs >= 168)      level = 'high';
+  else if (pct70 >= 0.25 || runHrs >= 72)                   level = 'elevated';
+  else if (pct70 >= 0.05 || runHrs >= 24 || spread >= 0.10) level = 'moderate';
+
+  return { level, pct70, pct80, spread, runHrs };
+}
+
+function renderMoldRisk(all) {
+  const data = all.map(x => {
+    const samples = _statsHistory[x.id] || [];
+    return { x, risk: samples.length ? moldRisk(samples) : null };
+  }).filter(d => d.risk && d.risk.level !== 'low');
+  if (!data.length) return '';
+
+  const tier = {
+    high:     { glyph: '⚠', color: 'var(--excl)', label: 'High'     },
+    elevated: { glyph: '◑', color: 'var(--warn)', label: 'Elevated' },
+    moderate: { glyph: '◔', color: 'var(--warn)', label: 'Moderate' },
+  };
+  const order = { high: 0, elevated: 1, moderate: 2 };
+  data.sort((a, b) => order[a.risk.level] - order[b.risk.level]);
+
+  const fmtRun = h => h < 1    ? '<1h'
+                    : h < 24   ? Math.round(h) + 'h'
+                    : h < 168  ? (h / 24).toFixed(1) + 'd'
+                    :            Math.round(h / 24) + 'd';
+
+  const rows = data.map(({ x, risk }) => {
+    const t = tier[risk.level];
+    return `<tr>
+      <td><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}</td>
+      <td style="color:${t.color}"><span style="margin-right:4px">${t.glyph}</span>${t.label}</td>
+      <td>${(risk.pct70 * 100).toFixed(0)}%</td>
+      <td>${(risk.spread * 100).toFixed(0)}%</td>
+      <td>${fmtRun(risk.runHrs)}</td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>Mold &amp; condensation risk (${_statsRange})</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr><th>Sensor</th><th>Risk</th><th>Time ≥70% RH</th><th>Close to dew</th><th>Longest humid run</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="stats-footnote">Sustained relative humidity ≥70% feeds mold growth; a dewpoint depression under 5°F (air close to saturation) makes surface condensation likely. The first percentage is fraction of time the sensor read ≥70% RH; the second is fraction of time temperature was within 5°F of dewpoint; the last is the longest unbroken stretch ≥70% RH. Low-risk sensors are omitted.</div>
+  </div>`;
+}
+
+// ── HVAC duty-cycle inference ────────────────────────────────────────────
+// Infer how much the HVAC is driving a room's temperature.
+//
+//   cyclesPerDay     — full on/off cycles per day, inferred from sign
+//                      reversals in the hour-to-hour temperature slope.
+//                      One on/off cycle produces TWO slope reversals
+//                      (heating→coasting + coasting→heating), so we
+//                      divide the reversal count by 2.
+//   activeHrsPerDay  — hours per day where |dT/dt| ≥ ACTIVE_SLOPE °F/hour.
+//                      "Active" ≈ the room is being driven, not coasting.
+//
+// Hourly rebinning normalizes sample cadence between raw 24h (~288/day)
+// and hourly_agg (24/day). Adjacent slopes only — non-adjacent hours
+// (gaps from polling outages, sensor offline) don't contribute a slope
+// pair, so they don't inflate the cycle count.
+const HVAC_ACTIVE_SLOPE   = 0.5;   // °F per hour — "the room is being driven"
+const HVAC_REVERSAL_FLOOR = 0.2;   // °F per hour — both sides must clear this to count as a cycle
+function hvacActivity(samples) {
+  const valid = samples.filter(s => s.temperature != null);
+  if (valid.length < 24) return null;
+
+  // Bin to hour means.
+  const byHour = new Map();
+  for (const s of valid) {
+    const h   = Math.floor(s.ts / 3600);
+    const cur = byHour.get(h) || { sum: 0, n: 0 };
+    cur.sum += s.temperature; cur.n++;
+    byHour.set(h, cur);
+  }
+  const hourly = [...byHour.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([h, agg]) => ({ h, t: agg.sum / agg.n }));
+  if (hourly.length < 24) return null;
+
+  const slopes = [];
+  for (let i = 1; i < hourly.length; i++) {
+    if (hourly[i].h - hourly[i - 1].h === 1) {
+      slopes.push(hourly[i].t - hourly[i - 1].t);
+    } else {
+      slopes.push(null); // gap — breaks slope-pair adjacency
+    }
+  }
+
+  let cycles = 0;
+  for (let i = 1; i < slopes.length; i++) {
+    const a = slopes[i - 1], b = slopes[i];
+    if (a == null || b == null) continue;
+    if (Math.abs(a) >= HVAC_REVERSAL_FLOOR && Math.abs(b) >= HVAC_REVERSAL_FLOOR && a * b < 0) {
+      cycles++;
+    }
+  }
+
+  const activeHrs = slopes.filter(s => s != null && Math.abs(s) >= HVAC_ACTIVE_SLOPE).length;
+  const days      = hourly.length / 24;
+  return {
+    cyclesPerDay:    (cycles / 2) / days, // 2 slope reversals = 1 on/off cycle
+    activeHrsPerDay: activeHrs / days,
+    days,
+  };
+}
+
+function renderHVACActivity(all) {
+  // Skip outside sensors (no HVAC) and appliances (fridges/freezers cycle
+  // on their own and would dominate the chart). House + Other only.
+  const data = all
+    .filter(x => x.group.group === 'house' || x.group.group === 'other')
+    .map(x => ({ x, hvac: hvacActivity(_statsHistory[x.id] || []) }))
+    .filter(d => d.hvac);
+  if (!data.length) return '';
+
+  data.sort((a, b) => b.hvac.cyclesPerDay - a.hvac.cyclesPerDay);
+
+  const tier = c => c >= 3 ? { glyph: '▲', color: 'var(--warn)', label: 'Active'   }
+                  : c >= 1 ? { glyph: '◑', color: 'var(--text2)', label: 'Moderate' }
+                  :          { glyph: '●', color: 'var(--text3)', label: 'Passive'  };
+
+  const rows = data.map(({ x, hvac }) => {
+    const t = tier(hvac.cyclesPerDay);
+    return `<tr>
+      <td><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}</td>
+      <td>${hvac.cyclesPerDay.toFixed(1)}</td>
+      <td>${hvac.activeHrsPerDay.toFixed(1)} h/day</td>
+      <td style="color:${t.color}"><span style="margin-right:4px">${t.glyph}</span>${t.label}</td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>HVAC activity (${_statsRange})</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr><th>Sensor</th><th>Cycles/day</th><th>Active time</th><th>Pattern</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="stats-footnote">"Cycles/day" counts heating-to-cooling pivots in the hour-to-hour temperature slope — a coasting room rarely flips direction, an actively driven one flips several times a day. "Active time" is hours per day where temperature changed by ≥${HVAC_ACTIVE_SLOPE}°F/hr. Outdoor sensors and appliances are excluded; both have their own dynamics that aren't HVAC.</div>
+  </div>`;
+}
+
 // Scan samples for the extreme value of a field. mode='max' uses the
 // hourly/daily max sidecar (tempMax/humMax) when present so the result
 // reflects the within-bucket extreme, not just the bucket mean. ts is
@@ -2646,6 +2835,8 @@ function renderStats() {
     renderHourOfDay(all),
     renderCorrelation(all),
     renderLagLead(all),
+    renderMoldRisk(all),
+    renderHVACActivity(all),
     renderBatteryHealth(all),
   ].filter(Boolean).join('');
 }
