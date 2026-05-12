@@ -2123,6 +2123,58 @@ function renderHourOfDay(all) {
   </div>`;
 }
 
+// Scan samples for the extreme value of a field. mode='max' uses the
+// hourly/daily max sidecar (tempMax/humMax) when present so the result
+// reflects the within-bucket extreme, not just the bucket mean. ts is
+// returned alongside so the UI can show the date the record was set.
+function findExtreme(samples, field, mode, minField, maxField) {
+  let bestVal = null, bestTs = null;
+  for (const s of samples) {
+    let v;
+    if (mode === 'max') v = (maxField && s[maxField] != null) ? s[maxField] : s[field];
+    else                v = (minField && s[minField] != null) ? s[minField] : s[field];
+    if (v == null) continue;
+    if (bestVal == null
+        || (mode === 'max' ? v > bestVal : v < bestVal)) {
+      bestVal = v; bestTs = s.ts;
+    }
+  }
+  return bestVal == null ? null : { value: bestVal, ts: bestTs };
+}
+
+function _fmtRecordDate(ts) {
+  return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function renderRecords(all) {
+  const rows = all.slice().sort(_sortStats).map(x => {
+    const samples = _statsHistory[x.id] || [];
+    if (!samples.length) return null;
+    const tHi = findExtreme(samples, 'temperature', 'max', 'tempMin', 'tempMax');
+    const tLo = findExtreme(samples, 'temperature', 'min', 'tempMin', 'tempMax');
+    const hHi = findExtreme(samples, 'humidity',    'max', 'humMin',  'humMax');
+    const hLo = findExtreme(samples, 'humidity',    'min', 'humMin',  'humMax');
+    const color = _colorMap[x.id] || '#888';
+    const cell = (ext, fmt, cls) => ext == null ? '<td>—</td>'
+      : `<td><span class="${cls || ''}">${fmt(ext.value)}</span><div class="rt-dim" style="font-size:10px">${_fmtRecordDate(ext.ts)}</div></td>`;
+    return `<tr>
+      <td><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</td>
+      ${cell(tHi, v => v.toFixed(1) + '°F', 'stats-up')}
+      ${cell(tLo, v => v.toFixed(1) + '°F', 'stats-down')}
+      ${cell(hHi, v => Math.round(v) + '%')}
+      ${cell(hLo, v => Math.round(v) + '%')}
+    </tr>`;
+  }).filter(Boolean).join('');
+  if (!rows) return '';
+  return `<div class="an-section"><h2>Records (${_statsRange})</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr><th>Sensor</th><th>Hottest</th><th>Coldest</th><th>Wettest</th><th>Driest</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="stats-footnote">Hottest/coldest/wettest/driest moments in the selected range. Pick a longer range (30d / 90d) to surface seasonal records. Date shown is when the record was set.</div>
+  </div>`;
+}
+
 function renderStats() {
   const c = document.getElementById('stats-content');
   if (!c) return;
@@ -2151,6 +2203,7 @@ function renderStats() {
     renderIndoorOutdoor(all),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
+    renderRecords(all),
     renderHourOfDay(all),
   ].filter(Boolean).join('');
 }
