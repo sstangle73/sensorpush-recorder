@@ -2434,25 +2434,30 @@ function pearsonR(xs, ys) {
   return denom === 0 ? null : sxy / denom;
 }
 
-// Bin samples into per-hour means so two sensors with slightly-offset poll
-// timestamps still align cleanly. Returns a Map<hourStartTs, mean>.
-function _hourlyBucket(samples, field) {
+// Bin samples into per-window means so two sensors with slightly-offset
+// poll timestamps still align cleanly. Default window is 1 hour
+// (3600s) — fine for 7d+ ranges where there's a full data point per
+// hour. At sub-day ranges callers pass a smaller bucketSecs (e.g. 300
+// for 5-min bins) so the bucket count isn't ≤2 and pearsonR has
+// enough paired obs to produce a meaningful r.
+// Returns a Map<bucketStartTs, mean>.
+function _timeBucket(samples, field, bucketSecs = 3600) {
   const acc = new Map();
   for (const s of samples) {
     if (s[field] == null) continue;
-    const hourTs = Math.floor(s.ts / 3600) * 3600;
-    const cur = acc.get(hourTs) || { sum: 0, n: 0 };
+    const bucketTs = Math.floor(s.ts / bucketSecs) * bucketSecs;
+    const cur = acc.get(bucketTs) || { sum: 0, n: 0 };
     cur.sum += s[field]; cur.n++;
-    acc.set(hourTs, cur);
+    acc.set(bucketTs, cur);
   }
   const out = new Map();
   for (const [k, v] of acc) out.set(k, v.sum / v.n);
   return out;
 }
 
-function correlationFor(idA, idB, field = 'temperature') {
-  const a = _hourlyBucket(_statsHistory[idA] || [], field);
-  const b = _hourlyBucket(_statsHistory[idB] || [], field);
+function correlationFor(idA, idB, field = 'temperature', bucketSecs = 3600) {
+  const a = _timeBucket(_statsHistory[idA] || [], field, bucketSecs);
+  const b = _timeBucket(_statsHistory[idB] || [], field, bucketSecs);
   const common = [];
   for (const ts of a.keys()) if (b.has(ts)) common.push(ts);
   if (common.length < 3) return null;
@@ -2471,13 +2476,21 @@ function renderCorrelation(all) {
   if (valid.length < 2) return '';
   const sorted = valid.slice().sort(_sortStats);
 
+  // At sub-day ranges, hourly bins collapse to ≤2 buckets and pearsonR
+  // can't say anything. Drop to 5-minute bins instead — enough resolution
+  // for two sensors polled together to land in the same bucket, and
+  // enough buckets (12 at 1h, 144 at 12h) for a meaningful r.
+  const rangeSecs = rangeToSeconds(_statsRange);
+  const subDay    = rangeSecs > 0 && rangeSecs < 86400;
+  const bucketSecs = subDay ? 300 : 3600;
+
   // Pre-compute the upper triangle, fill the lower via symmetry.
   const N = sorted.length;
   const M = Array.from({ length: N }, () => new Array(N).fill(null));
   for (let i = 0; i < N; i++) {
     M[i][i] = 1;
     for (let j = i + 1; j < N; j++) {
-      const r = correlationFor(sorted[i].id, sorted[j].id);
+      const r = correlationFor(sorted[i].id, sorted[j].id, 'temperature', bucketSecs);
       M[i][j] = M[j][i] = r;
     }
   }
@@ -2502,12 +2515,17 @@ function renderCorrelation(all) {
     </tr>`;
   }).join('');
 
+  const binLabel = subDay ? '5-minute' : 'hourly';
+  const subDayNote = subDay
+    ? ' At this range bins are 5 minutes wide; "—" means the two sensors had no overlapping 5-min windows in the range (typical if they happen to be polled offset from each other).'
+    : '';
+
   return `<div class="an-section"><h2>Temperature correlation (${_statsRange})</h2>
     <div class="stats-table-wrap"><table class="an-table corr-table">
       <thead><tr><th></th>${headers}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <div class="stats-footnote">Pearson r of hourly-binned temperature, range −1 (anti) to +1 (co-moving). High positive (≳0.7) means the pair moves together — typically HVAC zones, sun-exposed rooms, or anything sharing thermal mass. Near-zero means independent (e.g., a fridge vs. the attic).</div>
+    <div class="stats-footnote">Pearson r of ${binLabel}-binned temperature, range −1 (anti) to +1 (co-moving). High positive (≳0.7) means the pair moves together — typically HVAC zones, sun-exposed rooms, or anything sharing thermal mass. Near-zero means independent (e.g., a fridge vs. the attic).${subDayNote}</div>
   </div>`;
 }
 
@@ -2536,8 +2554,12 @@ function _laggedR(aMap, bMap, lagSec) {
 // the range to skip this case.
 const LAG_MAX_H = 4;
 function lagLeadFor(idA, idB, field = 'temperature') {
-  const a = _hourlyBucket(_statsHistory[idA] || [], field);
-  const b = _hourlyBucket(_statsHistory[idB] || [], field);
+  // Lag/lead measures lags in hours so it stays on hourly bins regardless
+  // of the correlation matrix's binning choice — at sub-day ranges the
+  // hourly buckets collapse to too few points and the function returns
+  // null, which is the right outcome.
+  const a = _timeBucket(_statsHistory[idA] || [], field);
+  const b = _timeBucket(_statsHistory[idB] || [], field);
   if (a.size < 6 || b.size < 6) return null;
   let best = null;
   for (let h = -LAG_MAX_H; h <= LAG_MAX_H; h++) {
