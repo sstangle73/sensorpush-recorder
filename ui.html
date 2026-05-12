@@ -569,6 +569,14 @@ header .spacer { flex: 1; }
   height: 8px; width: 100px; border-radius: 2px;
   background: linear-gradient(to right, rgb(77,184,255), rgb(240,240,240), rgb(240,160,60));
 }
+.corr-table { font-variant-numeric: tabular-nums; }
+.corr-table th, .corr-table td { padding: 5px 6px !important; font-size: 11px; }
+.corr-h { font-weight: 500; font-size: 10px; text-align: center !important; }
+.corr-cell { text-align: center !important; font-weight: 500; }
+.corr-row-label {
+  white-space: nowrap; max-width: 160px;
+  overflow: hidden; text-overflow: ellipsis;
+}
 @media (max-width: 640px) {
   .hod-label { flex: 0 0 95px; font-size: 10px; }
   .hod-axis-spacer { flex: 0 0 95px; }
@@ -2123,6 +2131,100 @@ function renderHourOfDay(all) {
   </div>`;
 }
 
+// Pearson correlation coefficient for two equal-length numeric sequences.
+// Returns null when there's no variance in either column (would divide by 0)
+// or when fewer than 3 paired observations are available.
+function pearsonR(xs, ys) {
+  if (xs.length !== ys.length || xs.length < 3) return null;
+  const n = xs.length;
+  const xm = xs.reduce((a, b) => a + b, 0) / n;
+  const ym = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - xm, dy = ys[i] - ym;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  const denom = Math.sqrt(sxx * syy);
+  return denom === 0 ? null : sxy / denom;
+}
+
+// Bin samples into per-hour means so two sensors with slightly-offset poll
+// timestamps still align cleanly. Returns a Map<hourStartTs, mean>.
+function _hourlyBucket(samples, field) {
+  const acc = new Map();
+  for (const s of samples) {
+    if (s[field] == null) continue;
+    const hourTs = Math.floor(s.ts / 3600) * 3600;
+    const cur = acc.get(hourTs) || { sum: 0, n: 0 };
+    cur.sum += s[field]; cur.n++;
+    acc.set(hourTs, cur);
+  }
+  const out = new Map();
+  for (const [k, v] of acc) out.set(k, v.sum / v.n);
+  return out;
+}
+
+function correlationFor(idA, idB, field = 'temperature') {
+  const a = _hourlyBucket(_statsHistory[idA] || [], field);
+  const b = _hourlyBucket(_statsHistory[idB] || [], field);
+  const common = [];
+  for (const ts of a.keys()) if (b.has(ts)) common.push(ts);
+  if (common.length < 3) return null;
+  return pearsonR(common.map(ts => a.get(ts)), common.map(ts => b.get(ts)));
+}
+
+// Map a correlation value (-1..+1) onto the diverging blue/neutral/orange
+// scale. r=+1 → deep blue (strongly co-moving), r=0 → grey (independent),
+// r=-1 → orange (anti-correlated, rare for sensor data).
+function _corrColor(r) {
+  return _hodColor(0.5 - r * 0.5);
+}
+
+function renderCorrelation(all) {
+  const valid = all.filter(x => (_statsHistory[x.id] || []).length >= 6);
+  if (valid.length < 2) return '';
+  const sorted = valid.slice().sort(_sortStats);
+
+  // Pre-compute the upper triangle, fill the lower via symmetry.
+  const N = sorted.length;
+  const M = Array.from({ length: N }, () => new Array(N).fill(null));
+  for (let i = 0; i < N; i++) {
+    M[i][i] = 1;
+    for (let j = i + 1; j < N; j++) {
+      const r = correlationFor(sorted[i].id, sorted[j].id);
+      M[i][j] = M[j][i] = r;
+    }
+  }
+
+  const shortLabel = name => name.length > 7 ? name.slice(0, 6) + '…' : name;
+
+  const headers = sorted.map(x =>
+    `<th class="corr-h" title="${esc(x.sensor.name)}">${esc(shortLabel(x.sensor.name))}</th>`
+  ).join('');
+
+  const rows = sorted.map((x, i) => {
+    const cells = sorted.map((y, j) => {
+      const r = M[i][j];
+      if (i === j) return '<td class="corr-cell" style="color:var(--text3)">—</td>';
+      if (r == null) return '<td class="corr-cell" style="color:var(--text3)">—</td>';
+      const fmt = (r >= 0 ? '+' : '') + r.toFixed(2);
+      return `<td class="corr-cell" style="background:${_corrColor(r)};color:#161616" title="${esc(x.sensor.name)} ↔ ${esc(y.sensor.name)}: r = ${r.toFixed(3)}">${fmt}</td>`;
+    }).join('');
+    return `<tr>
+      <td class="corr-row-label"><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}</td>
+      ${cells}
+    </tr>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>Temperature correlation (${_statsRange})</h2>
+    <div class="stats-table-wrap"><table class="an-table corr-table">
+      <thead><tr><th></th>${headers}</tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="stats-footnote">Pearson r of hourly-binned temperature, range −1 (anti) to +1 (co-moving). High positive (≳0.7) means the pair moves together — typically HVAC zones, sun-exposed rooms, or anything sharing thermal mass. Near-zero means independent (e.g., a fridge vs. the attic).</div>
+  </div>`;
+}
+
 // Scan samples for the extreme value of a field. mode='max' uses the
 // hourly/daily max sidecar (tempMax/humMax) when present so the result
 // reflects the within-bucket extreme, not just the bucket mean. ts is
@@ -2205,6 +2307,7 @@ function renderStats() {
     renderStatsTable(all, 'humidity'),
     renderRecords(all),
     renderHourOfDay(all),
+    renderCorrelation(all),
   ].filter(Boolean).join('');
 }
 
