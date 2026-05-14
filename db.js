@@ -95,6 +95,19 @@ export function openDb(path) {
     );
     CREATE INDEX IF NOT EXISTS idx_events_ts        ON events(ts);
     CREATE INDEX IF NOT EXISTS idx_events_sensor_id ON events(sensor_id);
+
+    -- Per-(target, condition) firing state for outbound notifications.
+    -- The "key" column is "condition:targetId" (e.g. "threshold:sensor123",
+    -- "gateway-offline:gw1"). "active" = condition is currently true;
+    -- last_payload is the most recent dispatched payload as JSON, kept for
+    -- debugging from the UI / test buttons.
+    CREATE TABLE IF NOT EXISTS notification_state (
+      key                TEXT PRIMARY KEY,
+      active             INTEGER NOT NULL DEFAULT 0,
+      last_notified_at   INTEGER,
+      last_transition_at INTEGER,
+      last_payload       TEXT
+    );
   `);
   // Migrate existing DBs that predate the excluded columns.
   for (const [table, col] of [['readings', 'excluded'], ['hourly_agg', 'excluded']]) {
@@ -515,27 +528,31 @@ export function rangeUnit(range) {
   return /^(\d+)(h|d|yr)$/.exec(range)?.[2] ?? null;
 }
 
-export function getHistory(db, sensorId, range) {
+// Optional `endTs` anchors the window at an arbitrary epoch (seconds) — used
+// by the Stats YoY overlay to fetch the same `range` ending one calendar
+// year ago. Omitted/null = anchor at "now" (the original behavior).
+export function getHistory(db, sensorId, range, endTs = null) {
   const rangeSeconds = rangeToSeconds(range) ?? 86400;
-  const since = Math.floor(Date.now() / 1000) - rangeSeconds;
+  const end   = endTs != null ? endTs : Math.floor(Date.now() / 1000);
+  const since = end - rangeSeconds;
   const unit  = rangeUnit(range) ?? 'h';
 
   if (unit === 'h') {
     return db.prepare(`
       SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax
-      FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0
+      FROM readings WHERE sensor_id = ? AND ts >= ? AND ts <= ? AND excluded = 0
       ORDER BY ts
-    `).all(sensorId, since);
+    `).all(sensorId, since, end);
   }
   if (unit === 'd') {
     return db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
              dewpoint_avg AS dewpoint, vpd_avg AS vpd,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax
-      FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
+      FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
       ORDER BY hour_ts
-    `).all(sensorId, since);
+    `).all(sensorId, since, end);
   }
   // yr → daily aggregates computed from hourly_agg (no schema change needed)
   return db.prepare(`
@@ -544,10 +561,18 @@ export function getHistory(db, sensorId, range) {
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
            AVG(baro_avg) AS baroPressure,
            AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd
-    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
+    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
-  `).all(sensorId, since);
+  `).all(sensorId, since, end);
+}
+
+// Oldest non-excluded reading ts across all sensors, or null when the DB is
+// empty. The Stats YoY overlay uses this to decide whether the recorder has
+// enough history (≥ 1 year) before offering the comparison.
+export function getOldestReadingTs(db) {
+  const row = db.prepare(`SELECT MIN(ts) AS ts FROM readings WHERE excluded = 0`).get();
+  return row?.ts ?? null;
 }
 
 // Returns all readings including excluded ones — used by the data explorer UI.
@@ -808,4 +833,78 @@ export function updateEvent(db, id, patch) {
 export function deleteEvent(db, id) {
   const r = db.prepare(`DELETE FROM events WHERE id = ?`).run(id);
   return r.changes > 0;
+}
+
+// ── Notification state helpers ─────────────────────────────────────────────
+// One row per (condition, target). Survives process restarts so the dedupe
+// state machine in notifications.js can decide on transition→firing vs.
+// transition→recovered after a crash or container redeploy.
+export function getNotifState(db, key) {
+  const row = db.prepare(`
+    SELECT key, active, last_notified_at, last_transition_at, last_payload
+    FROM notification_state WHERE key = ?
+  `).get(key);
+  if (!row) return null;
+  return {
+    key:              row.key,
+    active:           !!row.active,
+    lastNotifiedAt:   row.last_notified_at,
+    lastTransitionAt: row.last_transition_at,
+    lastPayload:      row.last_payload ? JSON.parse(row.last_payload) : null,
+  };
+}
+
+export function setNotifState(db, key, { active, lastNotifiedAt, lastTransitionAt, lastPayload }) {
+  db.prepare(`
+    INSERT INTO notification_state (key, active, last_notified_at, last_transition_at, last_payload)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      active             = excluded.active,
+      last_notified_at   = excluded.last_notified_at,
+      last_transition_at = excluded.last_transition_at,
+      last_payload       = excluded.last_payload
+  `).run(
+    key,
+    active ? 1 : 0,
+    lastNotifiedAt   ?? null,
+    lastTransitionAt ?? null,
+    lastPayload ? JSON.stringify(lastPayload) : null,
+  );
+}
+
+export function listNotifStates(db) {
+  return db.prepare(`SELECT key, active, last_notified_at, last_transition_at FROM notification_state`).all();
+}
+
+// 14-day per-hour-of-day baseline (mean + sample SD) for temperature and
+// humidity from hourly_agg. Used by the anomaly evaluator on the latest
+// reading — mirrors the UI's loadLiveBaselines() but reads aggregate rows
+// already in the local DB. Returns null when the bucket has < 5 hours of
+// data (not enough to estimate variance).
+export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {
+  const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
+  const rows = db.prepare(`
+    SELECT temp_avg AS t, hum_avg AS h
+    FROM hourly_agg
+    WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?
+      AND ((hour_ts / 3600) % 24) = ?
+  `).all(sensorId, since, hourOfDay);
+  let tSum = 0, tSum2 = 0, tN = 0;
+  let hSum = 0, hSum2 = 0, hN = 0;
+  for (const r of rows) {
+    if (r.t != null) { tSum += r.t; tSum2 += r.t * r.t; tN++; }
+    if (r.h != null) { hSum += r.h; hSum2 += r.h * r.h; hN++; }
+  }
+  const sd = (sum, sum2, n) => {
+    if (n < 2) return null;
+    const v = Math.max(0, (sum2 - sum * sum / n) / (n - 1));
+    return Math.sqrt(v);
+  };
+  return {
+    tempMean: tN > 0 ? tSum / tN : null,
+    tempSd:   sd(tSum, tSum2, tN),
+    humMean:  hN > 0 ? hSum / hN : null,
+    humSd:    sd(hSum, hSum2, hN),
+    nT: tN, nH: hN,
+  };
 }

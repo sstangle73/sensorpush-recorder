@@ -486,3 +486,97 @@ describe('hvacActivity', () => {
     expect(r.activeHrsPerDay).toBe(0);
   });
 });
+
+// ── priorYearWindow ───────────────────────────────────────────────────────
+// Duplicated from ui.html (see file header). Update both when changing.
+function priorYearWindow(startTs, endTs) {
+  const shift = ts => {
+    const d = new Date(ts * 1000);
+    d.setUTCFullYear(d.getUTCFullYear() - 1);
+    return Math.floor(d.getTime() / 1000);
+  };
+  return { startTs: shift(startTs), endTs: shift(endTs) };
+}
+
+// Convenience: Unix seconds for a UTC instant.
+const utc = (...args) => Math.floor(Date.UTC(...args) / 1000);
+
+describe('priorYearWindow', () => {
+  it('shifts a plain mid-year window back by one calendar year', () => {
+    // 2026-07-15 12:00 UTC → 2025-07-15 12:00 UTC; 7-day window stays 7 days.
+    const end   = utc(2026, 6, 15, 12, 0, 0);
+    const start = end - 7 * 86400;
+    const r = priorYearWindow(start, end);
+    expect(r.endTs).toBe(utc(2025, 6, 15, 12, 0, 0));
+    expect(r.startTs).toBe(utc(2025, 6, 8, 12, 0, 0));
+    expect(r.endTs - r.startTs).toBe(7 * 86400);
+  });
+
+  it('preserves the time-of-day component', () => {
+    // 2026-05-14 19:23:47 UTC → 2025-05-14 19:23:47 UTC
+    const end = utc(2026, 4, 14, 19, 23, 47);
+    const r = priorYearWindow(end - 3600, end);
+    expect(r.endTs).toBe(utc(2025, 4, 14, 19, 23, 47));
+  });
+
+  it('Feb 28 (non-leap day) → Feb 28 in prior year, unchanged', () => {
+    // 2025 and 2024 both have Feb 28 → identical calendar mapping.
+    const ts = utc(2025, 1, 28, 10, 0, 0);
+    const r = priorYearWindow(ts, ts);
+    expect(r.endTs).toBe(utc(2024, 1, 28, 10, 0, 0));
+  });
+
+  it('Feb 29 (leap day) rolls forward to Mar 1 in the prior non-leap year', () => {
+    // 2024-02-29 doesn't exist in 2023 → JS Date wraps Feb 29 → Mar 1.
+    // We accept this: Feb 29 a year ago is genuinely an empty date, and
+    // Mar 1 is the closest valid mapping.
+    const leapDay = utc(2024, 1, 29, 12, 0, 0);
+    const r = priorYearWindow(leapDay, leapDay);
+    expect(r.endTs).toBe(utc(2023, 2, 1, 12, 0, 0));
+  });
+
+  it('windows crossing the leap-year boundary keep the start unchanged', () => {
+    // Window: 2024-02-26 → 2024-03-04 (7 days, crosses Feb 29).
+    // Prior year: 2023-02-26 → 2023-03-04 (which in 2023 is still 7 cal days,
+    // but contains 365 not 366 day-of-year offset → so the window length
+    // can differ by ±1 day across the leap boundary; that's documented
+    // behavior).
+    const start = utc(2024, 1, 26, 0, 0, 0);
+    const end   = utc(2024, 2,  4, 0, 0, 0);
+    const r = priorYearWindow(start, end);
+    expect(r.startTs).toBe(utc(2023, 1, 26, 0, 0, 0));
+    expect(r.endTs).toBe(utc(2023, 2,  4, 0, 0, 0));
+  });
+
+  it('US spring-forward day: window shifts cleanly via UTC (no DST artifact)', () => {
+    // 2026-03-08 02:00 local US is the spring-forward instant; in UTC that's
+    // 2026-03-08 07:00 UTC. We anchor in UTC throughout, so a window crossing
+    // this point still shifts to exactly 2025-03-08 — UTC has no DST, so the
+    // local-time 23h day doesn't subtract an hour from our window.
+    const end   = utc(2026, 2, 8, 12, 0, 0);
+    const start = end - 86400;          // 24 UTC-hours
+    const r = priorYearWindow(start, end);
+    expect(r.endTs - r.startTs).toBe(86400);
+    expect(r.endTs).toBe(utc(2025, 2, 8, 12, 0, 0));
+    expect(r.startTs).toBe(utc(2025, 2, 7, 12, 0, 0));
+  });
+
+  it('US fall-back day: same — UTC math is insensitive to the extra local hour', () => {
+    // 2026-11-01 02:00 local US falls back to 01:00 (25h local day).
+    // UTC arithmetic is unaffected; window length stays a clean 24 UTC-hours.
+    const end   = utc(2026, 10, 1, 12, 0, 0);
+    const start = end - 86400;
+    const r = priorYearWindow(start, end);
+    expect(r.endTs - r.startTs).toBe(86400);
+    expect(r.endTs).toBe(utc(2025, 10, 1, 12, 0, 0));
+  });
+
+  it('returns the same shape (startTs/endTs as integers)', () => {
+    // Integer-only timestamps — downstream callers pass these to a query
+    // string and to integer-compare against DB rows; floats would break both.
+    const end = utc(2026, 5, 1, 8, 30, 15);
+    const r = priorYearWindow(end - 3600, end);
+    expect(Number.isInteger(r.startTs)).toBe(true);
+    expect(Number.isInteger(r.endTs)).toBe(true);
+  });
+});

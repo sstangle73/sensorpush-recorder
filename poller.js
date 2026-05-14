@@ -1,6 +1,7 @@
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus } from './db.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways } from './db.js';
 import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
+import { runNotifications } from './notifications.js';
 
 let _lastPollError     = null;
 let _lastPollTime      = null;
@@ -179,6 +180,43 @@ async function _poll(db, config) {
       console.error('[poller] mqtt publish:', err.message);
     }
   }
+
+  // Fire outbound notifications for any threshold breach / anomaly / offline
+  // sensor or gateway. State machine in notifications.js dedupes so a stuck
+  // condition only buzzes once per transition. Errors are swallowed — a
+  // webhook outage shouldn't break ingestion.
+  try {
+    await _runNotifications(db);
+  } catch (err) {
+    console.error('[poller] notifications error:', err?.message);
+  }
+}
+
+async function _runNotifications(db) {
+  const settings = getUiSettings(db);
+  const notifConfig = settings?.notifications;
+  if (!notifConfig?.enabled) return;
+  // Shape getSensors() rows into the {id, name, temperature, humidity, alerts,
+  // lastTs} fields the evaluators expect.
+  const sensorRows = getSensors(db).map(r => ({
+    id:          r.id,
+    name:        r.name,
+    temperature: r.temperature,
+    humidity:    r.humidity,
+    alerts:      r.alerts ? JSON.parse(r.alerts) : null,
+    lastTs:      r.last_ts,
+  }));
+  const gatewayRows = getGateways(db).map(r => ({
+    id:       r.id,
+    name:     r.name,
+    lastSeen: r.last_seen,
+  }));
+  await runNotifications(db, {
+    sensors:     sensorRows,
+    gateways:    gatewayRows,
+    notifConfig,
+    nowMs:       Date.now(),
+  });
 }
 
 export function getPollStatus() {

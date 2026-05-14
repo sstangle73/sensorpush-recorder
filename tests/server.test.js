@@ -42,6 +42,12 @@ describe('GET / (sensors list)', () => {
     expect(body.sensors).toEqual({});
   });
 
+  it('returns null oldestReadingTs on empty DB', async () => {
+    const { body } = await get('/');
+    expect(body).toHaveProperty('oldestReadingTs');
+    expect(body.oldestReadingTs).toBeNull();
+  });
+
   it('returns sensor data after upsert + readings', async () => {
     upsertSensors(db, [{ id: 'test1', name: 'Kitchen', type: 'HT1', active: true, batteryVoltage: 2.85 }]);
     const now = Math.floor(Date.now() / 1000);
@@ -60,6 +66,9 @@ describe('GET / (sensors list)', () => {
       type: 'HT1',
     });
     expect(body.sensors['test1'].temperature).toBeCloseTo(71.5);
+    // oldestReadingTs surfaced for the YoY toggle's coverage check
+    expect(typeof body.oldestReadingTs).toBe('number');
+    expect(body.oldestReadingTs).toBeLessThanOrEqual(now);
   });
 });
 
@@ -125,6 +134,38 @@ describe('GET /:id/history', () => {
     const { body } = await get('/hist1/history?range=365d');
     expect(body.ok).toBe(true);
     expect(body.resolution).toBe('hourly');
+  });
+
+  it('accepts endTs query param and anchors the window there', async () => {
+    // Insert a reading exactly one year ago, then fetch a 24h window
+    // anchored at "one year ago" — it should only return the year-old row.
+    const now      = Math.floor(Date.now() / 1000);
+    const yearAgo  = now - 365 * 86400;
+    upsertSensors(db, [{ id: 'yoy1', name: 'YoY', type: 'HT1', active: true, batteryVoltage: null }]);
+    insertReadings(db, 'yoy1', [
+      { observed: new Date((yearAgo - 1800) * 1000).toISOString(), temperature: 42, humidity: 30, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 60)       * 1000).toISOString(), temperature: 72, humidity: 50, barometric_pressure: null, battery_voltage: null },
+    ]);
+
+    const cur = await get('/yoy1/history?range=24h');
+    expect(cur.body.samples.some(s => s.temperature === 72)).toBe(true);
+    expect(cur.body.samples.some(s => s.temperature === 42)).toBe(false);
+
+    const yoy = await get(`/yoy1/history?range=24h&endTs=${yearAgo}`);
+    expect(yoy.body.samples.some(s => s.temperature === 42)).toBe(true);
+    expect(yoy.body.samples.some(s => s.temperature === 72)).toBe(false);
+  });
+
+  it('returns 400 when endTs is not a positive integer', async () => {
+    const bad = await get('/hist1/history?range=24h&endTs=notanumber');
+    expect(bad.status).toBe(400);
+    expect(bad.body.ok).toBe(false);
+
+    const negative = await get('/hist1/history?range=24h&endTs=-100');
+    expect(negative.status).toBe(400);
+
+    const floaty = await get('/hist1/history?range=24h&endTs=12.34');
+    expect(floaty.status).toBe(400);
   });
 });
 
@@ -460,6 +501,104 @@ describe('GET /backfill/status', () => {
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
     expect(body).toHaveProperty('status');
+  });
+});
+
+describe('POST /settings/notifications/test', () => {
+  // We don't want real network calls — for the test endpoint we just check
+  // that validation/routing works. Pointing at an unreachable URL returns
+  // ok:true with a per-sink error string, which is the documented contract.
+  async function post(path, body) {
+    const res = await fetch(baseUrl + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('400s on unknown sink', async () => {
+    const { status } = await post('/settings/notifications/test', { sink: 'pagerduty' });
+    expect(status).toBe(400);
+  });
+
+  it('400s when nothing is configured (no sinks)', async () => {
+    const { status, body } = await post('/settings/notifications/test', {
+      notifications: { enabled: true, webhook: { enabled: false, url: '' } },
+      sink: 'all',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/No matching sink/);
+  });
+
+  it('400s on malformed override', async () => {
+    const { status } = await post('/settings/notifications/test', {
+      notifications: { weird: true },
+    });
+    expect(status).toBe(400);
+  });
+
+  it('returns per-sink results when an override is provided', async () => {
+    // Unreachable host → result reports {ok:false, error:...}. The endpoint
+    // itself is ok:true because the request was well-formed.
+    const { status, body } = await post('/settings/notifications/test', {
+      sink: 'webhook',
+      notifications: {
+        enabled: true,
+        webhook: { enabled: true, url: 'http://127.0.0.1:1/nope' },
+      },
+    });
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.results.webhook).toBeDefined();
+    expect(body.results.webhook.ok).toBe(false);
+  });
+});
+
+describe('GET /settings/notifications/state', () => {
+  it('returns an empty list initially', async () => {
+    const res  = await fetch(baseUrl + '/settings/notifications/state');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(Array.isArray(body.states)).toBe(true);
+  });
+});
+
+describe('PUT /settings — notifications validation', () => {
+  it('accepts a valid notifications config alongside ranges', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h', '24h'],
+        notifications: {
+          enabled: true,
+          webhook: { enabled: true, url: 'https://example.com/hook' },
+          conditions: {
+            threshold:      { enabled: true },
+            sensorOffline:  { enabled: true, thresholdSecs: 1800 },
+            gatewayOffline: { enabled: false, thresholdSecs: 900 },
+          },
+        },
+      }),
+    });
+    expect(r.status).toBe(200);
+    const get = await fetch(baseUrl + '/settings').then(r => r.json());
+    expect(get.settings.notifications.enabled).toBe(true);
+    expect(get.settings.notifications.webhook.url).toBe('https://example.com/hook');
+  });
+
+  it('rejects a malformed notifications blob', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h'],
+        notifications: { unknownKey: 1 },
+      }),
+    });
+    expect(r.status).toBe(400);
   });
 });
 

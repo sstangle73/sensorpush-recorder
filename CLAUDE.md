@@ -18,7 +18,7 @@ Runs as a single-container compose stack. After source changes:
 git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js notifications.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
 
 CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
@@ -34,13 +34,14 @@ auth.js         — recorder-token resolution (env > /data/recorder-token > null
 drift.js        — pure-function drift detector: computeDriftStats(samples) → mean delta + linear-regression slope per day; classifyDrift() returns 'drifting'|'stable'|'unknown'
 mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
 hvac.js         — pure-function module: detectCycles(readings, opts) infers HVAC on/off cycles by smoothing the temperature series, sign-thresholding the slope, and grouping contiguous same-sign runs into heating/cooling cycles; pickDefaultThermostatSensor picks the lowest-variance indoor sensor
-ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token)
+notifications.js — outbound webhook + ntfy dispatch with per-(condition, target) DB-backed state machine; fires on transition→active and transition→recovered, dedupes while stuck; condition evaluators for threshold breach, hour-of-day anomaly, sensor-offline, gateway-offline; runNotifications() is called from the poll loop after each successful poll
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom, event markers), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
 tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests). Run `npm test` for the current count.
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db`, `auth`, `poller`, `hvac` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db` → `notifications`; `notifications` → `poller`, `server`; `db`, `auth`, `poller`, `hvac` → `server`.
 
 ## Configuration
 
@@ -53,13 +54,14 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 ## Routes
 
 - **Auth**: `GET /settings/auth` (state), `POST /settings/auth/generate` (bootstrap-only), `POST /settings/auth/rotate` (requires bearer), `DELETE /settings/auth` (clear file token)
-- **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
+- **Sensors / data**: `GET /` (JSON or HTML; response includes `oldestReadingTs` so the Stats YoY toggle can decide whether ≥1y of data exists), `GET /:id/history` (optional `endTs` query param anchors the window at an arbitrary epoch — used by the YoY overlay), `GET /:id/history/all`, `GET /:id/gaps`
 - **Battery forecast**: `GET /battery` — per-sensor voltage trend + projected days-until-replacement
 - **HVAC**: `GET /hvac?range=24h` — duty-cycle inference for thermostat-reference sensors; returns per-cycle list, heating/cooling runtime %, daily breakdown for the last 7 days, and short-cycle warnings. Reference sensors come from `settings.hvac.sensors.<id>.thermostat=true`; with none flagged, the most-stable indoor sensor over 24 h is auto-selected.
 - **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
 - **Settings**: `GET /settings`, `PUT /settings`
+- **Notifications**: `POST /settings/notifications/test` (one-off test dispatch to webhook/ntfy/all; bypasses state machine), `GET /settings/notifications/state` (per-condition firing state map)
 - **Export**: `GET /:id/history.csv?range=7d`
 - **Sensor pairs / drift**: `GET /sensor-pairs`, `POST /sensor-pairs`, `DELETE /sensor-pairs/:id`, `GET /sensor-pairs/:id/drift?range=30d`
 - **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
@@ -73,6 +75,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 - `sensors (id, name, type, active, battery_voltage, alerts, rssi, address, device_id, last_updated)` — upserted from `/devices/sensors` each poll.
 - `gateways (id, name, last_seen, last_alert, version, paired, message, last_synced)` — current state, upserted each poll.
 - `gateway_status (gateway_id, polled_at, last_seen)` — append-only per poll, pruned to 30 days. Used by `gatewayOnlineDuringWindow()` to answer "was this gateway online during this gap?"
+- `notification_state (key, active, last_notified_at, last_transition_at, last_payload)` — one row per (condition, target). `key` shape is `"condition:targetId"` (e.g. `threshold:sensor123`, `gateway-offline:gw1`). State persists across container restarts so a stuck-firing condition isn't re-buzzed after redeploy; `evaluateAndNotify` fires only on transitions in/out of `active`.
 
 ## Testing
 
@@ -82,7 +85,7 @@ npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
-- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`.
+- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`.
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.
@@ -107,6 +110,9 @@ npm run test:watch
 - **Scheduled jobs** (`scheduleDaily` in poller.js) align to host-local clock time, not relative offsets. The schedule re-arms after each run so a long-running job doesn't drift the cadence.
 - **Daily snapshots use `VACUUM INTO`** which produces a clean single-file copy of the SQLite DB without taking a long write lock. Files land in `/data/backups/sensorpush-YYYY-MM-DD.db`; only the 7 most recent are kept (mtime-sorted, then unlinked beyond 7).
 - **Auto gap-fill (03:00) skips silently** if a manual `/backfill` or `/backfill-gaps` is already running — it doesn't queue or retry.
+- **Notification state machine advances even on dispatch failure.** When a webhook or ntfy POST fails (HTTP 5xx, timeout, DNS), we still flip `notification_state.active` and bump `last_notified_at` — otherwise a transient outage would re-fire every 5 minutes forever. Failed deliveries are logged per sink; the firing payload is in `last_payload` for inspection. Recovery transitions follow the same rule.
+- **Anomaly evaluator reads `hourly_agg` for the baseline.** A sensor that's only just joined (< ~5 hours of data for the current hour-of-day) gets `evaluateAnomaly() === []` and never fires; once the bucket has ≥ 5 points, ±2σ checks engage. The SD floor (0.4°F / 1%) prevents naturally-quiet sensors from tripping on minor noise.
+- **Webhook vs ntfy payload shape differs.** Webhook receives the full JSON `{timestamp, key, transition, title, message, detail}` as the POST body. ntfy receives `message` as the body and uses `title`, `transition` → Priority+Tags headers — that's what the ntfy clients render natively.
 
 ## SensorPush API surface — what we use vs. don't
 
