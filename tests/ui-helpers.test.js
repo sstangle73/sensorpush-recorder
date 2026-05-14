@@ -354,6 +354,93 @@ describe('minuteOfHourMeans', () => {
   });
 });
 
+// ── eventMarkerX / visibleEventsForChart ───────────────────────────────────
+// Duplicated from ui.html (see file header). Update both when changing.
+
+function eventMarkerX(eventTsSec, xMinMs, xMaxMs, PL, cW) {
+  const tsMs = eventTsSec * 1000;
+  if (tsMs < xMinMs || tsMs > xMaxMs) return null;
+  if (xMaxMs <= xMinMs) return null;
+  return PL + (tsMs - xMinMs) / (xMaxMs - xMinMs) * cW;
+}
+
+function visibleEventsForChart(events, selectedIds) {
+  const sel = selectedIds instanceof Set ? selectedIds : new Set(selectedIds);
+  return events.filter(e => e.sensorId == null || sel.has(e.sensorId));
+}
+
+describe('eventMarkerX', () => {
+  // Chart at 1000-wide canvas, 60px left padding, 880px content width.
+  const PL = 60, cW = 880;
+  // 24-hour window starting at NOW-24h, ending at NOW.
+  const xMin = NOW - 24 * 3600 * 1000;
+  const xMax = NOW;
+
+  it('returns null when event is before the visible window', () => {
+    const before = (xMin / 1000) - 60; // 1 min before window start
+    expect(eventMarkerX(before, xMin, xMax, PL, cW)).toBeNull();
+  });
+
+  it('returns null when event is after the visible window', () => {
+    const after = (xMax / 1000) + 60;
+    expect(eventMarkerX(after, xMin, xMax, PL, cW)).toBeNull();
+  });
+
+  it('returns PL exactly at window start', () => {
+    expect(eventMarkerX(xMin / 1000, xMin, xMax, PL, cW)).toBeCloseTo(PL, 5);
+  });
+
+  it('returns PL + cW exactly at window end', () => {
+    expect(eventMarkerX(xMax / 1000, xMin, xMax, PL, cW)).toBeCloseTo(PL + cW, 5);
+  });
+
+  it('interpolates linearly: midpoint event lands at PL + cW/2', () => {
+    const mid = (xMin + xMax) / 2 / 1000;
+    expect(eventMarkerX(mid, xMin, xMax, PL, cW)).toBeCloseTo(PL + cW / 2, 5);
+  });
+
+  it('interpolates correctly at 25% / 75% of the window', () => {
+    const q1 = (xMin + 0.25 * (xMax - xMin)) / 1000;
+    const q3 = (xMin + 0.75 * (xMax - xMin)) / 1000;
+    expect(eventMarkerX(q1, xMin, xMax, PL, cW)).toBeCloseTo(PL + 0.25 * cW, 5);
+    expect(eventMarkerX(q3, xMin, xMax, PL, cW)).toBeCloseTo(PL + 0.75 * cW, 5);
+  });
+
+  it('returns null when xMax <= xMin (degenerate / zero-width window)', () => {
+    expect(eventMarkerX(xMin / 1000, xMin, xMin, PL, cW)).toBeNull();
+    expect(eventMarkerX(xMin / 1000, xMax, xMin, PL, cW)).toBeNull();
+  });
+});
+
+describe('visibleEventsForChart', () => {
+  const events = [
+    { id: 1, ts: 100, sensorId: null, label: 'global-a' },
+    { id: 2, ts: 200, sensorId: 's1',  label: 's1-only' },
+    { id: 3, ts: 300, sensorId: 's2',  label: 's2-only' },
+    { id: 4, ts: 400, sensorId: null, label: 'global-b' },
+  ];
+
+  it('always includes global (sensorId == null) events', () => {
+    const out = visibleEventsForChart(events, new Set());
+    expect(out.map(e => e.id).sort()).toEqual([1, 4]);
+  });
+
+  it('includes sensor-scoped events only when their sensor is selected', () => {
+    const out = visibleEventsForChart(events, new Set(['s1']));
+    expect(out.map(e => e.id).sort()).toEqual([1, 2, 4]);
+  });
+
+  it('accepts a plain array of ids as well as a Set', () => {
+    const out = visibleEventsForChart(events, ['s2']);
+    expect(out.map(e => e.id).sort()).toEqual([1, 3, 4]);
+  });
+
+  it('returns only globals when no sensor matches the scoped events', () => {
+    const out = visibleEventsForChart(events, new Set(['unknown']));
+    expect(out.map(e => e.id).sort()).toEqual([1, 4]);
+  });
+});
+
 describe('hvacActivity', () => {
   // 48-hour temperature trace with a configurable per-hour profile.
   function trace(profile) {
