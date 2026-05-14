@@ -69,6 +69,20 @@ export function openDb(path) {
     );
     CREATE INDEX IF NOT EXISTS idx_gw_status_polled ON gateway_status(polled_at);
 
+    -- User-defined pairs of sensors meant to be measuring the same environment.
+    -- The Calibration panel compares their hourly readings and flags pairs
+    -- whose delta is trending (i.e. one sensor's calibration is drifting).
+    -- UNIQUE prevents the same A→B mapping being registered twice; B→A is
+    -- a separate row (and the same data, since deltas just flip sign).
+    CREATE TABLE IF NOT EXISTS sensor_pairs (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      sensor_a_id  TEXT NOT NULL,
+      sensor_b_id  TEXT NOT NULL,
+      label        TEXT,
+      created_at   INTEGER NOT NULL,
+      UNIQUE(sensor_a_id, sensor_b_id)
+    );
+
     -- User-annotated events. sensor_id is NULL for global events (visible on
     -- every sensor's chart); non-NULL events are sensor-scoped and only show
     -- when that sensor is selected.
@@ -711,6 +725,59 @@ export function setLastPollTime(db, epochMs) {
 export function getLastPollTime(db) {
   const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get('last_poll');
   return row ? parseInt(row.value, 10) : null;
+}
+
+// ── Sensor pairs (drift detection) ──────────────────────────────────────────
+// Pairs are user-defined "these two sensors are measuring the same thing".
+// We compare them at the hourly_agg level (both sensors share the same
+// hour_ts buckets, so alignment is trivial) and surface the delta + slope
+// so calibration drift is obvious.
+
+export function listSensorPairs(db) {
+  return db.prepare(`
+    SELECT p.id, p.sensor_a_id, p.sensor_b_id, p.label, p.created_at,
+           sa.name AS sensor_a_name, sb.name AS sensor_b_name
+    FROM sensor_pairs p
+    LEFT JOIN sensors sa ON sa.id = p.sensor_a_id
+    LEFT JOIN sensors sb ON sb.id = p.sensor_b_id
+    ORDER BY p.created_at ASC, p.id ASC
+  `).all();
+}
+
+export function getSensorPair(db, id) {
+  return db.prepare(`SELECT id, sensor_a_id, sensor_b_id, label, created_at FROM sensor_pairs WHERE id = ?`).get(id);
+}
+
+// Returns the newly created row (incl. id), or throws on UNIQUE conflict.
+export function createSensorPair(db, { sensorAId, sensorBId, label }) {
+  const now = Math.floor(Date.now() / 1000);
+  const result = db.prepare(`
+    INSERT INTO sensor_pairs (sensor_a_id, sensor_b_id, label, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(sensorAId, sensorBId, label ?? null, now);
+  return getSensorPair(db, Number(result.lastInsertRowid));
+}
+
+export function deleteSensorPair(db, id) {
+  const result = db.prepare(`DELETE FROM sensor_pairs WHERE id = ?`).run(id);
+  return result.changes > 0;
+}
+
+// Pull aligned hourly deltas between two sensors over the given window.
+// Both sensors must have a non-excluded hourly_agg row at the same hour_ts
+// to contribute. Returns `[{ ts, deltaTemp, deltaHumidity }]` sorted by ts
+// ascending. Empty array when either sensor has no overlap in the window.
+export function getPairAlignedHourly(db, sensorAId, sensorBId, sinceTs) {
+  return db.prepare(`
+    SELECT a.hour_ts AS ts,
+           a.temp_avg - b.temp_avg AS deltaTemp,
+           a.hum_avg  - b.hum_avg  AS deltaHumidity
+    FROM hourly_agg a
+    JOIN hourly_agg b ON a.hour_ts = b.hour_ts AND b.sensor_id = ?
+    WHERE a.sensor_id = ? AND a.hour_ts >= ?
+      AND a.excluded = 0 AND b.excluded = 0
+    ORDER BY a.hour_ts
+  `).all(sensorBId, sensorAId, sinceTs);
 }
 
 // ── Events ───────────────────────────────────────────────────────────────

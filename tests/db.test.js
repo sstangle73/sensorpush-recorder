@@ -6,6 +6,7 @@ import {
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
   getBatteryHistory, computeBatteryForecast, getOldestReadingTs,
+  listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
 } from '../db.js';
 
@@ -1075,6 +1076,173 @@ describe('computeBatteryForecast', () => {
     expect(f).not.toBeNull();
     expect(f.slopeVPerDay).toBeCloseTo(0);
     expect(f.daysTo25).toBeNull();
+  });
+});
+
+describe('sensor_pairs CRUD', () => {
+  function seedSensors(db) {
+    upsertSensors(db, [
+      { id: 'sA', name: 'Sensor A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'Sensor B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sC', name: 'Sensor C', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+  }
+
+  it('createSensorPair inserts a row and returns it with the assigned id', () => {
+    const db = makeDb();
+    seedSensors(db);
+    const row = createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB', label: 'kitchen pair' });
+    expect(row.id).toBeGreaterThan(0);
+    expect(row.sensor_a_id).toBe('sA');
+    expect(row.sensor_b_id).toBe('sB');
+    expect(row.label).toBe('kitchen pair');
+    expect(row.created_at).toBeGreaterThan(0);
+  });
+
+  it('createSensorPair accepts null label', () => {
+    const db = makeDb();
+    seedSensors(db);
+    const row = createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB', label: null });
+    expect(row.label).toBeNull();
+  });
+
+  it('createSensorPair throws on UNIQUE (sensor_a_id, sensor_b_id) conflict', () => {
+    const db = makeDb();
+    seedSensors(db);
+    createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB', label: 'one' });
+    expect(() => createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB', label: 'two' }))
+      .toThrowError(/UNIQUE/);
+  });
+
+  it('createSensorPair allows the inverse direction as a separate row', () => {
+    const db = makeDb();
+    seedSensors(db);
+    const ab = createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB' });
+    const ba = createSensorPair(db, { sensorAId: 'sB', sensorBId: 'sA' });
+    expect(ab.id).not.toBe(ba.id);
+    expect(listSensorPairs(db)).toHaveLength(2);
+  });
+
+  it('listSensorPairs returns pairs joined with sensor names, ordered by created_at', () => {
+    const db = makeDb();
+    seedSensors(db);
+    createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB', label: 'first' });
+    createSensorPair(db, { sensorAId: 'sB', sensorBId: 'sC', label: 'second' });
+    const rows = listSensorPairs(db);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].label).toBe('first');
+    expect(rows[0].sensor_a_name).toBe('Sensor A');
+    expect(rows[0].sensor_b_name).toBe('Sensor B');
+    expect(rows[1].label).toBe('second');
+  });
+
+  it('getSensorPair returns the pair by id, or undefined when missing', () => {
+    const db = makeDb();
+    seedSensors(db);
+    const created = createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB' });
+    const found = getSensorPair(db, created.id);
+    expect(found.sensor_a_id).toBe('sA');
+    expect(getSensorPair(db, 999_999)).toBeUndefined();
+  });
+
+  it('deleteSensorPair removes the row and returns true; false for unknown id', () => {
+    const db = makeDb();
+    seedSensors(db);
+    const created = createSensorPair(db, { sensorAId: 'sA', sensorBId: 'sB' });
+    expect(deleteSensorPair(db, created.id)).toBe(true);
+    expect(getSensorPair(db, created.id)).toBeUndefined();
+    expect(deleteSensorPair(db, created.id)).toBe(false);
+  });
+});
+
+describe('getPairAlignedHourly', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+
+  function insertHour(db, sensorId, hourTs, tempAvg, humAvg, excluded = 0) {
+    db.prepare(`
+      INSERT OR REPLACE INTO hourly_agg
+        (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count, excluded)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 30, ?)
+    `).run(sensorId, hourTs, tempAvg, tempAvg, tempAvg, humAvg, humAvg, humAvg, excluded);
+  }
+
+  it('returns aligned deltas (a - b) for hours both sensors have', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 'sA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    const h0 = NOW - 3 * 3600 - (NOW % 3600);
+    insertHour(db, 'sA', h0,        70.5, 50);
+    insertHour(db, 'sB', h0,        70.0, 49);
+    insertHour(db, 'sA', h0 + 3600, 71.0, 51);
+    insertHour(db, 'sB', h0 + 3600, 70.0, 50);
+    const rows = getPairAlignedHourly(db, 'sA', 'sB', h0);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].deltaTemp).toBeCloseTo(0.5);
+    expect(rows[0].deltaHumidity).toBeCloseTo(1);
+    expect(rows[1].deltaTemp).toBeCloseTo(1.0);
+  });
+
+  it('drops hours where either sensor is missing', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 'sA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    const h0 = NOW - 3 * 3600 - (NOW % 3600);
+    insertHour(db, 'sA', h0, 70, 50);
+    // Only sA at h0 — should be dropped
+    insertHour(db, 'sA', h0 + 3600, 71, 51);
+    insertHour(db, 'sB', h0 + 3600, 70, 50);
+    const rows = getPairAlignedHourly(db, 'sA', 'sB', h0);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ts).toBe(h0 + 3600);
+  });
+
+  it('drops hours where either sensor has excluded=1', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 'sA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    const h0 = NOW - 3 * 3600 - (NOW % 3600);
+    insertHour(db, 'sA', h0, 70, 50);
+    insertHour(db, 'sB', h0, 70, 50, 1);  // sB excluded
+    insertHour(db, 'sA', h0 + 3600, 71, 51);
+    insertHour(db, 'sB', h0 + 3600, 70, 50);
+    const rows = getPairAlignedHourly(db, 'sA', 'sB', h0);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ts).toBe(h0 + 3600);
+  });
+
+  it('filters by sinceTs', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 'sA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    const old = NOW - 7 * 86400 - (NOW % 3600);
+    const recent = NOW - 3600 - (NOW % 3600);
+    insertHour(db, 'sA', old, 70, 50);
+    insertHour(db, 'sB', old, 70, 50);
+    insertHour(db, 'sA', recent, 71, 51);
+    insertHour(db, 'sB', recent, 70, 50);
+    const rows = getPairAlignedHourly(db, 'sA', 'sB', NOW - 86400);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ts).toBe(recent);
+  });
+
+  it('returns empty array when there is no overlap', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 'sA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'sB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    const h0 = NOW - 3 * 3600 - (NOW % 3600);
+    insertHour(db, 'sA', h0, 70, 50);
+    insertHour(db, 'sB', h0 + 7200, 70, 50);
+    expect(getPairAlignedHourly(db, 'sA', 'sB', h0)).toEqual([]);
   });
 });
 

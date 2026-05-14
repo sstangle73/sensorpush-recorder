@@ -1061,6 +1061,142 @@ describe('GET /battery', () => {
   });
 });
 
+describe('sensor-pairs routes', () => {
+  let pdb, psrv, purl;
+  beforeAll(async () => {
+    pdb = openDb(':memory:');
+    upsertSensors(pdb, [
+      { id: 'pairA', name: 'Living', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'pairB', name: 'Kitchen', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      { id: 'pairC', name: 'Bedroom', type: 'HT1', active: true, batteryVoltage: 2.9 },
+    ]);
+    await new Promise(r => {
+      psrv = http.createServer(createApp(pdb));
+      psrv.listen(0, '127.0.0.1', () => { purl = `http://127.0.0.1:${psrv.address().port}`; r(); });
+    });
+  });
+  afterAll(() => new Promise(r => psrv.close(r)));
+
+  async function api(method, path, body) {
+    const res = await fetch(purl + path, {
+      method,
+      headers: body != null ? { 'Content-Type': 'application/json' } : undefined,
+      body:    body != null ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('GET /sensor-pairs returns empty array initially', async () => {
+    const { status, body } = await api('GET', '/sensor-pairs');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.pairs).toEqual([]);
+  });
+
+  it('POST /sensor-pairs creates a pair and returns it', async () => {
+    const { status, body } = await api('POST', '/sensor-pairs', {
+      sensorAId: 'pairA', sensorBId: 'pairB', label: 'house pair',
+    });
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.pair.id).toBeGreaterThan(0);
+    expect(body.pair.sensorAId).toBe('pairA');
+    expect(body.pair.sensorBId).toBe('pairB');
+    expect(body.pair.label).toBe('house pair');
+  });
+
+  it('POST /sensor-pairs returns 400 when body is missing fields', async () => {
+    const r1 = await api('POST', '/sensor-pairs', { sensorAId: 'pairA' });
+    expect(r1.status).toBe(400);
+    const r2 = await api('POST', '/sensor-pairs', { sensorAId: 'pairA', sensorBId: 'pairA' });
+    expect(r2.status).toBe(400);
+    expect(r2.body.error).toMatch(/differ/);
+  });
+
+  it('POST /sensor-pairs returns 404 when a sensor does not exist', async () => {
+    const { status } = await api('POST', '/sensor-pairs', {
+      sensorAId: 'pairA', sensorBId: 'no-such-sensor',
+    });
+    expect(status).toBe(404);
+  });
+
+  it('POST /sensor-pairs returns 409 on duplicate (UNIQUE conflict)', async () => {
+    await api('POST', '/sensor-pairs', { sensorAId: 'pairB', sensorBId: 'pairC' });
+    const { status, body } = await api('POST', '/sensor-pairs', { sensorAId: 'pairB', sensorBId: 'pairC' });
+    expect(status).toBe(409);
+    expect(body.error).toMatch(/already exists/);
+  });
+
+  it('DELETE /sensor-pairs/:id removes a pair', async () => {
+    const create = await api('POST', '/sensor-pairs', { sensorAId: 'pairA', sensorBId: 'pairC' });
+    const id = create.body.pair.id;
+    const del = await api('DELETE', `/sensor-pairs/${id}`);
+    expect(del.status).toBe(200);
+    // Re-deleting returns 404
+    const again = await api('DELETE', `/sensor-pairs/${id}`);
+    expect(again.status).toBe(404);
+  });
+
+  it('DELETE /sensor-pairs/:id returns 400 for invalid id', async () => {
+    const r = await api('DELETE', '/sensor-pairs/not-a-number');
+    expect(r.status).toBe(400);
+  });
+
+  describe('GET /sensor-pairs/:id/drift', () => {
+    let pairId;
+    beforeAll(async () => {
+      // Seed aligned hourly_agg rows so the drift route has data to fit.
+      const now = Math.floor(Date.now() / 1000);
+      const h0  = now - (now % 3600) - 24 * 3600;
+      const stmt = pdb.prepare(`
+        INSERT OR REPLACE INTO hourly_agg
+          (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count, excluded)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 30, 0)
+      `);
+      // 24 hourly buckets, A slowly diverging from B in temperature.
+      for (let i = 0; i < 24; i++) {
+        const hourTs = h0 + i * 3600;
+        stmt.run('driftA', hourTs, 70 + i * 0.01, 69, 71, 50, 48, 52);
+        stmt.run('driftB', hourTs, 70,            69, 71, 50, 48, 52);
+      }
+      upsertSensors(pdb, [
+        { id: 'driftA', name: 'A', type: 'HT1', active: true, batteryVoltage: 2.9 },
+        { id: 'driftB', name: 'B', type: 'HT1', active: true, batteryVoltage: 2.9 },
+      ]);
+      const create = await api('POST', '/sensor-pairs', { sensorAId: 'driftA', sensorBId: 'driftB', label: 'drift pair' });
+      pairId = create.body.pair.id;
+    });
+
+    it('returns aligned samples and computed stats', async () => {
+      const { status, body } = await api('GET', `/sensor-pairs/${pairId}/drift?range=30d`);
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.range).toBe('30d');
+      expect(Array.isArray(body.samples)).toBe(true);
+      expect(body.samples.length).toBeGreaterThan(0);
+      expect(body.stats).toBeDefined();
+      expect(body.stats.nPairs).toBe(body.samples.length);
+      expect(body.stats.slopeTempPerDay).toBeGreaterThan(0);
+    });
+
+    it('returns 404 for unknown pair id', async () => {
+      const { status } = await api('GET', '/sensor-pairs/999999/drift');
+      expect(status).toBe(404);
+    });
+
+    it('returns 400 for invalid range', async () => {
+      const { status } = await api('GET', `/sensor-pairs/${pairId}/drift?range=forever`);
+      expect(status).toBe(400);
+    });
+
+    it('defaults to 30d when range param is absent', async () => {
+      const { status, body } = await api('GET', `/sensor-pairs/${pairId}/drift`);
+      expect(status).toBe(200);
+      expect(body.range).toBe('30d');
+    });
+  });
+});
+
 // ── Events routes ──────────────────────────────────────────────────────────
 // Happy-path coverage and basic validation; auth enforcement is exercised
 // separately in events-auth.test.js (own file so we can isolate the
