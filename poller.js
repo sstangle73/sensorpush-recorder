@@ -20,7 +20,14 @@ let _lastWeatherError    = null;
 //   03:00 — auto gap-backfill over the last 7 days (self-healing data)
 //   03:30 — SQLite snapshot to /data/backups/sensorpush-YYYY-MM-DD.db
 //           with retention pruning beyond 7 daily snapshots
-export function startPoller(db, config) {
+//
+// `db` is a let-mutable param so `registerSwap` (called by server.js on
+// /backups/:filename/restore) can swap in the post-restore handle. The
+// setInterval/scheduleDaily closures reference the param binding, so the
+// next tick picks up the new handle automatically.
+export function startPoller(db, config, registerSwap = null) {
+  if (registerSwap) registerSwap((newDb) => { db = newDb; });
+
   // Bring up the optional MQTT publisher. No-op when MQTT_URL is unset.
   // Failures here must not block sample polling — wrap in try/catch.
   try { mqttConnect(config?.mqtt || {}); } catch (err) { console.error('[poller] mqtt connect:', err.message); }

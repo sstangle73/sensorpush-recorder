@@ -10,6 +10,7 @@ import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
 import { detectCycles, pickDefaultThermostatSensor } from './hvac.js';
 import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
+import { listBackups, isRestorableName, restoreBackup } from './backups.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
@@ -124,7 +125,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery|hvac|weather)\\b/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -261,7 +262,13 @@ function _classifySensorGroup(name) {
 }
 
 
-export function createApp(db, config = null) {
+// The `db` parameter is intentionally mutable inside this function — the
+// /backups/:filename/restore route reassigns it to the freshly-reopened
+// handle after a restore, and ESM's let-style parameter bindings let the
+// other route closures pick up the new value without further plumbing.
+// `onSwap` is fired after the local reassignment so the bootstrap can
+// propagate the new handle to the poller (which captured its own `db`).
+export function createApp(db, config = null, onSwap = null) {
   const app = express();
   app.use(express.json());
 
@@ -909,6 +916,32 @@ export function createApp(db, config = null) {
     }
   });
 
+  // ── Backups (list + restore daily snapshots) ────────────────────────────
+  // The daily 03:30 _snapshotDb in poller.js drops files in /data/backups/;
+  // this surface lets an operator browse and roll back without SSH.
+  app.get('/backups', (_req, res) => {
+    res.json({ ok: true, backups: listBackups() });
+  });
+
+  // POST /backups/:filename/restore — swap the live DB to the chosen snapshot.
+  // Filename is regex-gated to the daily pattern (see backups.js) before any
+  // filesystem access; the resolved path is also confirmed to stay inside
+  // the backups dir as defense-in-depth.
+  app.post('/backups/:filename/restore', (req, res) => {
+    const filename = req.params.filename;
+    if (!isRestorableName(filename)) {
+      return res.status(400).json({ ok: false, error: 'invalid backup filename' });
+    }
+    try {
+      const { newDb, preRestoreFilename } = restoreBackup(db, filename);
+      db = newDb;
+      if (onSwap) onSwap(newDb);
+      res.json({ ok: true, preRestoreFilename });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   app.post('/poll', async (_req, res) => {
     if (!config) return res.status(503).json({ ok: false, error: 'No config available' });
     try {
@@ -1063,8 +1096,13 @@ export function createApp(db, config = null) {
 if (process.env.NODE_ENV !== 'test') {
   const config = loadConfig();
   const db     = openDb(DB_PATH);
-  const app    = createApp(db, config);
-  startPoller(db, config);
+  // Bridge createApp's restore-time db swap into the poller, which captured
+  // its own `db` binding at startPoller call time.
+  const swapCallbacks = [];
+  const app = createApp(db, config, (newDb) => {
+    for (const cb of swapCallbacks) cb(newDb);
+  });
+  startPoller(db, config, (cb) => swapCallbacks.push(cb));
   app.listen(PORT, () => {
     console.log(`[sensorpush-recorder] listening on :${PORT}`);
     // One-shot warning when no auth is configured. A LAN-only deploy can

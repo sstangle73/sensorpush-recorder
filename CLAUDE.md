@@ -18,7 +18,7 @@ Runs as a single-container compose stack. After source changes:
 git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js notifications.js weather.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js notifications.js weather.js backups.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
 
 CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
@@ -30,19 +30,20 @@ config.js       — loadConfig() reads /config/config.local.js via new Function 
 db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking; battery history + forecast; gateway uptime + primary-sensor counts; outdoor_readings (Open-Meteo)
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
 weather.js      — Open-Meteo (no API key): fetchCurrentWeather (current_weather) + fetchHourlyWeather (past_days 1..92); both soft-fail to []
-poller.js       — 5-min sensor poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); separate hourly weather loop (skipped when weather.{lat,lon} absent); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune; per-poll MQTT publish + hourly HA discovery
+poller.js       — 5-min sensor poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); separate hourly weather loop (skipped when weather.{lat,lon} absent); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune; per-poll MQTT publish + hourly HA discovery; accepts registerSwap callback for restore-driven handle hot-swap
 auth.js         — recorder-token resolution (env > /data/recorder-token > null); generate/set/clear helpers; bearer middleware in server.js calls getToken() on every request
 drift.js        — pure-function drift detector: computeDriftStats(samples) → mean delta + linear-regression slope per day; classifyDrift() returns 'drifting'|'stable'|'unknown'
 mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
 hvac.js         — pure-function module: detectCycles(readings, opts) infers HVAC on/off cycles by smoothing the temperature series, sign-thresholding the slope, and grouping contiguous same-sign runs into heating/cooling cycles; pickDefaultThermostatSensor picks the lowest-variance indoor sensor
 notifications.js — outbound webhook + ntfy dispatch with per-(condition, target) DB-backed state machine; fires on transition→active and transition→recovered, dedupes while stuck; condition evaluators for threshold breach, hour-of-day anomaly, sensor-offline, gateway-offline; runNotifications() is called from the poll loop after each successful poll
-ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel, indoor-vs-outdoor weather delta), Explorer (multi-sensor chart, exclusion, zoom, event markers, outdoor overlay), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
-tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests). Run `npm test` for the current count.
+backups.js      — listBackups()/restoreBackup()/isRestorableName() for /data/backups/*.db; strict daily-pattern regex + resolve-stays-in-dir gate; restore closes handle, copies pre-restore safety snapshot, removes WAL/SHM sidecars, copies chosen backup over live DB, re-opens
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel, indoor-vs-outdoor weather delta), Explorer (multi-sensor chart, exclusion, zoom, event markers, outdoor overlay), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles, backups list + restore)
+tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests; filesystem fixture for backups.test.js since restore is fs-level). Run `npm test` for the current count.
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `weather` → `poller`; `mqtt` → `poller`; `db` → `notifications`; `notifications` → `poller`, `server`; `db`, `auth`, `poller`, `hvac` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `backups`, `server`; `sensorpush` → `poller`; `weather` → `poller`; `mqtt` → `poller`; `db` → `notifications`, `backups`; `notifications` → `poller`, `server`; `db`, `auth`, `poller`, `hvac`, `backups` → `server`.
 
 ## Configuration
 
@@ -62,6 +63,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 - **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
+- **Backups**: `GET /backups` (list daily + pre-restore snapshots), `POST /backups/:filename/restore` (daily pattern only — swaps live DB to chosen snapshot, returns pre-restore safety filename)
 - **Settings**: `GET /settings`, `PUT /settings`
 - **Notifications**: `POST /settings/notifications/test` (one-off test dispatch to webhook/ntfy/all; bypasses state machine), `GET /settings/notifications/state` (per-condition firing state map)
 - **Export**: `GET /:id/history.csv?range=7d`
@@ -88,7 +90,7 @@ npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
-- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `weather.test.js`.
+- Test files: `auth.test.js`, `backups.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `weather.test.js`.
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.
@@ -109,13 +111,14 @@ npm run test:watch
 - **`gatewayOnlineDuringWindow` only consults post-gap polls.** Because gateway `last_seen` is monotonically non-decreasing, only a poll at or after gap-start can carry a `last_seen` value reaching the gap; pre-gap polls' freshness is information about pre-gap state, not gap state. Returns true iff some recorded `last_seen ≥ startTs`. POST_GAP_LOOKAHEAD (5 min) extends the upper bound so a gap shorter than the poll cadence can still be answered by the first poll after it.
 - **`/backfill` parses fromDate as UTC midnight** (`Z` suffix) — without it, the same fromDate gives different start epochs on a UTC container vs a local-TZ host.
 - **CORS sends echoed origin, not `*`** — adding a new caller means adding it to `CORS_ORIGINS` (or running behind a same-origin reverse proxy that strips/sets CORS itself).
-- **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
+- **Service worker bypasses caching for `/health`, `/history`, `/gaps`, `/poll`, `/gateways`, `/backfill`, `/backups`, `/settings`** — anything dynamic. Bump the `CACHE` version string in `SW_JS` (server.js) when changing static assets so existing PWA installs pick up the new version.
 - **Scheduled jobs** (`scheduleDaily` in poller.js) align to host-local clock time, not relative offsets. The schedule re-arms after each run so a long-running job doesn't drift the cadence.
 - **Daily snapshots use `VACUUM INTO`** which produces a clean single-file copy of the SQLite DB without taking a long write lock. Files land in `/data/backups/sensorpush-YYYY-MM-DD.db`; only the 7 most recent are kept (mtime-sorted, then unlinked beyond 7).
 - **Auto gap-fill (03:00) skips silently** if a manual `/backfill` or `/backfill-gaps` is already running — it doesn't queue or retry.
 - **Notification state machine advances even on dispatch failure.** When a webhook or ntfy POST fails (HTTP 5xx, timeout, DNS), we still flip `notification_state.active` and bump `last_notified_at` — otherwise a transient outage would re-fire every 5 minutes forever. Failed deliveries are logged per sink; the firing payload is in `last_payload` for inspection. Recovery transitions follow the same rule.
 - **Anomaly evaluator reads `hourly_agg` for the baseline.** A sensor that's only just joined (< ~5 hours of data for the current hour-of-day) gets `evaluateAnomaly() === []` and never fires; once the bucket has ≥ 5 points, ±2σ checks engage. The SD floor (0.4°F / 1%) prevents naturally-quiet sensors from tripping on minor noise.
 - **Webhook vs ntfy payload shape differs.** Webhook receives the full JSON `{timestamp, key, transition, title, message, detail}` as the POST body. ntfy receives `message` as the body and uses `title`, `transition` → Priority+Tags headers — that's what the ntfy clients render natively.
+- **Restore swaps the live DB handle in-place** via let-mutable params + an `onSwap` callback. `createApp(db, config, onSwap)` reassigns its `db` param on restore; ESM's let-style parameter bindings mean route closures pick up the new handle without further plumbing. `startPoller(db, config, registerSwap)` registers a callback so its captured `db` (used by setInterval/scheduleDaily) also swaps. In-flight requests using the old handle error out — acknowledged trade-off for an admin operation. Retention pruning only touches `sensorpush-YYYY-MM-DD.db`; pre-restore snapshots (`sensorpush-pre-restore-<ts>.db`) survive forever and are accessible via shell.
 
 ## SensorPush API surface — what we use vs. don't
 
