@@ -514,27 +514,31 @@ export function rangeUnit(range) {
   return /^(\d+)(h|d|yr)$/.exec(range)?.[2] ?? null;
 }
 
-export function getHistory(db, sensorId, range) {
+// Optional `endTs` anchors the window at an arbitrary epoch (seconds) — used
+// by the Stats YoY overlay to fetch the same `range` ending one calendar
+// year ago. Omitted/null = anchor at "now" (the original behavior).
+export function getHistory(db, sensorId, range, endTs = null) {
   const rangeSeconds = rangeToSeconds(range) ?? 86400;
-  const since = Math.floor(Date.now() / 1000) - rangeSeconds;
+  const end   = endTs != null ? endTs : Math.floor(Date.now() / 1000);
+  const since = end - rangeSeconds;
   const unit  = rangeUnit(range) ?? 'h';
 
   if (unit === 'h') {
     return db.prepare(`
       SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax
-      FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0
+      FROM readings WHERE sensor_id = ? AND ts >= ? AND ts <= ? AND excluded = 0
       ORDER BY ts
-    `).all(sensorId, since);
+    `).all(sensorId, since, end);
   }
   if (unit === 'd') {
     return db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
              dewpoint_avg AS dewpoint, vpd_avg AS vpd,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax
-      FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
+      FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
       ORDER BY hour_ts
-    `).all(sensorId, since);
+    `).all(sensorId, since, end);
   }
   // yr → daily aggregates computed from hourly_agg (no schema change needed)
   return db.prepare(`
@@ -543,10 +547,18 @@ export function getHistory(db, sensorId, range) {
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
            AVG(baro_avg) AS baroPressure,
            AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd
-    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
+    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
-  `).all(sensorId, since);
+  `).all(sensorId, since, end);
+}
+
+// Oldest non-excluded reading ts across all sensors, or null when the DB is
+// empty. The Stats YoY overlay uses this to decide whether the recorder has
+// enough history (≥ 1 year) before offering the comparison.
+export function getOldestReadingTs(db) {
+  const row = db.prepare(`SELECT MIN(ts) AS ts FROM readings WHERE excluded = 0`).get();
+  return row?.ts ?? null;
 }
 
 // Returns all readings including excluded ones — used by the data explorer UI.

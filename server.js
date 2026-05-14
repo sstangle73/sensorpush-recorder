@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, getOldestReadingTs } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
@@ -323,7 +323,9 @@ export function createApp(db, config = null) {
         alerts:         row.alerts ? JSON.parse(row.alerts) : null,
       };
     }
-    res.json({ ok: true, sensors });
+    // oldestReadingTs lets the Stats YoY toggle decide whether enough history
+    // exists to show a comparison overlay (≥ 1 year + the current range).
+    res.json({ ok: true, sensors, oldestReadingTs: getOldestReadingTs(db) });
   });
 
   app.get('/:id/history', (req, res) => {
@@ -331,9 +333,20 @@ export function createApp(db, config = null) {
     const range    = req.query.range || '24h';
     const rangeSecs = rangeToSeconds(range);
     if (!rangeSecs) return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 2h, 24h, 7d, 30d, 1yr.' });
+    // Optional endTs anchors the window at an arbitrary epoch (seconds). The
+    // Stats YoY overlay passes "now - 1 year" to fetch the same range from a
+    // year ago. Default anchor = "now" preserves the old behavior.
+    let endTs = null;
+    if (req.query.endTs != null) {
+      const parsed = parseInt(req.query.endTs, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0 || String(parsed) !== String(req.query.endTs)) {
+        return res.status(400).json({ ok: false, error: 'endTs must be a positive integer (Unix seconds).' });
+      }
+      endTs = parsed;
+    }
     const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).json({ ok: false, error: 'Sensor not found' });
-    const samples = getHistory(db, sensorId, range);
+    const samples = getHistory(db, sensorId, range, endTs);
     res.json({ ok: true, sensorId, range, resolution: rangeUnit(range) === 'h' ? 'raw' : rangeUnit(range) === 'd' ? 'hourly' : 'daily', samples });
   });
 
