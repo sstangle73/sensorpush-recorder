@@ -572,6 +572,162 @@ describe('GET/PUT /settings', () => {
     });
     expect(r.status).toBe(200);
   });
+
+  it('PUT persists hvac config alongside ranges', async () => {
+    const hvac = {
+      sensors: {
+        'thermo-1': { thermostat: true, zone: 'main' },
+      },
+      shortCycleMinutes: 7,
+    };
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h', '24h'], hvac }),
+    });
+    expect(r.status).toBe(200);
+    const { body } = await get('/settings');
+    expect(body.settings.hvac).toEqual(hvac);
+  });
+
+  it('PUT rejects malformed hvac — wrong thermostat type', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h'],
+        hvac: { sensors: { 'x': { thermostat: 'yes' } } },
+      }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('PUT rejects malformed hvac — non-positive shortCycleMinutes', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'], hvac: { shortCycleMinutes: 0 } }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('PUT rejects malformed hvac — unknown top-level key', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'], hvac: { weird: 1 } }),
+    });
+    expect(r.status).toBe(400);
+  });
+});
+
+describe('GET /hvac', () => {
+  // Use a dedicated DB + server so seeded data doesn't bleed into other suites
+  // (and so a clean "no thermostat configured" case can be tested independently).
+  let hvacDb, hvacSrv, hvacUrl;
+  beforeAll(async () => {
+    hvacDb = openDb(':memory:');
+    await new Promise(r => {
+      hvacSrv = http.createServer(createApp(hvacDb));
+      hvacSrv.listen(0, '127.0.0.1', () => { hvacUrl = `http://127.0.0.1:${hvacSrv.address().port}`; r(); });
+    });
+  });
+  afterAll(() => new Promise(r => hvacSrv.close(r)));
+
+  async function hvacGet(path) {
+    const res = await fetch(hvacUrl + path);
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('returns 400 for invalid range', async () => {
+    const r = await hvacGet('/hvac?range=forever');
+    expect(r.status).toBe(400);
+  });
+
+  it('returns empty referenceIds + empty sensors when no thermostat is configured and no data exists', async () => {
+    const { status, body } = await hvacGet('/hvac?range=24h');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.referenceIds).toEqual([]);
+    expect(body.sensors).toEqual({});
+    expect(body.config.shortCycleMinutes).toBe(5);
+  });
+
+  it('uses an explicitly flagged thermostat sensor', async () => {
+    upsertSensors(hvacDb, [
+      { id: 'living-room', name: 'Living Room',   type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'attic',       name: 'Attic',         type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    // Plant a heating ramp on living-room so detectCycles has something to work with.
+    const now = Math.floor(Date.now() / 1000);
+    const start = now - 3 * 3600;
+    const samples = [];
+    for (let i = 0; i <= 36; i++) {
+      // 10 min cadence, +1°F/hr ramp for 3h
+      const t = start + i * 600;
+      const temp = 68 + (i / 36) * 3;
+      samples.push({ observed: new Date(t * 1000).toISOString(), temperature: temp, humidity: 45, barometric_pressure: null, battery_voltage: null });
+    }
+    insertReadings(hvacDb, 'living-room', samples);
+
+    // Flag living-room as the thermostat reference.
+    await fetch(hvacUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h', '24h'],
+        hvac: { sensors: { 'living-room': { thermostat: true } } },
+      }),
+    });
+
+    const { body } = await hvacGet('/hvac?range=24h');
+    expect(body.referenceIds).toContain('living-room');
+    expect(body.sensors['living-room']).toBeDefined();
+    expect(body.sensors['living-room'].isThermostat).toBe(true);
+    expect(body.sensors['living-room'].isAutoSelected).toBe(false);
+    expect(body.sensors['living-room'].analysis.ok).toBe(true);
+    expect(body.sensors['living-room'].analysis.heatingRuntimePct).toBeGreaterThan(0);
+    expect(Array.isArray(body.sensors['living-room'].dailyRuntime)).toBe(true);
+    expect(body.sensors['living-room'].dailyRuntime).toHaveLength(7);
+  });
+
+  it('auto-selects the most-stable indoor sensor when no flags exist', async () => {
+    // Fresh DB so the explicit flag set in the previous test doesn't carry over.
+    const db2 = openDb(':memory:');
+    let srv2, url2;
+    await new Promise(r => {
+      srv2 = http.createServer(createApp(db2));
+      srv2.listen(0, '127.0.0.1', () => { url2 = `http://127.0.0.1:${srv2.address().port}`; r(); });
+    });
+
+    upsertSensors(db2, [
+      { id: 'stable',  name: 'Living Room', type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'jittery', name: 'Kitchen',     type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'outside', name: 'Outside',     type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    const now   = Math.floor(Date.now() / 1000);
+    const start = now - 24 * 3600;
+    const stable = [], jittery = [], outside = [];
+    for (let i = 0; i <= 144; i++) {                                 // 10min cadence × 24h
+      const t = start + i * 600;
+      stable.push ({ observed: new Date(t * 1000).toISOString(), temperature: 70 + 0.1 * Math.sin(i / 5), humidity: 45, barometric_pressure: null, battery_voltage: null });
+      jittery.push({ observed: new Date(t * 1000).toISOString(), temperature: 70 + 3.0 * Math.sin(i / 5), humidity: 45, barometric_pressure: null, battery_voltage: null });
+      outside.push({ observed: new Date(t * 1000).toISOString(), temperature: 50 + 0.1 * Math.sin(i / 5), humidity: 45, barometric_pressure: null, battery_voltage: null });
+    }
+    insertReadings(db2, 'stable',  stable);
+    insertReadings(db2, 'jittery', jittery);
+    insertReadings(db2, 'outside', outside);
+
+    const r = await fetch(url2 + '/hvac?range=24h');
+    const body = await r.json();
+    expect(body.ok).toBe(true);
+    expect(body.autoDefaultId).toBe('stable');     // lowest var of the two indoor sensors
+    expect(body.referenceIds).toEqual(['stable']);
+    expect(body.sensors['stable'].isAutoSelected).toBe(true);
+    expect(body.sensors['stable'].isThermostat).toBe(false);
+
+    await new Promise(r => srv2.close(r));
+  });
 });
 
 describe('CORS middleware', () => {
