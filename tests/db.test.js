@@ -5,7 +5,7 @@ import {
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
-  getBatteryHistory, computeBatteryForecast,
+  getBatteryHistory, computeBatteryForecast, getOldestReadingTs,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
 } from '../db.js';
 
@@ -250,6 +250,81 @@ describe('getHistory — extended ranges', () => {
     const rows = getHistory(db, 's1', '24h');
     expect(rows.every(r => r.temperature !== 999)).toBe(true);
     expect(rows.length).toBe(1);
+  });
+});
+
+describe('getHistory — endTs anchor (YoY overlay)', () => {
+  it('returns rows ending at endTs, not "now"', () => {
+    // Three raw readings: a year ago, last week, and now. With endTs anchored
+    // a year ago, only the year-ago reading should be in a 24h window.
+    const db = makeDb();
+    const now    = Math.floor(Date.now() / 1000);
+    const yearAgo = now - 365 * 86400;
+    upsertSensors(db, [{ id: 's1', name: 'R', type: 'HT1', active: true, batteryVoltage: null }]);
+    insertReadings(db, 's1', [
+      { observed: new Date((yearAgo - 1800) * 1000).toISOString(), temperature: 50, humidity: 40, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 7 * 86400) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 60)  * 1000).toISOString(),       temperature: 75, humidity: 55, barometric_pressure: null, battery_voltage: null },
+    ]);
+    const rows = getHistory(db, 's1', '24h', yearAgo);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].temperature).toBe(50);
+  });
+
+  it('omitting endTs preserves the "anchored at now" behavior', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [{ id: 's1', name: 'R', type: 'HT1', active: true, batteryVoltage: null }]);
+    insertReadings(db, 's1', [
+      { observed: new Date((now - 60) * 1000).toISOString(), temperature: 72, humidity: 50, barometric_pressure: null, battery_voltage: null },
+    ]);
+    expect(getHistory(db, 's1', '24h')).toHaveLength(1);
+    expect(getHistory(db, 's1', '24h', null)).toHaveLength(1);
+  });
+
+  it('endTs respects hourly_agg resolution for d-unit ranges', () => {
+    // Two hourly buckets: one inside a year-ago window, one inside a now-window.
+    const db = makeDb();
+    const now      = Math.floor(Date.now() / 1000);
+    const yearAgo  = now - 365 * 86400;
+    const hourPast = yearAgo - (yearAgo % 3600);
+    const hourNow  = now - 3600 - (now % 3600);
+    upsertSensors(db, [{ id: 's1', name: 'R', type: 'HT1', active: true, batteryVoltage: null }]);
+    db.prepare(`INSERT INTO hourly_agg (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count, excluded)
+      VALUES ('s1', ?, 55, 53, 57, 60, 58, 62, null, 12, 0)`).run(hourPast);
+    db.prepare(`INSERT INTO hourly_agg (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count, excluded)
+      VALUES ('s1', ?, 75, 73, 77, 40, 38, 42, null, 12, 0)`).run(hourNow);
+    // Anchored at yearAgo, 7d window — should only see the year-ago bucket.
+    const rows = getHistory(db, 's1', '7d', yearAgo);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].temperature).toBe(55);
+  });
+});
+
+describe('getOldestReadingTs', () => {
+  it('returns null on an empty DB', () => {
+    expect(getOldestReadingTs(makeDb())).toBeNull();
+  });
+
+  it('returns the smallest ts across all sensors, ignoring excluded rows', () => {
+    const db = makeDb();
+    const base = 1_700_000_000; // arbitrary fixed timestamp
+    upsertSensors(db, [
+      { id: 'a', name: 'A', type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'b', name: 'B', type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    insertReadings(db, 'a', [
+      { observed: new Date((base + 1000) * 1000).toISOString(), temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: null },
+    ]);
+    insertReadings(db, 'b', [
+      { observed: new Date(base * 1000).toISOString(),          temperature: 60, humidity: 40, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((base + 500) * 1000).toISOString(),  temperature: 61, humidity: 41, barometric_pressure: null, battery_voltage: null },
+    ]);
+    expect(getOldestReadingTs(db)).toBe(base);
+
+    // Excluding the oldest moves the answer forward.
+    setReadingExcluded(db, 'b', base, true);
+    expect(getOldestReadingTs(db)).toBe(base + 500);
   });
 });
 

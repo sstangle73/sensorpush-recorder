@@ -658,6 +658,71 @@ header .spacer { flex: 1; }
 .stats-io-line  { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .stats-io-line b { color: var(--text); font-weight: 600; }
 
+/* ── Year-over-year overlay ── */
+.stats-row-sep {
+  width: 1px; align-self: stretch; background: var(--border);
+  margin: 0 6px;
+}
+#stats-yoy-toggle { display: inline-flex; align-items: center; gap: 5px; }
+#stats-yoy-toggle .stats-yoy-toggle-glyph { font-size: 12px; line-height: 1; }
+.stats-yoy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+.stats-yoy-card {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px;
+  min-width: 0;
+}
+.stats-yoy-hdr {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text2);
+  white-space: nowrap;
+}
+.stats-yoy-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--text);
+}
+.stats-yoy-delta {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.stats-yoy-svg {
+  width: 100%; height: 96px; display: block;
+  background: var(--bg2); border-radius: 4px;
+}
+.stats-yoy-legend {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 10px; color: var(--text3);
+  align-items: center;
+}
+.stats-yoy-legend-item {
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.stats-yoy-legend-item svg {
+  display: inline-block; vertical-align: middle;
+}
+.stats-yoy-empty {
+  font-size: 10px; color: var(--text3);
+  text-align: center; padding: 4px 0;
+}
+.stats-yoy-needs-history {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; background: var(--bg3);
+  border: 1px dashed var(--border); border-radius: 6px;
+}
+.stats-yoy-needs-icon {
+  font-size: 22px; flex-shrink: 0; opacity: 0.7;
+}
+.stats-yoy-needs-title {
+  font-size: 13px; color: var(--text); font-weight: 500;
+  margin-bottom: 2px;
+}
+
 @media (max-width: 640px) {
   #view-stats { padding: 8px; gap: 10px; }
   .stats-highlights { grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -921,6 +986,11 @@ header .spacer { flex: 1; }
   <div id="stats-range-row" class="an-range-row">
     <span style="font-size:11px;color:var(--text2)">Range:</span>
     <div id="stats-range-btns" style="display:contents"></div>
+    <div class="stats-row-sep"></div>
+    <button class="an-range-btn" id="stats-yoy-toggle" onclick="toggleStatsYoY()"
+            title="Overlay the same date range from one year ago for comparison">
+      <span class="stats-yoy-toggle-glyph" aria-hidden="true">⤢</span> Show year ago
+    </button>
   </div>
   <div id="stats-content"><div class="rt-empty">Loading…</div></div>
 </div>
@@ -1951,6 +2021,13 @@ let _statsHistory = {};        // id → samples[]
 let _batteryForecasts = {};    // id → { slopeVPerDay, currentV, daysTo27, daysTo25, daysTo24, sampleDays } | null
 let _hvacInfo     = null;      // /hvac response: { ok, range, config, referenceIds, autoDefaultId, sensors }
 let _statsLoading = false;
+// YoY overlay state — toggle persisted in localStorage; samples parallel to
+// _statsHistory but anchored at endTs = now - 1 calendar year.
+let _statsYoY = (() => {
+  try { return localStorage.getItem('statsYoY') === '1'; } catch { return false; }
+})();
+let _statsYoYHistory = {};     // id → samples[]
+let _statsOldestTs   = null;   // oldest non-excluded reading across all sensors
 
 // ── stats math ─────────────────────────────────────────────────────────────
 function _mean(xs) {
@@ -2086,13 +2163,26 @@ async function loadStats() {
   _statsLoading = true;
   try {
     renderStatsRangeBtns();
+    updateYoYToggleUI();
     const sr = await fetch(`${API_BASE}/`).then(r => r.json());
-    if (sr?.ok) _sensors = sr.sensors;
+    if (sr?.ok) {
+      _sensors = sr.sensors;
+      _statsOldestTs = sr.oldestReadingTs ?? null;
+    }
     Object.keys(_sensors).forEach((id, i) => {
       if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
     });
     const ids = Object.keys(_sensors);
-    const [results, batt, hvac] = await Promise.all([
+
+    // Prior-year fetch runs only when the toggle is on AND we have enough
+    // history to reach into last year for this range. Skipping the fetch
+    // here keeps the placeholder render fast and avoids N round trips
+    // returning empty samples.
+    const wantYoY = _statsYoY && _hasYoYCoverage();
+    const nowTs = Math.floor(Date.now() / 1000);
+    const yoyEndTs = wantYoY ? priorYearWindow(nowTs, nowTs).endTs : null;
+
+    const pending = [
       Promise.all(ids.map(id =>
         fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
           .then(r => r.json()).catch(() => null)
@@ -2101,15 +2191,75 @@ async function loadStats() {
       // HVAC analysis always uses 24h for the "today" gauge — independent of
       // _statsRange. The route's daily breakdown covers the last 7 days.
       fetch(`${API_BASE}/hvac?range=24h`).then(r => r.json()).catch(() => null),
-    ]);
+    ];
+    if (wantYoY) {
+      pending.push(Promise.all(ids.map(id =>
+        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}&endTs=${yoyEndTs}`)
+          .then(r => r.json()).catch(() => null)
+      )));
+    }
+    const [results, batt, hvac, yoyResults] = await Promise.all(pending);
+
     _statsHistory = {};
     results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
+    _statsYoYHistory = {};
+    if (yoyResults) {
+      yoyResults.forEach((d, i) => { if (d?.ok) _statsYoYHistory[ids[i]] = d.samples || []; });
+    }
     _batteryForecasts = (batt?.ok && batt.forecasts) ? batt.forecasts : {};
     _hvacInfo = (hvac?.ok) ? hvac : null;
     renderStats();
   } finally {
     _statsLoading = false;
   }
+}
+
+// True iff the recorder's oldest reading reaches back at least one calendar
+// year before the start of the current Stats range — i.e. we have data old
+// enough that a same-range overlay won't be a flat line of nothing.
+function _hasYoYCoverage() {
+  if (_statsOldestTs == null) return false;
+  const rangeSecs = rangeToSeconds(_statsRange) || 0;
+  const now = Math.floor(Date.now() / 1000);
+  const priorStart = priorYearWindow(now - rangeSecs, now).startTs;
+  return _statsOldestTs <= priorStart;
+}
+
+// Returns { startTs, endTs } for the same-length window ending one calendar
+// year before the input endTs. Both endpoints are shifted by -1 calendar year
+// via setUTCFullYear, which:
+//   - lands on the same UTC month/day in the prior year for most dates;
+//   - maps Feb 29 → Mar 1 in the prior non-leap year (JS Date rolls invalid
+//     dates forward, and Mar 1 is the closest valid mapping for "the day
+//     after Feb 28 in a non-leap year");
+//   - is unaffected by local DST transitions, since UTC has no DST — a
+//     local-time spring-forward (23h) or fall-back (25h) day is still
+//     exactly 86400 UTC seconds long.
+//
+// Across a leap-year boundary the prior-year window can differ in length by
+// ±1 day, which is the intended "same calendar dates last year" behavior;
+// callers needing identical-length windows should use a fixed-second offset.
+function priorYearWindow(startTs, endTs) {
+  const shift = ts => {
+    const d = new Date(ts * 1000);
+    d.setUTCFullYear(d.getUTCFullYear() - 1);
+    return Math.floor(d.getTime() / 1000);
+  };
+  return { startTs: shift(startTs), endTs: shift(endTs) };
+}
+
+function toggleStatsYoY() {
+  _statsYoY = !_statsYoY;
+  try { localStorage.setItem('statsYoY', _statsYoY ? '1' : '0'); } catch {}
+  updateYoYToggleUI();
+  // Reload to fetch (or skip) prior-year samples. loadStats() respects
+  // _statsLoading and is idempotent for repeat clicks.
+  loadStats();
+}
+
+function updateYoYToggleUI() {
+  const btn = document.getElementById('stats-yoy-toggle');
+  if (btn) btn.classList.toggle('active', _statsYoY);
 }
 
 function setStatsRange(r) {
@@ -3286,6 +3436,123 @@ function renderRecords(all) {
   </div>`;
 }
 
+// Year-over-year temperature overlay. Renders one mini-chart per sensor,
+// with the current window as a solid line and the same-range-last-year as
+// a dashed line. The dashed pattern is the primary visual distinction —
+// color is reused intentionally so the eye reads "same sensor, two times"
+// instead of "two unrelated traces", and so the comparison stays legible
+// for color-blind users (no red/green pairing, no shade-only difference).
+function renderYearOverYear(all) {
+  if (!_statsYoY) return '';
+
+  // Coverage gate. We need history reaching back ≥1 calendar year before
+  // the start of the current Stats window. Otherwise the overlay would be
+  // a flat line of nothing; render an explanation instead.
+  if (!_hasYoYCoverage()) {
+    const now = Math.floor(Date.now() / 1000);
+    const days = _statsOldestTs ? Math.floor((now - _statsOldestTs) / 86400) : 0;
+    const need = Math.ceil((rangeToSeconds(_statsRange) || 0) / 86400) + 365;
+    return `<div class="an-section"><h2>Year-over-year (${_statsRange})</h2>
+      <div class="stats-yoy-needs-history">
+        <div class="stats-yoy-needs-icon" aria-hidden="true">⏳</div>
+        <div>
+          <div class="stats-yoy-needs-title">Needs more history</div>
+          <div class="rt-dim">Currently have ${days} day${days === 1 ? '' : 's'} of data — need at least ${need} days to compare this ${rangeLabel(_statsRange)} window against the same range a year ago.</div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  const cards = all.slice().sort(_sortStats)
+    .map(x => _renderYoYCard(x))
+    .filter(Boolean)
+    .join('');
+
+  if (!cards) return '';
+
+  return `<div class="an-section"><h2>Year-over-year (${_statsRange})</h2>
+    <div class="stats-yoy-grid">${cards}</div>
+    <div class="stats-footnote">Solid line = current ${rangeLabel(_statsRange)} ending now; dashed line = same range ending one calendar year ago. Each sensor's y-axis is scaled to its combined min–max so small shifts are visible. Dash pattern is the primary cue — not color — so the comparison reads cleanly in grayscale.</div>
+  </div>`;
+}
+
+function _renderYoYCard(x) {
+  const curSamples = (_statsHistory[x.id] || []).filter(s => s.temperature != null);
+  const yrSamples  = (_statsYoYHistory[x.id] || []).filter(s => s.temperature != null);
+  if (curSamples.length < 2 && yrSamples.length < 2) return null;
+
+  const color = _colorMap[x.id] || '#888';
+
+  // Shared y-axis: combined min/max across both series so they can be
+  // compared on the same scale.
+  const allTemps = curSamples.map(s => s.temperature).concat(yrSamples.map(s => s.temperature));
+  const lo = Math.min(...allTemps);
+  const hi = Math.max(...allTemps);
+  const span = Math.max(hi - lo, 0.5);
+
+  // Normalize each series to [0, 1] along its own time span. Both windows
+  // are the same `rangeSecs` long (we anchored the YoY fetch with endTs),
+  // so position-by-fraction-of-window aligns "same hour of the period"
+  // even when sample counts differ.
+  const W = 320, H = 96, PAD_X = 6, PAD_Y = 8;
+  const mapSeries = pts => {
+    if (pts.length < 2) return null;
+    const t0 = pts[0].ts, tn = pts[pts.length - 1].ts;
+    const tspan = Math.max(tn - t0, 1);
+    return pts.map(s => {
+      const xN = (s.ts - t0) / tspan;
+      const yN = 1 - (s.temperature - lo) / span;
+      return {
+        x: PAD_X + xN * (W - 2 * PAD_X),
+        y: PAD_Y + yN * (H - 2 * PAD_Y),
+      };
+    });
+  };
+  const toD = pts => pts.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1)).join('');
+
+  const curPath = mapSeries(curSamples);
+  const yrPath  = mapSeries(yrSamples);
+  const curLine = curPath
+    ? `<path d="${toD(curPath)}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+    : '';
+  const yrLine  = yrPath
+    ? `<path d="${toD(yrPath)}" fill="none" stroke="${color}" stroke-width="1.5" stroke-dasharray="5 3" stroke-linejoin="round" stroke-linecap="round" opacity="0.75"/>`
+    : '';
+
+  // Mean delta vs last year, with arrow + tabular value. Arrow is a glyph,
+  // so the direction carries even if the up/down color tint isn't perceived.
+  const curMean = curSamples.length ? _mean(curSamples.map(s => s.temperature)) : null;
+  const yrMean  = yrSamples.length  ? _mean(yrSamples.map(s => s.temperature))  : null;
+  let deltaChip = '';
+  if (curMean != null && yrMean != null) {
+    const delta = curMean - yrMean;
+    const cls = Math.abs(delta) < 0.2 ? 'stats-flat' : delta > 0 ? 'stats-up' : 'stats-down';
+    const arrow = Math.abs(delta) < 0.2 ? '≈' : delta > 0 ? '↑' : '↓';
+    deltaChip = `<span class="stats-yoy-delta ${cls}">${arrow} ${Math.abs(delta).toFixed(1)}°F vs last yr</span>`;
+  }
+
+  const emptyNote = !yrPath
+    ? `<div class="stats-yoy-empty">No data for the same range one year ago.</div>`
+    : '';
+
+  return `<div class="stats-yoy-card">
+    <div class="stats-yoy-hdr">
+      <span class="stats-dot" style="background:${color}"></span>
+      <span class="stats-yoy-name" title="${esc(x.sensor.name)}">${esc(x.sensor.name)}</span>
+      ${deltaChip}
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" class="stats-yoy-svg" preserveAspectRatio="none" role="img" aria-label="${esc(x.sensor.name)} year-over-year temperature">
+      ${yrLine}
+      ${curLine}
+    </svg>
+    <div class="stats-yoy-legend">
+      <span class="stats-yoy-legend-item"><svg viewBox="0 0 20 4" width="22" height="4" aria-hidden="true"><line x1="1" y1="2" x2="19" y2="2" stroke="${color}" stroke-width="2"/></svg> Now (${lo.toFixed(0)}–${hi.toFixed(0)}°F)</span>
+      <span class="stats-yoy-legend-item"><svg viewBox="0 0 20 4" width="22" height="4" aria-hidden="true"><line x1="1" y1="2" x2="19" y2="2" stroke="${color}" stroke-width="2" stroke-dasharray="5 3"/></svg> 1 yr ago</span>
+    </div>
+    ${emptyNote}
+  </div>`;
+}
+
 function renderStats() {
   const c = document.getElementById('stats-content');
   if (!c) return;
@@ -3312,6 +3579,7 @@ function renderStats() {
   c.innerHTML = [
     renderStatsHighlights(all, valid),
     renderIndoorOutdoor(all),
+    renderYearOverYear(all),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
     renderBreachHistory(all),

@@ -34,7 +34,7 @@ auth.js         — recorder-token resolution (env > /data/recorder-token > null
 mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
 hvac.js         — pure-function module: detectCycles(readings, opts) infers HVAC on/off cycles by smoothing the temperature series, sign-thresholding the slope, and grouping contiguous same-sign runs into heating/cooling cycles; pickDefaultThermostatSensor picks the lowest-variance indoor sensor
 notifications.js — outbound webhook + ntfy dispatch with per-(condition, target) DB-backed state machine; fires on transition→active and transition→recovered, dedupes while stuck; condition evaluators for threshold breach, hour-of-day anomaly, sensor-offline, gateway-offline; runNotifications() is called from the poll loop after each successful poll
-ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom, event markers), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
 tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests). Run `npm test` for the current count.
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
@@ -53,7 +53,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 ## Routes
 
 - **Auth**: `GET /settings/auth` (state), `POST /settings/auth/generate` (bootstrap-only), `POST /settings/auth/rotate` (requires bearer), `DELETE /settings/auth` (clear file token)
-- **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
+- **Sensors / data**: `GET /` (JSON or HTML; response includes `oldestReadingTs` so the Stats YoY toggle can decide whether ≥1y of data exists), `GET /:id/history` (optional `endTs` query param anchors the window at an arbitrary epoch — used by the YoY overlay), `GET /:id/history/all`, `GET /:id/gaps`
 - **Battery forecast**: `GET /battery` — per-sensor voltage trend + projected days-until-replacement
 - **HVAC**: `GET /hvac?range=24h` — duty-cycle inference for thermostat-reference sensors; returns per-cycle list, heating/cooling runtime %, daily breakdown for the last 7 days, and short-cycle warnings. Reference sensors come from `settings.hvac.sensors.<id>.thermostat=true`; with none flagged, the most-stable indoor sensor over 24 h is auto-selected.
 - **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)

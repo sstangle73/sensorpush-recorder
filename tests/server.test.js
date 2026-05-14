@@ -42,6 +42,12 @@ describe('GET / (sensors list)', () => {
     expect(body.sensors).toEqual({});
   });
 
+  it('returns null oldestReadingTs on empty DB', async () => {
+    const { body } = await get('/');
+    expect(body).toHaveProperty('oldestReadingTs');
+    expect(body.oldestReadingTs).toBeNull();
+  });
+
   it('returns sensor data after upsert + readings', async () => {
     upsertSensors(db, [{ id: 'test1', name: 'Kitchen', type: 'HT1', active: true, batteryVoltage: 2.85 }]);
     const now = Math.floor(Date.now() / 1000);
@@ -60,6 +66,9 @@ describe('GET / (sensors list)', () => {
       type: 'HT1',
     });
     expect(body.sensors['test1'].temperature).toBeCloseTo(71.5);
+    // oldestReadingTs surfaced for the YoY toggle's coverage check
+    expect(typeof body.oldestReadingTs).toBe('number');
+    expect(body.oldestReadingTs).toBeLessThanOrEqual(now);
   });
 });
 
@@ -125,6 +134,38 @@ describe('GET /:id/history', () => {
     const { body } = await get('/hist1/history?range=365d');
     expect(body.ok).toBe(true);
     expect(body.resolution).toBe('hourly');
+  });
+
+  it('accepts endTs query param and anchors the window there', async () => {
+    // Insert a reading exactly one year ago, then fetch a 24h window
+    // anchored at "one year ago" — it should only return the year-old row.
+    const now      = Math.floor(Date.now() / 1000);
+    const yearAgo  = now - 365 * 86400;
+    upsertSensors(db, [{ id: 'yoy1', name: 'YoY', type: 'HT1', active: true, batteryVoltage: null }]);
+    insertReadings(db, 'yoy1', [
+      { observed: new Date((yearAgo - 1800) * 1000).toISOString(), temperature: 42, humidity: 30, barometric_pressure: null, battery_voltage: null },
+      { observed: new Date((now - 60)       * 1000).toISOString(), temperature: 72, humidity: 50, barometric_pressure: null, battery_voltage: null },
+    ]);
+
+    const cur = await get('/yoy1/history?range=24h');
+    expect(cur.body.samples.some(s => s.temperature === 72)).toBe(true);
+    expect(cur.body.samples.some(s => s.temperature === 42)).toBe(false);
+
+    const yoy = await get(`/yoy1/history?range=24h&endTs=${yearAgo}`);
+    expect(yoy.body.samples.some(s => s.temperature === 42)).toBe(true);
+    expect(yoy.body.samples.some(s => s.temperature === 72)).toBe(false);
+  });
+
+  it('returns 400 when endTs is not a positive integer', async () => {
+    const bad = await get('/hist1/history?range=24h&endTs=notanumber');
+    expect(bad.status).toBe(400);
+    expect(bad.body.ok).toBe(false);
+
+    const negative = await get('/hist1/history?range=24h&endTs=-100');
+    expect(negative.status).toBe(400);
+
+    const floaty = await get('/hist1/history?range=24h&endTs=12.34');
+    expect(floaty.status).toBe(400);
   });
 });
 
