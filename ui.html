@@ -235,6 +235,28 @@ header .spacer { flex: 1; }
 }
 .an-range-btn:hover { color: var(--text); }
 .an-range-btn.active { color: var(--accent); border-color: var(--accent); background: var(--bg2); }
+
+/* ── Stats sub-tabs ── */
+.stats-subtab-row {
+  display: flex; gap: 2px; padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+.stats-subtab-btn {
+  padding: 9px 16px; border: none; background: transparent;
+  color: var(--text2); cursor: pointer; font-size: 12px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.stats-subtab-btn:hover { color: var(--text); }
+.stats-subtab-btn.active {
+  color: var(--accent); border-bottom-color: var(--accent);
+}
+@media (max-width: 640px) {
+  .stats-subtab-row { padding: 0 8px; overflow-x: auto; }
+  .stats-subtab-btn { padding: 8px 10px; font-size: 11px; white-space: nowrap; }
+}
 .an-section {
   background: var(--bg2); border: 1px solid var(--border);
   border-radius: 6px; padding: 14px 16px;
@@ -906,9 +928,9 @@ header .spacer { flex: 1; }
 
 <header>
   <h1>SensorPush Explorer</h1>
-  <button class="tab-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
+  <button class="tab-btn active" data-view="realtime"  onclick="switchView('realtime')">Live</button>
   <button class="tab-btn"        data-view="stats"     onclick="switchView('stats')">Stats</button>
-  <button class="tab-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
+  <button class="tab-btn"        data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="tab-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="tab-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
   <span id="poll-status"></span>
@@ -916,8 +938,8 @@ header .spacer { flex: 1; }
   <button class="hdr-btn" onclick="init()">↺ Refresh</button>
 </header>
 
-<div id="sensor-chips"></div>
-<div id="body">
+<div id="sensor-chips" style="display:none"></div>
+<div id="body" style="display:none">
   <div id="sidebar">
     <div id="sidebar-hdr">
       Sensors
@@ -971,7 +993,7 @@ header .spacer { flex: 1; }
   </div>
 </div>
 
-<div id="view-realtime" style="display:none">
+<div id="view-realtime" style="display:flex">
   <div id="realtime-head">
     <span>Live readings · trend over last 30 min</span>
     <div class="rt-legend">
@@ -994,6 +1016,12 @@ header .spacer { flex: 1; }
             title="Overlay the same date range from one year ago for comparison">
       <span class="stats-yoy-toggle-glyph" aria-hidden="true">⤢</span> Show year ago
     </button>
+  </div>
+  <div class="stats-subtab-row" role="tablist">
+    <button class="stats-subtab-btn active" data-subtab="overview" onclick="setStatsTab('overview')">Overview</button>
+    <button class="stats-subtab-btn"        data-subtab="patterns" onclick="setStatsTab('patterns')">Patterns</button>
+    <button class="stats-subtab-btn"        data-subtab="hvac"     onclick="setStatsTab('hvac')">HVAC &amp; Climate</button>
+    <button class="stats-subtab-btn"        data-subtab="sensors"  onclick="setStatsTab('sensors')">Sensors</button>
   </div>
   <div id="stats-content"><div class="rt-empty">Loading…</div></div>
 </div>
@@ -1193,9 +1221,9 @@ header .spacer { flex: 1; }
 
 <div id="toast"></div>
 <nav id="bottom-nav">
-  <button class="nav-btn"        data-view="realtime"  onclick="switchView('realtime')">Live</button>
+  <button class="nav-btn active" data-view="realtime"  onclick="switchView('realtime')">Live</button>
   <button class="nav-btn"        data-view="stats"     onclick="switchView('stats')">Stats</button>
-  <button class="nav-btn active" data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
+  <button class="nav-btn"        data-view="explorer"  onclick="switchView('explorer')">Explorer</button>
   <button class="nav-btn"        data-view="analytics" onclick="switchView('analytics')">Analytics</button>
   <button class="nav-btn"        data-view="settings"  onclick="switchView('settings')">Settings</button>
   <button class="nav-btn" id="edit-nav-btn" onclick="toggleEditMode()">Edit</button>
@@ -1306,7 +1334,7 @@ const DEFAULT_RANGES = ['1h', '24h', '7d', '30d', '90d', '1yr'];
 let _settings = { ranges: [...DEFAULT_RANGES] };
 
 // Analytics state
-let _currentView          = 'explorer';
+let _currentView          = 'realtime';
 let _analyticsRange       = '7d';
 let _analyticsData        = {};   // id → { gaps, sparseHours, coveragePct, rangeStartTs, rangeEndTs }
 let _analyticsSelectedId  = null;
@@ -2084,6 +2112,13 @@ let _statsYoY = (() => {
 })();
 let _statsYoYHistory = {};     // id → samples[]
 let _statsOldestTs   = null;   // oldest non-excluded reading across all sensors
+// Sub-tab within Stats. Persisted so revisits land on the user's last view.
+let _statsTab = (() => {
+  try {
+    const v = localStorage.getItem('statsTab');
+    return ['overview', 'patterns', 'hvac', 'sensors'].includes(v) ? v : 'overview';
+  } catch { return 'overview'; }
+})();
 
 // Sensor-pair calibration drift. _pairs is the list from /sensor-pairs;
 // _pairDrift[pairId] caches { samples, stats } from /sensor-pairs/:id/drift.
@@ -2227,6 +2262,7 @@ async function loadStats() {
   try {
     renderStatsRangeBtns();
     updateYoYToggleUI();
+    _restoreStatsTabUI();
     const sr = await fetch(`${API_BASE}/`).then(r => r.json());
     if (sr?.ok) {
       _sensors = sr.sensors;
@@ -2339,6 +2375,20 @@ function toggleStatsYoY() {
 function updateYoYToggleUI() {
   const btn = document.getElementById('stats-yoy-toggle');
   if (btn) btn.classList.toggle('active', _statsYoY);
+}
+
+function setStatsTab(name) {
+  if (!['overview', 'patterns', 'hvac', 'sensors'].includes(name)) return;
+  _statsTab = name;
+  try { localStorage.setItem('statsTab', name); } catch {}
+  document.querySelectorAll('.stats-subtab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.subtab === name));
+  renderStats();
+}
+
+function _restoreStatsTabUI() {
+  document.querySelectorAll('.stats-subtab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.subtab === _statsTab));
 }
 
 function setStatsRange(r) {
@@ -3826,24 +3876,40 @@ function renderStats() {
     };
   });
   const valid = all.filter(x => x.stats.sampleCount > 0);
-  c.innerHTML = [
-    renderStatsHighlights(all, valid),
-    renderIndoorOutdoor(all),
-    renderCalibration(),
-    renderYearOverYear(all),
-    renderOutdoorWeatherDelta(all),
-    renderStatsTable(all, 'temperature'),
-    renderStatsTable(all, 'humidity'),
-    renderBreachHistory(all),
-    renderRecords(all),
-    renderHourOfDay(all),
-    renderCorrelation(all),
-    renderLagLead(all),
-    renderMoldRisk(all),
-    renderHvacPanel(),
-    renderHVACActivity(all),
-    renderBatteryHealth(all),
-  ].filter(Boolean).join('');
+  // Sub-tab dispatch — year-over-year only meaningful on Patterns; HVAC/mold
+  // inference lives on its own tab to keep Overview scannable.
+  const sections = {
+    overview: [
+      renderStatsHighlights(all, valid),
+      renderIndoorOutdoor(all),
+      renderOutdoorWeatherDelta(all),
+      renderStatsTable(all, 'temperature'),
+      renderStatsTable(all, 'humidity'),
+      renderRecords(all),
+      renderBreachHistory(all),
+    ],
+    patterns: [
+      renderYearOverYear(all),
+      renderHourOfDay(all),
+      renderCorrelation(all),
+      renderLagLead(all),
+    ],
+    hvac: [
+      renderMoldRisk(all),
+      renderHvacPanel(),
+      renderHVACActivity(all),
+    ],
+    sensors: [
+      renderCalibration(),
+      renderBatteryHealth(all),
+    ],
+  };
+  const tab = sections[_statsTab] ? _statsTab : 'overview';
+  c.innerHTML = sections[tab].filter(Boolean).join('');
+  // YoY toggle only acts on Patterns content — hide it elsewhere so the
+  // control's lit-up state can't mislead.
+  const yoy = document.getElementById('stats-yoy-toggle');
+  if (yoy) yoy.style.display = tab === 'patterns' ? '' : 'none';
 }
 
 // ── Fetch ──────────────────────────────────────────────────────────────────
@@ -3924,6 +3990,7 @@ async function init() {
     await loadEvents();
     await _bootstrapOutdoor();
     await refreshChart();
+    await loadRealtime();
     updateLastUpdatedLabel();
     startAutoRefresh();
   } catch (e) {
