@@ -535,6 +535,51 @@ header .spacer { flex: 1; }
 #view-stats .an-table td:not(:first-child),
 #view-stats .an-table th:not(:first-child) { text-align: right; }
 .stats-footnote { color: var(--text3); font-size: 10px; margin-top: 8px; }
+
+/* HVAC zone analysis panel. Heating/cooling colors are color-blind safe
+   (amber/sky-blue, hue-distinct) and paired with ▲/▼ glyphs and labels. */
+.hvac-zone { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.hvac-zone:last-child { border-bottom: none; padding-bottom: 0; }
+.hvac-zone-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.hvac-zone-name { font-weight: 600; font-size: 13px; }
+.hvac-zone-summary { margin-left: auto; font-size: 11px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.hvac-tag {
+  display: inline-block; font-size: 10px; padding: 1px 6px;
+  border-radius: 10px; background: var(--bg3); color: var(--text2);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.hvac-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.hvac-col { flex: 1 1 280px; min-width: 0; }
+.hvac-col-title {
+  font-size: 11px; color: var(--text3); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px;
+}
+.hvac-bar {
+  display: flex; height: 14px; border-radius: 3px;
+  overflow: hidden; background: var(--bg3);
+}
+.hvac-bar-seg { transition: width 200ms; }
+.hvac-stat-row {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  margin-top: 6px; font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.hvac-stat-row-dim { color: var(--text3); font-size: 10.5px; }
+.hvac-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.hvac-day { display: flex; flex-direction: column; align-items: center; min-width: 0; }
+.hvac-day-bar {
+  display: flex; flex-direction: column-reverse;
+  width: 100%; height: 50px;
+  background: var(--bg3); border-radius: 3px; overflow: hidden;
+}
+.hvac-day-seg { width: 100%; }
+.hvac-day-empty { background: repeating-linear-gradient(45deg, var(--bg3), var(--bg3) 3px, var(--border) 3px, var(--border) 6px); }
+.hvac-day-label {
+  font-size: 10px; color: var(--text3);
+  margin-top: 4px; text-align: center; line-height: 1.2;
+}
+.hvac-day-pct { font-size: 9px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.hvac-short-empty { font-size: 11px; color: var(--text3); padding: 6px 0; }
 .stats-zone-block { margin-top: 14px; }
 .stats-zone-block:first-child { margin-top: 0; }
 .stats-zone-title {
@@ -908,7 +953,6 @@ header .spacer { flex: 1; }
     </div>
   </div>
 
-  <div class="set-section">
     <h2>Sensor Pairs (Calibration Drift)</h2>
     <p class="set-hint" style="margin-bottom:10px">Pair two sensors that measure the same environment. The Stats tab's Calibration panel will compare them and flag pairs whose 30-day delta is trending — usually a sign one sensor's calibration is drifting.</p>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
@@ -933,6 +977,27 @@ header .spacer { flex: 1; }
         <span style="color:var(--text3)">%RH/d</span>
       </label>
       <button class="set-btn" onclick="saveDriftThresholds()">Save thresholds</button>
+    </div>
+  </div>
+
+  <div class="set-section">
+    <h2>HVAC</h2>
+    <p class="set-hint" style="margin-bottom:10px">Flag the sensor(s) closest to your thermostat — they drive duty-cycle inference on the Stats tab. If nothing is flagged, the most-stable indoor sensor (lowest 24 h variance) is used automatically.</p>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+      <label style="font-size:12px;color:var(--text2)">Short-cycle threshold (min):
+        <input type="number" id="hvac-shortcycle" class="set-text-input" min="1" max="120" step="1" style="width:80px;margin-left:6px" value="5">
+      </label>
+      <label style="font-size:12px;color:var(--text2)">Slope threshold (°F/hr):
+        <input type="number" id="hvac-slope" class="set-text-input" min="0.05" max="10" step="0.05" style="width:80px;margin-left:6px" value="0.5">
+      </label>
+    </div>
+    <div class="set-subheader">Thermostat-reference sensors</div>
+    <table class="comfort-table"><thead>
+      <tr><th>Sensor</th><th style="width:90px">Thermostat</th><th>Zone label (optional)</th></tr>
+    </thead><tbody id="hvac-sensors-body"></tbody></table>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="set-btn" onclick="saveHvacSettings()">Save</button>
+      <button class="set-btn" onclick="resetHvacSettings()">Clear all flags</button>
     </div>
   </div>
 
@@ -1857,6 +1922,7 @@ function resolveComfort(sensorId) {
 let _statsRange   = '7d';
 let _statsHistory = {};        // id → samples[]
 let _batteryForecasts = {};    // id → { slopeVPerDay, currentV, daysTo27, daysTo25, daysTo24, sampleDays } | null
+let _hvacInfo     = null;      // /hvac response: { ok, range, config, referenceIds, autoDefaultId, sensors }
 let _statsLoading = false;
 
 // Sensor-pair calibration drift. _pairs is the list from /sensor-pairs;
@@ -2006,13 +2072,16 @@ async function loadStats() {
       if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
     });
     const ids = Object.keys(_sensors);
-    const [results, batt, pairs] = await Promise.all([
+    const [results, batt, pairs, hvac] = await Promise.all([
       Promise.all(ids.map(id =>
         fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
           .then(r => r.json()).catch(() => null)
       )),
       fetch(`${API_BASE}/battery`).then(r => r.json()).catch(() => null),
       fetch(`${API_BASE}/sensor-pairs`).then(r => r.json()).catch(() => null),
+      // HVAC analysis always uses 24h for the "today" gauge — independent of
+      // _statsRange. The route's daily breakdown covers the last 7 days.
+      fetch(`${API_BASE}/hvac?range=24h`).then(r => r.json()).catch(() => null),
     ]);
     _statsHistory = {};
     results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
@@ -2025,6 +2094,7 @@ async function loadStats() {
       fetch(`${API_BASE}/sensor-pairs/${p.id}/drift?range=30d`).then(r => r.json()).catch(() => null)));
     _pairDrift = {};
     drifts.forEach((d, i) => { if (d?.ok) _pairDrift[_pairs[i].id] = d; });
+    _hvacInfo = (hvac?.ok) ? hvac : null;
     renderStats();
   } finally {
     _statsLoading = false;
@@ -3115,6 +3185,156 @@ function renderHVACActivity(all) {
   </div>`;
 }
 
+// ── HVAC zone analysis panel (driven by /hvac route) ──────────────────────
+// Shows, per thermostat-reference sensor:
+//   • Today's runtime gauge — horizontal bar split heating (orange/yellow)
+//     vs cooling (sky-blue), with the idle remainder dim grey.
+//   • Last 7 days of daily heating/cooling runtime as paired bars.
+//   • Short-cycle warning list — every cycle shorter than the configured
+//     threshold (default 5 min).
+//
+// Colors are chosen for color-blind safety: heating = sky-blue (#4db8ff),
+// cooling = amber (#e69f00); the pair is hue-distinct rather than the
+// stock red/blue thermostat metaphor (which is hard for protans/deuterans).
+// Glyphs (▲/▼) and labels reinforce the encoding.
+function _fmtPct(v) {
+  if (v == null) return '—';
+  return (v * 100).toFixed(0) + '%';
+}
+function _fmtMinSec(secs) {
+  if (secs == null || !isFinite(secs)) return '—';
+  if (secs < 60)   return Math.round(secs) + 's';
+  if (secs < 3600) return Math.round(secs / 60) + ' min';
+  return (secs / 3600).toFixed(1) + ' h';
+}
+function _fmtCycleTimestamp(ts) {
+  return new Date(ts * 1000).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+}
+
+const HVAC_COLOR_HEAT = '#e69f00'; // amber
+const HVAC_COLOR_COOL = '#4db8ff'; // sky-blue
+const HVAC_COLOR_IDLE = '#3a3a3a'; // dim grey
+
+function _hvacRuntimeBar(heatPct, coolPct) {
+  const h = Math.max(0, Math.min(1, heatPct || 0));
+  const c = Math.max(0, Math.min(1, coolPct || 0));
+  const idle = Math.max(0, 1 - h - c);
+  return `<div class="hvac-bar" title="Heating ${_fmtPct(h)} · Cooling ${_fmtPct(c)} · Idle ${_fmtPct(idle)}">
+    <div class="hvac-bar-seg" style="width:${(h * 100).toFixed(1)}%;background:${HVAC_COLOR_HEAT}"></div>
+    <div class="hvac-bar-seg" style="width:${(c * 100).toFixed(1)}%;background:${HVAC_COLOR_COOL}"></div>
+    <div class="hvac-bar-seg" style="width:${(idle * 100).toFixed(1)}%;background:${HVAC_COLOR_IDLE}"></div>
+  </div>`;
+}
+
+function _hvacDailyBars(daily) {
+  if (!Array.isArray(daily) || !daily.length) return '';
+  const maxPct = daily.reduce((m, d) =>
+    Math.max(m, (d.heatingRuntimePct || 0) + (d.coolingRuntimePct || 0)), 0) || 1;
+  // Day labels: short weekday from the YYYY-MM-DD ISO date.
+  const cells = daily.map(d => {
+    const date  = new Date(d.date + 'T00:00:00Z');
+    const label = date.toLocaleDateString(undefined, { weekday: 'short' });
+    if (d.heatingRuntimePct == null && d.coolingRuntimePct == null) {
+      return `<div class="hvac-day"><div class="hvac-day-bar hvac-day-empty"></div><div class="hvac-day-label">${label}</div></div>`;
+    }
+    const h = (d.heatingRuntimePct || 0) / maxPct;
+    const c = (d.coolingRuntimePct || 0) / maxPct;
+    const total = (d.heatingRuntimePct || 0) + (d.coolingRuntimePct || 0);
+    return `<div class="hvac-day" title="${d.date} · Heating ${_fmtPct(d.heatingRuntimePct)} · Cooling ${_fmtPct(d.coolingRuntimePct)} · ${d.cycleCount} cycles">
+      <div class="hvac-day-bar">
+        <div class="hvac-day-seg" style="height:${(h * 100).toFixed(1)}%;background:${HVAC_COLOR_HEAT}"></div>
+        <div class="hvac-day-seg" style="height:${(c * 100).toFixed(1)}%;background:${HVAC_COLOR_COOL}"></div>
+      </div>
+      <div class="hvac-day-label">${label}<div class="hvac-day-pct">${_fmtPct(total)}</div></div>
+    </div>`;
+  }).join('');
+  return `<div class="hvac-days">${cells}</div>`;
+}
+
+function _hvacShortCycleList(shorts, shortCycleSecs) {
+  if (!shorts?.length) return `<div class="hvac-short-empty">No short cycles detected (threshold: ${_fmtMinSec(shortCycleSecs)}).</div>`;
+  // Worst-first by shortest duration; cap at 10 to keep the panel readable.
+  const sorted = shorts.slice().sort((a, b) => a.durationSecs - b.durationSecs).slice(0, 10);
+  const rows = sorted.map(c => {
+    const glyph = c.kind === 'heating' ? `<span style="color:${HVAC_COLOR_HEAT}">▲</span>`
+               : c.kind === 'cooling' ? `<span style="color:${HVAC_COLOR_COOL}">▼</span>`
+               :                        '●';
+    return `<tr>
+      <td>${glyph} ${esc(c.kind)}</td>
+      <td>${_fmtCycleTimestamp(c.startTs)}</td>
+      <td>${_fmtMinSec(c.durationSecs)}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="stats-table-wrap"><table class="an-table">
+    <thead><tr><th>Kind</th><th>Started</th><th>Duration</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function renderHvacPanel() {
+  const info = _hvacInfo;
+  if (!info) return '';
+  const ids = info.referenceIds || [];
+  if (!ids.length) {
+    return `<div class="an-section"><h2>HVAC zone analysis</h2>
+      <div class="stats-footnote">No thermostat-reference sensor configured yet, and no indoor sensor has 24 h of data to auto-select. Set one in Settings → HVAC, or wait for the next poll.</div>
+    </div>`;
+  }
+  const shortThresholdSecs = (info.config?.shortCycleMinutes ?? 5) * 60;
+  const blocks = ids.map(id => {
+    const s = info.sensors?.[id]; if (!s) return '';
+    const a = s.analysis;
+    const sourceTag = s.isAutoSelected
+      ? `<span class="hvac-tag" title="Auto-selected (most-stable indoor sensor over 24 h)">auto</span>`
+      : `<span class="hvac-tag">thermostat</span>`;
+    const zoneTag = s.zone ? `<span class="hvac-tag">zone: ${esc(s.zone)}</span>` : '';
+
+    if (!a?.ok) {
+      return `<div class="hvac-zone">
+        <div class="hvac-zone-head"><span class="hvac-zone-name">${esc(s.name)}</span> ${sourceTag} ${zoneTag}</div>
+        <div class="stats-footnote">Not enough recent data to analyze (need at least ${a?.opts?.minSamples ?? 12} valid samples).</div>
+      </div>`;
+    }
+
+    const dominantGlyph = a.dominantKind === 'heating' ? `<span style="color:${HVAC_COLOR_HEAT}">▲ heating</span>`
+                       : a.dominantKind === 'cooling' ? `<span style="color:${HVAC_COLOR_COOL}">▼ cooling</span>`
+                       :                                `<span style="color:var(--text3)">● idle</span>`;
+    return `<div class="hvac-zone">
+      <div class="hvac-zone-head">
+        <span class="hvac-zone-name">${esc(s.name)}</span> ${sourceTag} ${zoneTag}
+        <span class="hvac-zone-summary">${dominantGlyph} · ${a.cycleCount} cycles · mean ${_fmtMinSec(a.meanCycleSecs)}</span>
+      </div>
+      <div class="hvac-row">
+        <div class="hvac-col">
+          <div class="hvac-col-title">Today (24 h)</div>
+          ${_hvacRuntimeBar(a.heatingRuntimePct, a.coolingRuntimePct)}
+          <div class="hvac-stat-row">
+            <span><span style="color:${HVAC_COLOR_HEAT}">▲</span> Heating <b>${_fmtPct(a.heatingRuntimePct)}</b></span>
+            <span><span style="color:${HVAC_COLOR_COOL}">▼</span> Cooling <b>${_fmtPct(a.coolingRuntimePct)}</b></span>
+          </div>
+          <div class="hvac-stat-row hvac-stat-row-dim">
+            <span>Mean heat cycle <b>${_fmtMinSec(a.meanHeatingCycleSecs)}</b></span>
+            <span>Mean cool cycle <b>${_fmtMinSec(a.meanCoolingCycleSecs)}</b></span>
+          </div>
+        </div>
+        <div class="hvac-col">
+          <div class="hvac-col-title">Last 7 days</div>
+          ${_hvacDailyBars(s.dailyRuntime)}
+        </div>
+      </div>
+      <div class="hvac-col-title" style="margin-top:10px">Short cycles (&lt; ${_fmtMinSec(shortThresholdSecs)})</div>
+      ${_hvacShortCycleList(a.shortCycles, shortThresholdSecs)}
+    </div>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>HVAC zone analysis</h2>
+    ${blocks}
+    <div class="stats-footnote">Runtime is the fraction of the window where the room's smoothed temperature was changing faster than ${info.config?.slopeThresholdF ?? 0.5}°F/hr — positive slope = heating, negative = cooling. Cycle boundaries come from slope sign changes after a 15-min smoothing pass. Short cycles (compressor or burner runs that end before the threshold) often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Flag additional thermostat-reference sensors in Settings → HVAC if you have multiple zones.</div>
+  </div>`;
+}
+
 // Scan samples for the extreme value of a field. mode='max' uses the
 // hourly/daily max sidecar (tempMax/humMax) when present so the result
 // reflects the within-bucket extreme, not just the bucket mean. ts is
@@ -3202,6 +3422,7 @@ function renderStats() {
     renderCorrelation(all),
     renderLagLead(all),
     renderMoldRisk(all),
+    renderHvacPanel(),
     renderHVACActivity(all),
     renderBatteryHealth(all),
   ].filter(Boolean).join('');
@@ -3673,6 +3894,10 @@ async function loadSettings() {
       if (resp.settings.driftThresholds !== undefined) {
         _settings.driftThresholds = resp.settings.driftThresholds;
       }
+      // HVAC: same — server validates on PUT, so trust the shape here.
+      if (resp.settings.hvac !== undefined) {
+        _settings.hvac = resp.settings.hvac;
+      }
       return;
     }
   } catch(e) {}
@@ -3703,6 +3928,7 @@ async function renderSettings() {
   renderComfortPresets();
   renderPairsPanel();
   loadAndRenderPairs();
+  renderHvacSettings();
   // Resume progress display if a backfill is already in progress
   try {
     const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
@@ -3807,6 +4033,98 @@ async function saveDriftThresholds() {
   _settings.driftThresholds = next;
   await saveSettings();
   showToast('Drift thresholds saved ✓');
+}
+
+// ── HVAC settings editor ────────────────────────────────────────────────
+function renderHvacSettings() {
+  const body = document.getElementById('hvac-sensors-body');
+  const shortInp = document.getElementById('hvac-shortcycle');
+  const slopeInp = document.getElementById('hvac-slope');
+  if (!body || !shortInp || !slopeInp) return;
+  const cfg = _settings.hvac || {};
+  shortInp.value = cfg.shortCycleMinutes != null ? cfg.shortCycleMinutes : 5;
+  slopeInp.value = cfg.slopeThresholdF   != null ? cfg.slopeThresholdF   : 0.5;
+  const flags = cfg.sensors || {};
+
+  const order = Object.keys(_sensors).map(id => ({
+    id,
+    sensor: _sensors[id],
+    group:  classifySensor(_sensors[id].name),
+  })).sort(_sortStats);
+
+  if (!order.length) {
+    body.innerHTML = `<tr><td colspan="3" style="color:var(--text3)">No sensors registered yet.</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = order.map(x => {
+    const e        = flags[x.id] || {};
+    const checked  = e.thermostat ? 'checked' : '';
+    const zone     = e.zone ?? '';
+    const color    = _colorMap[x.id] || '#888';
+    const grpLabel = _COMFORT_GROUP_LABEL[x.group.group] || x.group.group;
+    return `<tr>
+      <td>
+        <div class="comfort-sensor-label"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
+        <div class="comfort-sensor-sub">${esc(grpLabel)}</div>
+      </td>
+      <td style="text-align:center">
+        <input type="checkbox" class="hvac-thermostat-input" data-sensor="${esc(x.id)}" ${checked}>
+      </td>
+      <td>
+        <input type="text" class="comfort-input hvac-zone-input" data-sensor="${esc(x.id)}" value="${esc(zone)}" placeholder="e.g. upstairs">
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function _collectHvacFromInputs() {
+  const out = { sensors: {} };
+  const shortMin = parseFloat(document.getElementById('hvac-shortcycle').value);
+  const slopeF   = parseFloat(document.getElementById('hvac-slope').value);
+  if (isFinite(shortMin) && shortMin > 0) out.shortCycleMinutes = shortMin;
+  if (isFinite(slopeF)   && slopeF   > 0) out.slopeThresholdF   = slopeF;
+
+  document.querySelectorAll('.hvac-thermostat-input').forEach(inp => {
+    const id = inp.dataset.sensor;
+    if (inp.checked) (out.sensors[id] = out.sensors[id] || {}).thermostat = true;
+  });
+  document.querySelectorAll('.hvac-zone-input').forEach(inp => {
+    const id = inp.dataset.sensor;
+    const z  = inp.value.trim();
+    if (z) (out.sensors[id] = out.sensors[id] || {}).zone = z;
+  });
+  // Drop sensors with no useful flags so the stored blob stays minimal.
+  for (const k of Object.keys(out.sensors)) {
+    if (!Object.keys(out.sensors[k]).length) delete out.sensors[k];
+  }
+  return out;
+}
+
+async function saveHvacSettings() {
+  const hvac = _collectHvacFromInputs();
+  _settings.hvac = hvac;
+  try {
+    const r = await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_settings),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    showToast('HVAC settings saved ✓');
+    // If the Stats tab is showing, refresh so the panel reflects the new flag.
+    if (_currentView === 'stats') loadStats();
+  } catch (e) {
+    showToast('Save failed: ' + e.message);
+  }
+}
+
+function resetHvacSettings() {
+  if (!confirm('Clear all HVAC flags? The auto-default (most-stable indoor sensor) will resume.')) return;
+  _settings.hvac = { sensors: {} };
+  renderHvacSettings();
+  saveHvacSettings();
 }
 
 // ── Comfort presets editor ────────────────────────────────────────────────

@@ -18,7 +18,7 @@ Runs as a single-container compose stack. After source changes:
 git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
 
 CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
@@ -33,13 +33,14 @@ poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; trig
 auth.js         — recorder-token resolution (env > /data/recorder-token > null); generate/set/clear helpers; bearer middleware in server.js calls getToken() on every request
 drift.js        — pure-function drift detector: computeDriftStats(samples) → mean delta + linear-regression slope per day; classifyDrift() returns 'drifting'|'stable'|'unknown'
 mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
-ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, security/token)
-tests/          — 250 vitest tests across 7 files; in-memory SQLite + http.createServer for route tests
+hvac.js         — pure-function module: detectCycles(readings, opts) infers HVAC on/off cycles by smoothing the temperature series, sign-thresholding the slope, and grouping contiguous same-sign runs into heating/cooling cycles; pickDefaultThermostatSensor picks the lowest-variance indoor sensor
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token)
+tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests). Run `npm test` for the current count.
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db`, `auth`, `poller` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db`, `auth`, `poller`, `hvac` → `server`.
 
 ## Configuration
 
@@ -54,6 +55,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 - **Auth**: `GET /settings/auth` (state), `POST /settings/auth/generate` (bootstrap-only), `POST /settings/auth/rotate` (requires bearer), `DELETE /settings/auth` (clear file token)
 - **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
 - **Battery forecast**: `GET /battery` — per-sensor voltage trend + projected days-until-replacement
+- **HVAC**: `GET /hvac?range=24h` — duty-cycle inference for thermostat-reference sensors; returns per-cycle list, heating/cooling runtime %, daily breakdown for the last 7 days, and short-cycle warnings. Reference sensors come from `settings.hvac.sensors.<id>.thermostat=true`; with none flagged, the most-stable indoor sensor over 24 h is auto-selected.
 - **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
@@ -75,12 +77,12 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 ## Testing
 
 ```bash
-npm test                       # all 250 tests
+npm test                       # full vitest run
 npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
-- Test files: `auth.test.js` (15), `config.test.js` (7), `db.test.js` (78), `poller.test.js` (26), `sensorpush.test.js` (15), `server.test.js` (65), `ui-helpers.test.js` (44).
+- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`.
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.

@@ -8,6 +8,7 @@ import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
+import { detectCycles, pickDefaultThermostatSensor } from './hvac.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
@@ -122,7 +123,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery)\\b/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery|hvac)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -203,6 +204,61 @@ function _validDriftThresholds(d) {
   }
   return true;
 }
+
+// HVAC config validation. Shape (all fields optional):
+//   {
+//     sensors?: { [sensorId]: { thermostat?: boolean, zone?: string } | null },
+//     shortCycleMinutes?: number > 0,
+//     slopeThresholdF?:   number > 0,
+//   }
+function _validHvacConfig(c) {
+  if (c == null) return true;
+  if (typeof c !== 'object' || Array.isArray(c)) return false;
+  for (const k of Object.keys(c)) {
+    if (k === 'sensors') {
+      const v = c.sensors;
+      if (v == null) continue;
+      if (typeof v !== 'object' || Array.isArray(v)) return false;
+      for (const id of Object.keys(v)) {
+        const e = v[id];
+        if (e == null) continue;
+        if (typeof e !== 'object' || Array.isArray(e)) return false;
+        for (const k2 of Object.keys(e)) {
+          if (k2 === 'thermostat') {
+            if (typeof e.thermostat !== 'boolean') return false;
+          } else if (k2 === 'zone') {
+            if (e.zone != null && typeof e.zone !== 'string') return false;
+          } else {
+            return false;
+          }
+        }
+      }
+    } else if (k === 'shortCycleMinutes' || k === 'slopeThresholdF') {
+      const v = c[k];
+      if (v == null) continue;
+      if (typeof v !== 'number' || !isFinite(v) || v <= 0) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Server-side mirror of ui.html's classifySensor (top-level group only),
+// kept in sync with the keyword set there. Used to scope the auto-default
+// thermostat reference to indoor sensors only. If you tweak the keyword
+// lists in ui.html, update them here too.
+function _classifySensorGroup(name) {
+  const n = name || '';
+  if (/\b(fridge|refrig|freezer|cabinet|rack|server|cooler|wine|incubator|pantry)\b/i.test(n))
+    return 'appliance';
+  if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
+    return 'outside';
+  if (/\b(attic|bedroom|bedrm|bath|nursery|loft|master|kids?|living|kitchen|dining|family|foyer|den|study|office|main|hallway|entry|mudroom|basement|cellar|crawl)\b/i.test(n))
+    return 'house';
+  return 'other';
+}
+
 
 export function createApp(db, config = null) {
   const app = express();
@@ -467,6 +523,117 @@ export function createApp(db, config = null) {
     });
   });
 
+  // HVAC duty-cycle inference. Returns per-reference-sensor analysis:
+  //   - cycle list (start/end/kind/duration) over the window
+  //   - heating/cooling runtime % for the window AND a daily breakdown for
+  //     the last 7 days so the UI can render bar charts
+  //   - short-cycle list (cycles strictly shorter than the configured
+  //     threshold, default 5 min)
+  //
+  // Reference-sensor selection:
+  //   1. If any sensors are flagged with settings.hvac.sensors.<id>.thermostat=true,
+  //      analyze only those.
+  //   2. Otherwise auto-select the most-stable indoor sensor (lowest 24h
+  //      temperature variance) as the default — pickDefaultThermostatSensor
+  //      in hvac.js handles the variance comparison; we feed it the eligible
+  //      indoor sensors classified by name.
+  //
+  // The window for cycle detection comes from ?range= (default 24h). The
+  // 7-day daily breakdown is independent of `range` — always last 7 days,
+  // one detectCycles call per UTC day.
+  app.get('/hvac', (req, res) => {
+    const range     = req.query.range || '24h';
+    const rangeSecs = rangeToSeconds(range);
+    if (!rangeSecs) return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 24h, 7d, 30d.' });
+
+    const settings        = getUiSettings(db) || {};
+    const hvacCfg         = settings.hvac || {};
+    const shortCycleMins  = hvacCfg.shortCycleMinutes != null ? hvacCfg.shortCycleMinutes : 5;
+    const slopeThresholdF = hvacCfg.slopeThresholdF   != null ? hvacCfg.slopeThresholdF   : 0.5;
+    const flagged         = hvacCfg.sensors || {};
+
+    const opts = {
+      shortCycleSecs:  Math.max(1, shortCycleMins * 60),
+      slopeThresholdF: slopeThresholdF,
+    };
+
+    const sensorRows = db.prepare('SELECT id, name FROM sensors').all();
+    const explicit   = sensorRows.filter(s => flagged[s.id]?.thermostat === true).map(s => s.id);
+
+    // Auto-default: most-stable indoor sensor over last 24h. Skip when the
+    // user has explicit flags (they've made their choice).
+    let autoDefault = null;
+    if (!explicit.length) {
+      const since24h = Math.floor(Date.now() / 1000) - 86400;
+      const stableInputs = sensorRows.map(s => ({
+        id:      s.id,
+        group:   _classifySensorGroup(s.name),
+        samples: db.prepare(
+          'SELECT ts, temperature FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0 ORDER BY ts'
+        ).all(s.id, since24h),
+      }));
+      autoDefault = pickDefaultThermostatSensor(stableInputs);
+    }
+
+    const referenceIds = explicit.length ? explicit : (autoDefault ? [autoDefault] : []);
+
+    // Per-reference analysis. For each, fetch raw history over the chosen
+    // range, plus seven 24h slices for the daily breakdown.
+    const sensorsOut = {};
+    const dayStart = (offsetDays) => {
+      const d = new Date();
+      d.setUTCHours(0, 0, 0, 0);
+      d.setUTCDate(d.getUTCDate() - offsetDays);
+      return Math.floor(d.getTime() / 1000);
+    };
+
+    for (const id of referenceIds) {
+      const sensor = sensorRows.find(s => s.id === id);
+      if (!sensor) continue;
+
+      const samples = getHistory(db, id, range);   // raw if range≤24h, hourly otherwise
+      const analysis = detectCycles(samples, opts);
+
+      // Daily breakdown: last 7 days, including today. Each day's samples
+      // come from getHistory at 24h resolution → raw data. We re-bucket
+      // them ourselves because getHistory only takes a "look back N" range,
+      // not an arbitrary [start, end] window.
+      const all24hRaw = db.prepare(
+        'SELECT ts, temperature FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0 ORDER BY ts'
+      ).all(id, dayStart(7));
+
+      const dailyRuntime = [];
+      for (let i = 6; i >= 0; i--) {
+        const d0 = dayStart(i);
+        const d1 = d0 + 86400;
+        const slice = all24hRaw.filter(r => r.ts >= d0 && r.ts < d1);
+        const day   = detectCycles(slice, opts);
+        const iso   = new Date(d0 * 1000).toISOString().slice(0, 10);
+        dailyRuntime.push(day.ok
+          ? { date: iso, heatingRuntimePct: day.heatingRuntimePct, coolingRuntimePct: day.coolingRuntimePct, cycleCount: day.cycleCount }
+          : { date: iso, heatingRuntimePct: null, coolingRuntimePct: null, cycleCount: 0 });
+      }
+
+      sensorsOut[id] = {
+        name:           sensor.name,
+        zone:           flagged[id]?.zone ?? null,
+        isThermostat:   flagged[id]?.thermostat === true,
+        isAutoSelected: !explicit.length && id === autoDefault,
+        analysis,
+        dailyRuntime,
+      };
+    }
+
+    res.json({
+      ok: true,
+      range,
+      config: { shortCycleMinutes: shortCycleMins, slopeThresholdF },
+      referenceIds,
+      autoDefaultId: autoDefault,
+      sensors: sensorsOut,
+    });
+  });
+
   app.get('/gateways', (req, res) => {
     const rows  = getGateways(db);
     // Optional ?range=Xd attaches uptime % and sensor counts. Backward-compatible:
@@ -559,7 +726,7 @@ export function createApp(db, config = null) {
   });
 
   app.put('/settings', (req, res) => {
-    const { ranges, comfort, driftThresholds } = req.body ?? {};
+    const { ranges, comfort, driftThresholds, hvac } = req.body ?? {};
     if (!Array.isArray(ranges) || !ranges.every(r => /^\d+(h|d|yr)$/.test(r))) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: ranges' });
     }
@@ -569,12 +736,16 @@ export function createApp(db, config = null) {
     if (driftThresholds !== undefined && !_validDriftThresholds(driftThresholds)) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: driftThresholds' });
     }
+    if (hvac !== undefined && !_validHvacConfig(hvac)) {
+      return res.status(400).json({ ok: false, error: 'Invalid settings: hvac' });
+    }
     // Merge with whatever else is in the meta blob (future fields stay untouched
     // even when the client only sends ranges, and vice versa).
     const existing = getUiSettings(db) || {};
     const payload = { ...existing, ranges };
     if (comfort !== undefined)          payload.comfort = comfort;
     if (driftThresholds !== undefined)  payload.driftThresholds = driftThresholds;
+    if (hvac !== undefined)             payload.hvac = hvac;
     setUiSettings(db, payload);
     res.json({ ok: true });
   });
