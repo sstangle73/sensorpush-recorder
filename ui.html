@@ -1108,8 +1108,10 @@ header .spacer { flex: 1; }
         </label>
         <input type="url" id="notif-ntfy-url" class="set-text-input" placeholder="https://ntfy.sh/your-topic" style="flex:1;min-width:200px">
         <input type="text" id="notif-ntfy-token" class="set-text-input" placeholder="Bearer token (optional)" style="flex:0 0 200px">
+        <button class="set-btn" onclick="generateNtfyTopic()" title="Fill the URL with a random ntfy.sh topic — security comes from the topic being unguessable">Generate</button>
         <button class="set-btn" onclick="testNotif('ntfy')">Test</button>
       </div>
+      <p class="set-hint" style="margin-top:-2px">ntfy.sh has no accounts on the free tier — anyone who knows your topic name can read or post to it. Use <b>Generate</b> for a long random topic, then subscribe in the ntfy app or via <code>curl -s https://ntfy.sh/&lt;topic&gt;/json</code>.</p>
       <div id="notif-test-status" style="font-size:12px;color:var(--text2);min-height:16px"></div>
     </div>
 
@@ -4485,6 +4487,19 @@ async function saveNotifications() {
     status.textContent = 'Save failed: ' + e.message;
     showToast('Save failed: ' + e.message);
   }
+}
+
+// Fill the ntfy URL field with a long random topic. Security on ntfy.sh
+// (free tier) is "the topic name is unguessable" — 16 random bytes hex-
+// encoded is more than enough. Subscribe via the ntfy app or `curl
+// https://ntfy.sh/<topic>/json`.
+function generateNtfyTopic() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  document.getElementById('notif-ntfy-url').value     = `https://ntfy.sh/sensorpush-${hex}`;
+  document.getElementById('notif-ntfy-enabled').checked = true;
+  showToast('Topic generated — click Save to persist, then subscribe in the ntfy app');
 }
 
 async function testNotif(sink) {
