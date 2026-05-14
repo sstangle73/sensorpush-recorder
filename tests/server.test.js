@@ -765,3 +765,122 @@ describe('GET /battery', () => {
     await new Promise(r => srv.close(r));
   });
 });
+
+// ── Events routes ──────────────────────────────────────────────────────────
+// Happy-path coverage and basic validation; auth enforcement is exercised
+// separately in events-auth.test.js (own file so we can isolate the
+// RECORDER_TOKEN env var without polluting other server tests).
+describe('Events routes', () => {
+  let evDb, evSrv, evUrl;
+  async function api(method, path, body) {
+    const res = await fetch(evUrl + path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  beforeAll(() => new Promise(resolve => {
+    evDb = openDb(':memory:');
+    upsertSensors(evDb, [{ id: 'ev-sensor', name: 'Test', type: 'HT1', active: true, batteryVoltage: null }]);
+    evSrv = http.createServer(createApp(evDb));
+    evSrv.listen(0, '127.0.0.1', () => {
+      evUrl = `http://127.0.0.1:${evSrv.address().port}`;
+      resolve();
+    });
+  }));
+  afterAll(() => new Promise(r => evSrv.close(r)));
+
+  it('POST /events creates a global event when sensor_id is omitted', async () => {
+    const { status, body } = await api('POST', '/events', { ts: 1000, label: 'global event' });
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.event).toMatchObject({ ts: 1000, sensorId: null, label: 'global event' });
+    expect(body.event.id).toBeGreaterThan(0);
+  });
+
+  it('POST /events creates a sensor-scoped event', async () => {
+    const { body } = await api('POST', '/events', { ts: 2000, sensor_id: 'ev-sensor', label: 'scoped', note: 'with note' });
+    expect(body.event.sensorId).toBe('ev-sensor');
+    expect(body.event.note).toBe('with note');
+  });
+
+  it('POST /events 400 when label is missing or empty', async () => {
+    const r1 = await api('POST', '/events', { ts: 1000 });
+    expect(r1.status).toBe(400);
+    const r2 = await api('POST', '/events', { ts: 1000, label: '   ' });
+    expect(r2.status).toBe(400);
+  });
+
+  it('POST /events 400 when ts is missing or non-numeric', async () => {
+    const r1 = await api('POST', '/events', { label: 'x' });
+    expect(r1.status).toBe(400);
+    const r2 = await api('POST', '/events', { ts: 'not-a-number', label: 'x' });
+    expect(r2.status).toBe(400);
+  });
+
+  it('POST /events 400 when sensor_id references an unknown sensor', async () => {
+    const { status } = await api('POST', '/events', { ts: 1000, sensor_id: 'nope', label: 'x' });
+    expect(status).toBe(400);
+  });
+
+  it('GET /events lists events DESC by ts', async () => {
+    // Fresh app/DB so we control what's listed.
+    const db2 = openDb(':memory:');
+    const srv2 = http.createServer(createApp(db2));
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv2.address().port}`;
+    await fetch(u + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ts: 1000, label: 'a' }) });
+    await fetch(u + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ts: 3000, label: 'b' }) });
+    await fetch(u + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ts: 2000, label: 'c' }) });
+    const r = await fetch(u + '/events').then(r => r.json());
+    expect(r.events.map(e => e.label)).toEqual(['b', 'c', 'a']);
+    await new Promise(r => srv2.close(r));
+  });
+
+  it('GET /events filters by from/to/sensor_id', async () => {
+    const db2 = openDb(':memory:');
+    upsertSensors(db2, [{ id: 's1', name: 'A', type: 'HT1', active: true, batteryVoltage: null }]);
+    const srv2 = http.createServer(createApp(db2));
+    await new Promise(r => srv2.listen(0, '127.0.0.1', r));
+    const u = `http://127.0.0.1:${srv2.address().port}`;
+    const post = body => fetch(u + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    await post({ ts: 1000, label: 'global' });
+    await post({ ts: 2000, sensor_id: 's1', label: 'scoped' });
+    await post({ ts: 3000, sensor_id: 's1', label: 'late-scoped' });
+
+    const r1 = await fetch(u + '/events?from=1500&to=2500').then(r => r.json());
+    expect(r1.events.map(e => e.label)).toEqual(['scoped']);
+
+    const r2 = await fetch(u + '/events?sensor_id=s1').then(r => r.json());
+    const labels = r2.events.map(e => e.label).sort();
+    expect(labels).toEqual(['global', 'late-scoped', 'scoped']);
+
+    await new Promise(r => srv2.close(r));
+  });
+
+  it('PATCH /events/:id updates fields and returns the updated event', async () => {
+    const created = await api('POST', '/events', { ts: 5000, label: 'orig' });
+    const id = created.body.event.id;
+    const { status, body } = await api('PATCH', `/events/${id}`, { label: 'patched', note: 'added' });
+    expect(status).toBe(200);
+    expect(body.event.label).toBe('patched');
+    expect(body.event.note).toBe('added');
+    expect(body.event.ts).toBe(5000);
+  });
+
+  it('PATCH /events/:id 404 when id does not exist', async () => {
+    const { status } = await api('PATCH', '/events/99999', { label: 'x' });
+    expect(status).toBe(404);
+  });
+
+  it('DELETE /events/:id removes the event', async () => {
+    const created = await api('POST', '/events', { ts: 6000, label: 'gone' });
+    const id = created.body.event.id;
+    const del = await api('DELETE', `/events/${id}`);
+    expect(del.status).toBe(200);
+    const del2 = await api('DELETE', `/events/${id}`);
+    expect(del2.status).toBe(404);
+  });
+});

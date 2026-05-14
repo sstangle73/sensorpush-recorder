@@ -68,6 +68,19 @@ export function openDb(path) {
       last_seen   INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_gw_status_polled ON gateway_status(polled_at);
+
+    -- User-annotated events. sensor_id is NULL for global events (visible on
+    -- every sensor's chart); non-NULL events are sensor-scoped and only show
+    -- when that sensor is selected.
+    CREATE TABLE IF NOT EXISTS events (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts        INTEGER NOT NULL,
+      sensor_id TEXT,
+      label     TEXT NOT NULL,
+      note      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_ts        ON events(ts);
+    CREATE INDEX IF NOT EXISTS idx_events_sensor_id ON events(sensor_id);
   `);
   // Migrate existing DBs that predate the excluded columns.
   for (const [table, col] of [['readings', 'excluded'], ['hourly_agg', 'excluded']]) {
@@ -673,4 +686,59 @@ export function setLastPollTime(db, epochMs) {
 export function getLastPollTime(db) {
   const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get('last_poll');
   return row ? parseInt(row.value, 10) : null;
+}
+
+// ── Events ───────────────────────────────────────────────────────────────
+// User-annotated events overlaid on the Explorer chart. sensor_id NULL =
+// global (shown on every chart); non-NULL = sensor-scoped.
+
+export function createEvent(db, { ts, sensorId, label, note }) {
+  const r = db.prepare(`
+    INSERT INTO events (ts, sensor_id, label, note) VALUES (?, ?, ?, ?)
+  `).run(ts, sensorId ?? null, label, note ?? null);
+  return getEventById(db, r.lastInsertRowid);
+}
+
+export function getEventById(db, id) {
+  return db.prepare(`SELECT id, ts, sensor_id AS sensorId, label, note FROM events WHERE id = ?`).get(id) ?? null;
+}
+
+// Filter by [from, to] ts bounds and/or sensor_id. When sensorId is provided,
+// returns events for that sensor AND global events (sensor_id IS NULL) — the
+// UI shows global events on every chart. Pass sensorId='__global__' to fetch
+// only globals; omit the param to fetch everything.
+export function listEvents(db, { from, to, sensorId } = {}) {
+  const conds = [];
+  const args  = [];
+  if (from != null) { conds.push('ts >= ?'); args.push(from); }
+  if (to   != null) { conds.push('ts <= ?'); args.push(to);   }
+  if (sensorId === '__global__') {
+    conds.push('sensor_id IS NULL');
+  } else if (sensorId) {
+    conds.push('(sensor_id = ? OR sensor_id IS NULL)');
+    args.push(sensorId);
+  }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  return db.prepare(`
+    SELECT id, ts, sensor_id AS sensorId, label, note
+    FROM events ${where}
+    ORDER BY ts DESC
+  `).all(...args);
+}
+
+export function updateEvent(db, id, patch) {
+  const cur = getEventById(db, id);
+  if (!cur) return null;
+  const ts       = patch.ts       !== undefined ? patch.ts       : cur.ts;
+  const sensorId = patch.sensorId !== undefined ? patch.sensorId : cur.sensorId;
+  const label    = patch.label    !== undefined ? patch.label    : cur.label;
+  const note     = patch.note     !== undefined ? patch.note     : cur.note;
+  db.prepare(`UPDATE events SET ts = ?, sensor_id = ?, label = ?, note = ? WHERE id = ?`)
+    .run(ts, sensorId ?? null, label, note ?? null, id);
+  return getEventById(db, id);
+}
+
+export function deleteEvent(db, id) {
+  const r = db.prepare(`DELETE FROM events WHERE id = ?`).run(id);
+  return r.changes > 0;
 }

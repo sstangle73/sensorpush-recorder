@@ -654,6 +654,95 @@ header .spacer { flex: 1; }
 }
 #toast.show { opacity: 1; }
 
+/* ── Events ── */
+#add-event-btn {
+  padding: 4px 11px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--text2);
+  cursor: pointer; font-size: 12px;
+}
+#add-event-btn:hover { color: var(--text); }
+#event-modal-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.55);
+  z-index: 300;
+  display: none; align-items: center; justify-content: center;
+}
+#event-modal-backdrop.show { display: flex; }
+#event-modal {
+  background: var(--bg2); border: 1px solid var(--bg4);
+  border-radius: 8px; padding: 18px 20px;
+  min-width: 320px; max-width: 440px; width: 92vw;
+  box-shadow: 0 10px 30px rgba(0,0,0,.55);
+}
+#event-modal h3 {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  margin-bottom: 12px;
+}
+#event-modal label {
+  display: block; font-size: 11px; color: var(--text2); margin: 9px 0 3px;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+#event-modal input, #event-modal textarea, #event-modal select {
+  width: 100%; padding: 6px 9px; border-radius: 4px;
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text); font-size: 13px; font-family: inherit;
+}
+#event-modal input[type="datetime-local"] { color-scheme: dark; }
+#event-modal textarea { resize: vertical; min-height: 60px; }
+#event-modal .em-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+  margin-top: 14px;
+}
+#event-modal .em-err {
+  color: var(--excl); font-size: 11px; min-height: 14px; margin-top: 6px;
+}
+
+/* Chart event markers */
+.ev-marker-line { pointer-events: none; }
+.ev-marker-hit  { cursor: pointer; }
+
+/* Live tab recent-events list */
+.rt-events-section {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px 14px; margin-bottom: 14px;
+}
+.rt-events-title {
+  font-size: 11px; font-weight: 600; color: var(--text2);
+  text-transform: uppercase; letter-spacing: .05em;
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.rt-events-empty { color: var(--text3); font-size: 12px; padding: 4px 0; }
+.rt-event-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 6px 0; border-top: 1px solid var(--border);
+}
+.rt-event-row:first-of-type { border-top: none; }
+.rt-event-time {
+  color: var(--text3); font-size: 11px; min-width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+.rt-event-body { flex: 1; min-width: 0; }
+.rt-event-label {
+  color: var(--text); font-size: 13px;
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+}
+.rt-event-scope {
+  color: var(--accent); font-size: 10px;
+  border: 1px solid var(--border); border-radius: 9px;
+  padding: 0 6px; flex-shrink: 0;
+}
+.rt-event-scope.global { color: var(--text2); }
+.rt-event-note {
+  color: var(--text2); font-size: 12px; margin-top: 2px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.rt-event-del {
+  background: none; border: none; color: var(--text3);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px;
+}
+.rt-event-del:hover { color: var(--excl); }
+
 /* ── Sensor chips (mobile sidebar replacement) ── */
 #sensor-chips {
   display: none; flex-shrink: 0; overflow-x: auto;
@@ -734,6 +823,7 @@ header .spacer { flex: 1; }
       <div id="range-btns"></div>
       <button id="custom-range-btn" class="range-btn" onclick="toggleCustomRange()">Custom…</button>
       <button id="zoom-reset" onclick="resetZoom()">✕ Reset zoom</button>
+      <button id="add-event-btn" onclick="openEventModal()" title="Annotate the chart with a labeled event">＋ Add event</button>
       <div class="ctrl-sep"></div>
       <span id="mode-hint"></span>
       <button id="edit-btn" onclick="toggleEditMode()">Edit</button>
@@ -848,6 +938,27 @@ header .spacer { flex: 1; }
     <h2>App</h2>
     <button class="set-btn danger" onclick="hardRefresh()">Clear cache &amp; refresh</button>
     <p class="set-hint">Unregisters the service worker, clears the PWA cache, and reloads to pick up the latest version.</p>
+  </div>
+</div>
+
+<div id="event-modal-backdrop" onclick="onEventModalBackdropClick(event)">
+  <div id="event-modal" onclick="event.stopPropagation()">
+    <h3 id="event-modal-title">Add event</h3>
+    <input type="hidden" id="event-id">
+    <label for="event-ts">Timestamp</label>
+    <input type="datetime-local" id="event-ts">
+    <label for="event-sensor">Sensor (optional — leave as "Global" to show on every chart)</label>
+    <select id="event-sensor"></select>
+    <label for="event-label">Label <span style="color:var(--excl)">*</span></label>
+    <input type="text" id="event-label" maxlength="120" placeholder="e.g. furnace cleaned">
+    <label for="event-note">Note</label>
+    <textarea id="event-note" maxlength="2000" placeholder="Optional free-text details"></textarea>
+    <div class="em-err" id="event-err"></div>
+    <div class="em-actions">
+      <button class="set-btn" id="event-delete-btn" onclick="deleteEventFromModal()" style="display:none;color:var(--excl)">Delete</button>
+      <button class="set-btn" onclick="closeEventModal()">Cancel</button>
+      <button class="set-btn" onclick="saveEventFromModal()" style="border-color:var(--accent);color:var(--accent)">Save</button>
+    </div>
   </div>
 </div>
 
@@ -976,6 +1087,10 @@ let _gateways             = [];   // [{ id, name, lastSeen, version, paired, ...
 // _realtimeHistory: id → { samples: [{ ts, temperature, humidity, baroPressure, dewpoint, vpd }] }
 let _realtimeHistory      = {};
 let _realtimeLoading      = false;
+
+// User-annotated events overlaid on the Explorer chart and listed on Live.
+// Loaded once on init and refreshed by event create/update/delete actions.
+let _events = []; // [{ id, ts, sensorId, label, note }]
 
 // Hour-of-day baselines (14-day rolling) used to flag readings that are
 // unusual for *this* time of day. Refreshed once an hour — baselines change
@@ -1310,6 +1425,7 @@ async function loadRealtime() {
     // Refresh baselines in the background — gated by TTL inside the call
     // so this is a no-op most ticks. Doesn't block the render.
     loadLiveBaselines().catch(() => {});
+    await loadEvents();
     renderRealtime();
   } finally {
     _realtimeLoading = false;
@@ -1635,15 +1751,47 @@ function renderRealtime() {
   const useTwoCol = houseSections.length > 0 && otherSections.length > 0;
   grid.classList.toggle('two-col', useTwoCol);
 
+  const eventsHTML = renderRecentEventsSection();
+
   if (!houseSections.length && !otherSections.length) {
-    grid.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+    grid.innerHTML = eventsHTML + `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
   } else if (useTwoCol) {
-    grid.innerHTML =
+    grid.innerHTML = eventsHTML +
       `<div class="rt-col">${houseSections.join('')}</div>` +
       `<div class="rt-col">${otherSections.join('')}</div>`;
   } else {
-    grid.innerHTML = houseSections.concat(otherSections).join('');
+    grid.innerHTML = eventsHTML + houseSections.concat(otherSections).join('');
   }
+}
+
+// Render the "Recent events" panel that sits above the live cards. Shows the
+// 10 most recent events across all sensors (global + sensor-scoped).
+function renderRecentEventsSection() {
+  const recent = _events.slice(0, 10);
+  let body;
+  if (!recent.length) {
+    body = `<div class="rt-events-empty">No events yet — annotate the chart with the “＋ Add event” button on the Explorer tab.</div>`;
+  } else {
+    body = recent.map(e => {
+      const when  = fmtTs(e.ts * 1000);
+      const scope = e.sensorId
+        ? `<span class="rt-event-scope">${esc(_sensors[e.sensorId]?.name || e.sensorId)}</span>`
+        : `<span class="rt-event-scope global">Global</span>`;
+      const note = e.note ? `<div class="rt-event-note">${esc(e.note)}</div>` : '';
+      return `<div class="rt-event-row">
+        <div class="rt-event-time">${esc(when)}</div>
+        <div class="rt-event-body">
+          <div class="rt-event-label">${scope}<span>${esc(e.label)}</span></div>
+          ${note}
+        </div>
+        <button class="rt-event-del" title="Delete" onclick="deleteEventById(${e.id})">×</button>
+      </div>`;
+    }).join('');
+  }
+  return `<section class="rt-events-section">
+    <div class="rt-events-title">Recent events <span style="color:var(--text3);font-weight:400">${recent.length} of ${_events.length}</span></div>
+    ${body}
+  </section>`;
 }
 
 // ── Stats view ────────────────────────────────────────────────────────────
@@ -2977,6 +3125,7 @@ async function init() {
     }
 
     renderSidebar();
+    await loadEvents();
     await refreshChart();
     updateLastUpdatedLabel();
     startAutoRefresh();
@@ -4126,6 +4275,24 @@ function renderChart() {
     }
   }
 
+  // ── Event markers ──
+  // Vertical line spanning all panels at each event's ts, plus a clickable
+  // triangle anchor in the top axis margin. Sensor-scoped events appear only
+  // when their sensor is selected; global events (sensorId == null) appear
+  // for every chart.
+  const visibleEvents = visibleEventsForChart(_events, _selected);
+  let eventSvg = '';
+  const eventHits = []; // { id, cx, top }
+  for (const ev of visibleEvents) {
+    const cx = eventMarkerX(ev.ts, xMin, xMax, PL, cW);
+    if (cx == null) continue;
+    const cxStr = cx.toFixed(1);
+    eventSvg +=
+      `<line x1="${cxStr}" y1="${PT}" x2="${cxStr}" y2="${chartBottom}" stroke="#f0b942" stroke-width="1" stroke-dasharray="2,3" opacity=".55" class="ev-marker-line"/>` +
+      `<polygon points="${cxStr},${PT - 2} ${(+cxStr - 6).toFixed(1)},${PT - 12} ${(+cxStr + 6).toFixed(1)},${PT - 12}" fill="#f0b942" class="ev-marker-hit" data-evid="${ev.id}"/>`;
+    eventHits.push({ id: ev.id, cx, top: PT });
+  }
+
   // Selection rectangle (updated dynamically on drag)
   const selRectSvg = `<rect id="sel-rect" x="0" y="${PT}" width="0" height="${chartBottom-PT}" fill="var(--accent)" fill-opacity=".08" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4,4" display="none"/>`;
 
@@ -4138,7 +4305,7 @@ function renderChart() {
   const chartCursor = _editMode ? 'crosshair' : 'crosshair';
 
   wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" id="chart">
-    ${gridSvg}${axesSvg}${labelSvg}${xLabels}${thresholdSvg}${dataSvg}${hitSvg}
+    ${gridSvg}${axesSvg}${labelSvg}${xLabels}${thresholdSvg}${dataSvg}${eventSvg}${hitSvg}
   </svg>`;
 
   // ── Legend ──
@@ -4304,9 +4471,41 @@ function renderChart() {
 
   // Restore excluded point by clicking its ✕ marker (edit mode only)
   svgEl.addEventListener('click', async e => {
+    // Event-marker click: open edit modal (works in any mode)
+    const ev = e.target.closest('.ev-marker-hit');
+    if (ev) {
+      const id = parseInt(ev.dataset.evid, 10);
+      const found = _events.find(x => x.id === id);
+      if (found) openEventModal(found);
+      return;
+    }
     if (!_editMode) return;
     const x = e.target.closest('.excl-x');
     if (x) await excludeToggle(x.dataset.sid, parseInt(x.dataset.ts), false, x.dataset.res);
+  });
+
+  // Show a small tooltip on event-marker hover
+  svgEl.addEventListener('mouseover', e => {
+    const ev = e.target.closest('.ev-marker-hit');
+    if (!ev) return;
+    const id = parseInt(ev.dataset.evid, 10);
+    const found = _events.find(x => x.id === id);
+    if (!found) return;
+    const wr  = wrapEl.getBoundingClientRect();
+    const rect = ev.getBoundingClientRect();
+    const scopeName = found.sensorId
+      ? (_sensors[found.sensorId]?.name || found.sensorId)
+      : 'Global';
+    tooltip.innerHTML = `
+      <div class="tt-time">${esc(scopeName)} · ${fmtTs(found.ts * 1000)}</div>
+      <div class="tt-row"><span class="tt-name">${esc(found.label)}</span></div>
+      ${found.note ? `<div class="tt-row" style="white-space:pre-wrap"><span class="tt-name">${esc(found.note)}</span></div>` : ''}`;
+    tooltip.style.display = 'block';
+    tooltip.style.left = (rect.left - wr.left + 14) + 'px';
+    tooltip.style.top  = Math.max(0, rect.top  - wr.top  - 6) + 'px';
+  });
+  svgEl.addEventListener('mouseout', e => {
+    if (e.target.closest('.ev-marker-hit')) tooltip.style.display = 'none';
   });
 
   // Touch: tap to show tooltip, auto-hide after 3 s
@@ -4392,6 +4591,117 @@ const _longHoldConsumed = (() => {
 
   return () => { if (fired) { fired = false; return true; } return false; };
 })();
+
+// ── Events ────────────────────────────────────────────────────────────────
+// Marker x coordinate for an event ts (seconds) given the chart's current
+// visible time window. Returns null when the event lies outside [xMin, xMax].
+// Pure math — also exercised by tests/ui-helpers.test.js.
+function eventMarkerX(eventTsSec, xMinMs, xMaxMs, PL, cW) {
+  const tsMs = eventTsSec * 1000;
+  if (tsMs < xMinMs || tsMs > xMaxMs) return null;
+  if (xMaxMs <= xMinMs) return null;
+  return PL + (tsMs - xMinMs) / (xMaxMs - xMinMs) * cW;
+}
+
+// Filter events for chart display: a global event (sensorId == null) is
+// always shown; a sensor-scoped event only when that sensor is among
+// `selectedIds`.
+function visibleEventsForChart(events, selectedIds) {
+  const sel = selectedIds instanceof Set ? selectedIds : new Set(selectedIds);
+  return events.filter(e => e.sensorId == null || sel.has(e.sensorId));
+}
+
+async function loadEvents() {
+  try {
+    const r = await fetch(`${API_BASE}/events`).then(r => r.json());
+    if (r?.ok) _events = r.events;
+  } catch (_) { /* keep prior cache */ }
+}
+
+// ── Modal ────────────────────────────────────────────────────────────────
+function _toLocalDatetimeValue(date) {
+  // <input type="datetime-local"> wants 'YYYY-MM-DDTHH:MM' in local time.
+  const pad = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`
+       + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function openEventModal(existing = null) {
+  const backdrop = document.getElementById('event-modal-backdrop');
+  document.getElementById('event-id').value     = existing?.id ?? '';
+  document.getElementById('event-label').value  = existing?.label ?? '';
+  document.getElementById('event-note').value   = existing?.note  ?? '';
+  document.getElementById('event-err').textContent = '';
+  document.getElementById('event-modal-title').textContent = existing ? 'Edit event' : 'Add event';
+  document.getElementById('event-delete-btn').style.display = existing ? '' : 'none';
+  const ts = existing ? new Date(existing.ts * 1000) : new Date();
+  document.getElementById('event-ts').value = _toLocalDatetimeValue(ts);
+  const sel = document.getElementById('event-sensor');
+  sel.innerHTML = '<option value="">Global (every chart)</option>' +
+    Object.values(_sensors).map(s => `<option value="${esc(s.id)}">${esc(s.name || s.id)}</option>`).join('');
+  sel.value = existing?.sensorId ?? '';
+  backdrop.classList.add('show');
+  setTimeout(() => document.getElementById('event-label').focus(), 50);
+}
+function closeEventModal() {
+  document.getElementById('event-modal-backdrop').classList.remove('show');
+}
+function onEventModalBackdropClick(e) {
+  if (e.target.id === 'event-modal-backdrop') closeEventModal();
+}
+
+async function saveEventFromModal() {
+  const id       = document.getElementById('event-id').value;
+  const tsRaw    = document.getElementById('event-ts').value;
+  const sensorId = document.getElementById('event-sensor').value || null;
+  const label    = document.getElementById('event-label').value.trim();
+  const note     = document.getElementById('event-note').value;
+  const err      = document.getElementById('event-err');
+  err.textContent = '';
+  if (!label) { err.textContent = 'Label is required'; return; }
+  if (!tsRaw) { err.textContent = 'Timestamp is required'; return; }
+  const ts = Math.floor(new Date(tsRaw).getTime() / 1000);
+  if (!isFinite(ts) || ts <= 0) { err.textContent = 'Invalid timestamp'; return; }
+
+  const body = { ts, sensor_id: sensorId, label, note: note || null };
+  const url    = id ? `${API_BASE}/events/${encodeURIComponent(id)}` : `${API_BASE}/events`;
+  const method = id ? 'PATCH' : 'POST';
+  try {
+    const r = await fetch(url, {
+      method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) { err.textContent = j.error || 'Save failed'; return; }
+    await loadEvents();
+    closeEventModal();
+    if (_currentView === 'explorer')      renderChart();
+    else if (_currentView === 'realtime') renderRealtime();
+  } catch (e) { err.textContent = e.message || 'Save failed'; }
+}
+
+async function deleteEventFromModal() {
+  const id = document.getElementById('event-id').value;
+  if (!id) return;
+  if (!confirm('Delete this event?')) return;
+  try {
+    const r = await fetch(`${API_BASE}/events/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) { document.getElementById('event-err').textContent = 'Delete failed'; return; }
+    await loadEvents();
+    closeEventModal();
+    if (_currentView === 'explorer')      renderChart();
+    else if (_currentView === 'realtime') renderRealtime();
+  } catch (e) { document.getElementById('event-err').textContent = e.message || 'Delete failed'; }
+}
+
+async function deleteEventById(id) {
+  if (!confirm('Delete this event?')) return;
+  try {
+    await fetch(`${API_BASE}/events/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    await loadEvents();
+    if (_currentView === 'realtime') renderRealtime();
+    else if (_currentView === 'explorer') renderChart();
+  } catch (_) {}
+}
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 init();

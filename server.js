@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, createEvent, listEvents, updateEvent, deleteEvent, getEventById } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
@@ -599,6 +599,94 @@ export function createApp(db, config = null) {
   });
 
   app.get('/ui', (_req, res) => res.setHeader('Content-Type', 'text/html').send(UI_HTML));
+
+  // ── Events ──────────────────────────────────────────────────────────────
+  // User-annotated events overlaid on the Explorer chart. Bearer-protected
+  // via the middleware above (not in PUBLIC_PATHS, no UI bypass).
+  app.post('/events', (req, res) => {
+    const { ts, sensor_id, label, note } = req.body ?? {};
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) {
+      return res.status(400).json({ ok: false, error: 'ts (number, epoch seconds) is required' });
+    }
+    if (typeof label !== 'string' || !label.trim()) {
+      return res.status(400).json({ ok: false, error: 'label (non-empty string) is required' });
+    }
+    if (sensor_id != null && typeof sensor_id !== 'string') {
+      return res.status(400).json({ ok: false, error: 'sensor_id must be a string or null' });
+    }
+    if (note != null && typeof note !== 'string') {
+      return res.status(400).json({ ok: false, error: 'note must be a string or null' });
+    }
+    if (sensor_id) {
+      const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensor_id);
+      if (!sensor) return res.status(400).json({ ok: false, error: 'sensor_id does not match any sensor' });
+    }
+    const ev = createEvent(db, { ts, sensorId: sensor_id ?? null, label: label.trim(), note: note ?? null });
+    res.json({ ok: true, event: ev });
+  });
+
+  app.get('/events', (req, res) => {
+    const opts = {};
+    if (req.query.from != null) {
+      const v = parseInt(req.query.from, 10);
+      if (!isFinite(v)) return res.status(400).json({ ok: false, error: 'from must be an integer (epoch seconds)' });
+      opts.from = v;
+    }
+    if (req.query.to != null) {
+      const v = parseInt(req.query.to, 10);
+      if (!isFinite(v)) return res.status(400).json({ ok: false, error: 'to must be an integer (epoch seconds)' });
+      opts.to = v;
+    }
+    if (req.query.sensor_id) opts.sensorId = String(req.query.sensor_id);
+    const events = listEvents(db, opts);
+    res.json({ ok: true, events });
+  });
+
+  app.patch('/events/:id', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!isFinite(id)) return res.status(400).json({ ok: false, error: 'id must be an integer' });
+    if (!getEventById(db, id)) return res.status(404).json({ ok: false, error: 'event not found' });
+    const patch = {};
+    const { ts, sensor_id, label, note } = req.body ?? {};
+    if (ts !== undefined) {
+      if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) {
+        return res.status(400).json({ ok: false, error: 'ts must be a positive number' });
+      }
+      patch.ts = ts;
+    }
+    if (sensor_id !== undefined) {
+      if (sensor_id !== null && typeof sensor_id !== 'string') {
+        return res.status(400).json({ ok: false, error: 'sensor_id must be a string or null' });
+      }
+      if (sensor_id) {
+        const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensor_id);
+        if (!sensor) return res.status(400).json({ ok: false, error: 'sensor_id does not match any sensor' });
+      }
+      patch.sensorId = sensor_id;
+    }
+    if (label !== undefined) {
+      if (typeof label !== 'string' || !label.trim()) {
+        return res.status(400).json({ ok: false, error: 'label must be a non-empty string' });
+      }
+      patch.label = label.trim();
+    }
+    if (note !== undefined) {
+      if (note !== null && typeof note !== 'string') {
+        return res.status(400).json({ ok: false, error: 'note must be a string or null' });
+      }
+      patch.note = note;
+    }
+    const ev = updateEvent(db, id, patch);
+    res.json({ ok: true, event: ev });
+  });
+
+  app.delete('/events/:id', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!isFinite(id)) return res.status(400).json({ ok: false, error: 'id must be an integer' });
+    const ok = deleteEvent(db, id);
+    if (!ok) return res.status(404).json({ ok: false, error: 'event not found' });
+    res.json({ ok: true });
+  });
 
   return app;
 }
