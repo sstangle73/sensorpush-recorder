@@ -985,6 +985,60 @@ header .spacer { flex: 1; }
   </div>
 
   <div class="set-section">
+    <h2>Notifications</h2>
+    <p class="set-hint" style="margin-bottom:10px">Outbound alerts to a webhook URL or ntfy.sh topic. Each enabled condition fires once on the transition into "active" and once on the transition back to "recovered". Stuck conditions don't re-buzz.</p>
+
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px">
+      <input type="checkbox" id="notif-master-enabled"> <b>Enable notifications</b>
+    </label>
+
+    <div class="set-subheader">Sinks</div>
+    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-width:120px">
+          <input type="checkbox" id="notif-webhook-enabled"> Webhook
+        </label>
+        <input type="url" id="notif-webhook-url" class="set-text-input" placeholder="https://example.com/hook" style="flex:1;min-width:200px">
+        <button class="set-btn" onclick="testNotif('webhook')">Test</button>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-width:120px">
+          <input type="checkbox" id="notif-ntfy-enabled"> ntfy.sh
+        </label>
+        <input type="url" id="notif-ntfy-url" class="set-text-input" placeholder="https://ntfy.sh/your-topic" style="flex:1;min-width:200px">
+        <input type="text" id="notif-ntfy-token" class="set-text-input" placeholder="Bearer token (optional)" style="flex:0 0 200px">
+        <button class="set-btn" onclick="testNotif('ntfy')">Test</button>
+      </div>
+      <div id="notif-test-status" style="font-size:12px;color:var(--text2);min-height:16px"></div>
+    </div>
+
+    <div class="set-subheader">Conditions</div>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+        <input type="checkbox" id="notif-cond-threshold"> Threshold breach <span style="color:var(--text3);font-size:11px">— SensorPush min/max alerts cross</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+        <input type="checkbox" id="notif-cond-anomaly"> Anomaly <span style="color:var(--text3);font-size:11px">— deviates &gt;2σ from 14-day hour-of-day baseline</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
+        <input type="checkbox" id="notif-cond-sensor-offline"> Sensor offline
+        <span style="color:var(--text3);font-size:11px">— no reading in</span>
+        <input type="number" id="notif-cond-sensor-offline-mins" min="5" step="5" value="30" style="width:60px" class="set-text-input"> <span style="color:var(--text3);font-size:11px">min</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
+        <input type="checkbox" id="notif-cond-gateway-offline"> Gateway offline
+        <span style="color:var(--text3);font-size:11px">— last_seen older than</span>
+        <input type="number" id="notif-cond-gateway-offline-mins" min="5" step="5" value="15" style="width:60px" class="set-text-input"> <span style="color:var(--text3);font-size:11px">min</span>
+      </label>
+    </div>
+
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="set-btn" onclick="saveNotifications()">Save</button>
+      <span id="notif-save-status" style="font-size:12px;color:var(--text2)"></span>
+    </div>
+  </div>
+
+  <div class="set-section">
     <h2>Security</h2>
     <p class="set-hint" style="margin-bottom:10px">A bearer token gates non-public routes. Browsers loading the Explorer UI from this hostname bypass it via <code>Sec-Fetch-Site: same-origin</code>; cross-origin programmatic callers (the rosestorie dashboard, etc.) must include <code>Authorization: Bearer &lt;token&gt;</code>.</p>
     <div id="auth-state" style="margin-bottom:10px;font-size:13px;color:var(--text2)">Loading…</div>
@@ -3739,6 +3793,9 @@ async function loadSettings() {
       if (resp.settings.hvac !== undefined) {
         _settings.hvac = resp.settings.hvac;
       }
+      if (resp.settings.notifications !== undefined) {
+        _settings.notifications = resp.settings.notifications;
+      }
       return;
     }
   } catch(e) {}
@@ -3775,6 +3832,91 @@ async function renderSettings() {
     if (state.status === 'running') _schedulePollBackfill();
   } catch(e) {}
   renderAuthSection();
+  renderNotifications();
+}
+
+// ── Notifications panel ──────────────────────────────────────────────────
+function renderNotifications() {
+  const n = _settings.notifications || {};
+  document.getElementById('notif-master-enabled').checked   = !!n.enabled;
+  document.getElementById('notif-webhook-enabled').checked  = !!n.webhook?.enabled;
+  document.getElementById('notif-webhook-url').value        = n.webhook?.url || '';
+  document.getElementById('notif-ntfy-enabled').checked     = !!n.ntfy?.enabled;
+  document.getElementById('notif-ntfy-url').value           = n.ntfy?.url || '';
+  document.getElementById('notif-ntfy-token').value         = n.ntfy?.token || '';
+  const c = n.conditions || {};
+  document.getElementById('notif-cond-threshold').checked        = !!c.threshold?.enabled;
+  document.getElementById('notif-cond-anomaly').checked          = !!c.anomaly?.enabled;
+  document.getElementById('notif-cond-sensor-offline').checked   = !!c.sensorOffline?.enabled;
+  document.getElementById('notif-cond-gateway-offline').checked  = !!c.gatewayOffline?.enabled;
+  if (c.sensorOffline?.thresholdSecs)  document.getElementById('notif-cond-sensor-offline-mins').value  = Math.round(c.sensorOffline.thresholdSecs / 60);
+  if (c.gatewayOffline?.thresholdSecs) document.getElementById('notif-cond-gateway-offline-mins').value = Math.round(c.gatewayOffline.thresholdSecs / 60);
+}
+
+function _collectNotifications() {
+  const sensorMins  = parseInt(document.getElementById('notif-cond-sensor-offline-mins').value,  10) || 30;
+  const gatewayMins = parseInt(document.getElementById('notif-cond-gateway-offline-mins').value, 10) || 15;
+  return {
+    enabled: document.getElementById('notif-master-enabled').checked,
+    webhook: {
+      enabled: document.getElementById('notif-webhook-enabled').checked,
+      url:     document.getElementById('notif-webhook-url').value.trim(),
+    },
+    ntfy: {
+      enabled: document.getElementById('notif-ntfy-enabled').checked,
+      url:     document.getElementById('notif-ntfy-url').value.trim(),
+      token:   document.getElementById('notif-ntfy-token').value.trim(),
+    },
+    conditions: {
+      threshold:      { enabled: document.getElementById('notif-cond-threshold').checked },
+      anomaly:        { enabled: document.getElementById('notif-cond-anomaly').checked },
+      sensorOffline:  { enabled: document.getElementById('notif-cond-sensor-offline').checked,  thresholdSecs: sensorMins  * 60 },
+      gatewayOffline: { enabled: document.getElementById('notif-cond-gateway-offline').checked, thresholdSecs: gatewayMins * 60 },
+    },
+  };
+}
+
+async function saveNotifications() {
+  const notifications = _collectNotifications();
+  _settings.notifications = notifications;
+  const status = document.getElementById('notif-save-status');
+  status.textContent = 'Saving…';
+  try {
+    const r = await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_settings),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    status.textContent = 'Saved ✓';
+    showToast('Notifications saved ✓');
+  } catch (e) {
+    status.textContent = 'Save failed: ' + e.message;
+    showToast('Save failed: ' + e.message);
+  }
+}
+
+async function testNotif(sink) {
+  const notifications = _collectNotifications();
+  const status = document.getElementById('notif-test-status');
+  status.textContent = 'Sending test…';
+  try {
+    const r = await fetch(`${API_BASE}/settings/notifications/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sink, notifications }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    const parts = Object.entries(data.results || {}).map(([k, v]) =>
+      v.ok ? `${k}: ✓ delivered` : `${k}: ✗ ${v.error}`);
+    status.innerHTML = parts.length ? parts.join(' · ') : 'No sinks dispatched';
+    showToast('Test sent');
+  } catch (e) {
+    status.textContent = 'Test failed: ' + e.message;
+    showToast('Test failed: ' + e.message);
+  }
 }
 
 // ── HVAC settings editor ────────────────────────────────────────────────

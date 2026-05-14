@@ -463,6 +463,104 @@ describe('GET /backfill/status', () => {
   });
 });
 
+describe('POST /settings/notifications/test', () => {
+  // We don't want real network calls — for the test endpoint we just check
+  // that validation/routing works. Pointing at an unreachable URL returns
+  // ok:true with a per-sink error string, which is the documented contract.
+  async function post(path, body) {
+    const res = await fetch(baseUrl + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('400s on unknown sink', async () => {
+    const { status } = await post('/settings/notifications/test', { sink: 'pagerduty' });
+    expect(status).toBe(400);
+  });
+
+  it('400s when nothing is configured (no sinks)', async () => {
+    const { status, body } = await post('/settings/notifications/test', {
+      notifications: { enabled: true, webhook: { enabled: false, url: '' } },
+      sink: 'all',
+    });
+    expect(status).toBe(400);
+    expect(body.error).toMatch(/No matching sink/);
+  });
+
+  it('400s on malformed override', async () => {
+    const { status } = await post('/settings/notifications/test', {
+      notifications: { weird: true },
+    });
+    expect(status).toBe(400);
+  });
+
+  it('returns per-sink results when an override is provided', async () => {
+    // Unreachable host → result reports {ok:false, error:...}. The endpoint
+    // itself is ok:true because the request was well-formed.
+    const { status, body } = await post('/settings/notifications/test', {
+      sink: 'webhook',
+      notifications: {
+        enabled: true,
+        webhook: { enabled: true, url: 'http://127.0.0.1:1/nope' },
+      },
+    });
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.results.webhook).toBeDefined();
+    expect(body.results.webhook.ok).toBe(false);
+  });
+});
+
+describe('GET /settings/notifications/state', () => {
+  it('returns an empty list initially', async () => {
+    const res  = await fetch(baseUrl + '/settings/notifications/state');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(Array.isArray(body.states)).toBe(true);
+  });
+});
+
+describe('PUT /settings — notifications validation', () => {
+  it('accepts a valid notifications config alongside ranges', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h', '24h'],
+        notifications: {
+          enabled: true,
+          webhook: { enabled: true, url: 'https://example.com/hook' },
+          conditions: {
+            threshold:      { enabled: true },
+            sensorOffline:  { enabled: true, thresholdSecs: 1800 },
+            gatewayOffline: { enabled: false, thresholdSecs: 900 },
+          },
+        },
+      }),
+    });
+    expect(r.status).toBe(200);
+    const get = await fetch(baseUrl + '/settings').then(r => r.json());
+    expect(get.settings.notifications.enabled).toBe(true);
+    expect(get.settings.notifications.webhook.url).toBe('https://example.com/hook');
+  });
+
+  it('rejects a malformed notifications blob', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h'],
+        notifications: { unknownKey: 1 },
+      }),
+    });
+    expect(r.status).toBe(400);
+  });
+});
+
 describe('GET/PUT /settings', () => {
   it('GET returns ok with empty object initially', async () => {
     const { status, body } = await get('/settings');

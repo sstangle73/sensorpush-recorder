@@ -3,11 +3,12 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, createEvent, listEvents, updateEvent, deleteEvent, getEventById } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates } from './db.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
 import { detectCycles, pickDefaultThermostatSensor } from './hvac.js';
+import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
@@ -628,7 +629,7 @@ export function createApp(db, config = null) {
   });
 
   app.put('/settings', (req, res) => {
-    const { ranges, comfort, hvac } = req.body ?? {};
+    const { ranges, comfort, hvac, notifications } = req.body ?? {};
     if (!Array.isArray(ranges) || !ranges.every(r => /^\d+(h|d|yr)$/.test(r))) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: ranges' });
     }
@@ -638,14 +639,68 @@ export function createApp(db, config = null) {
     if (hvac !== undefined && !_validHvacConfig(hvac)) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: hvac' });
     }
+    if (notifications !== undefined && !validateNotifConfig(notifications)) {
+      return res.status(400).json({ ok: false, error: 'Invalid settings: notifications' });
+    }
     // Merge with whatever else is in the meta blob (future fields stay untouched
     // even when the client only sends ranges, and vice versa).
     const existing = getUiSettings(db) || {};
     const payload = { ...existing, ranges };
-    if (comfort !== undefined) payload.comfort = comfort;
-    if (hvac    !== undefined) payload.hvac    = hvac;
+    if (comfort       !== undefined) payload.comfort       = comfort;
+    if (hvac          !== undefined) payload.hvac          = hvac;
+    if (notifications !== undefined) payload.notifications = notifications;
     setUiSettings(db, payload);
     res.json({ ok: true });
+  });
+
+  // ── Notifications: test dispatch + state inspection ─────────────────────
+  // POST /settings/notifications/test — fire a one-off test message to the
+  // requested sink ('webhook' | 'ntfy' | 'all'). Bypasses the state machine
+  // entirely so repeated clicks always send. Body may include `sink` (default
+  // 'all') and a `notifications` blob overriding the persisted config — lets
+  // the UI test unsaved settings, but defaults to the saved settings when
+  // omitted.
+  app.post('/settings/notifications/test', async (req, res) => {
+    const { sink = 'all', notifications: override } = req.body ?? {};
+    if (!['webhook', 'ntfy', 'all'].includes(sink)) {
+      return res.status(400).json({ ok: false, error: 'sink must be one of: webhook, ntfy, all' });
+    }
+    const settings = getUiSettings(db) || {};
+    const notif = override !== undefined ? override : settings.notifications;
+    if (!validateNotifConfig(override)) {
+      return res.status(400).json({ ok: false, error: 'Invalid notifications config' });
+    }
+    if (!notif) {
+      return res.status(400).json({ ok: false, error: 'No notifications configured' });
+    }
+    const payload = {
+      timestamp:  new Date().toISOString(),
+      key:        'test',
+      transition: 'firing',
+      title:      'SensorPush test notification',
+      message:    'This is a test notification from the SensorPush recorder.',
+      detail:     { test: true },
+    };
+    const results = {};
+    if ((sink === 'webhook' || sink === 'all') && notif.webhook?.url) {
+      results.webhook = await dispatchWebhook(notif.webhook.url, payload);
+    }
+    if ((sink === 'ntfy' || sink === 'all') && notif.ntfy?.url) {
+      results.ntfy = await dispatchNtfy(notif.ntfy.url, payload, { token: notif.ntfy.token });
+    }
+    if (!Object.keys(results).length) {
+      return res.status(400).json({ ok: false, error: 'No matching sink configured (set url to enable)' });
+    }
+    res.json({ ok: true, results });
+  });
+
+  // GET /settings/notifications/state — diagnostic view of the per-condition
+  // dedupe state. Useful from the UI to show "currently firing" alerts and
+  // when they last transitioned. Read-only; resetting state is intentionally
+  // not exposed (a manual SQL DELETE FROM notification_state is the escape
+  // hatch and we don't want a stray click clearing the firing-flags map).
+  app.get('/settings/notifications/state', (_req, res) => {
+    res.json({ ok: true, states: listNotifStates(db) });
   });
 
   // ── Auth (recorder bearer token) ────────────────────────────────────────
