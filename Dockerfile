@@ -5,6 +5,6 @@ WORKDIR /app
 COPY package.json .
 RUN npm install --omit=dev
 
-COPY server.js config.js db.js sensorpush.js poller.js auth.js mqtt.js hvac.js ui.html ./
+COPY server.js config.js db.js sensorpush.js poller.js auth.js mqtt.js hvac.js notifications.js ui.html ./
 
 CMD ["node", "server.js"]
