@@ -704,8 +704,10 @@ header .spacer { flex: 1; }
 /* Live tab recent-events list */
 .rt-events-section {
   background: var(--bg2); border: 1px solid var(--border);
-  border-radius: 6px; padding: 12px 14px; margin-bottom: 14px;
+  border-radius: 6px; padding: 12px 14px;
 }
+/* In two-col layout the events panel spans both columns at the bottom. */
+#realtime-grid.two-col .rt-events-section { grid-column: 1 / -1; }
 .rt-events-title {
   font-size: 11px; font-weight: 600; color: var(--text2);
   text-transform: uppercase; letter-spacing: .05em;
@@ -1754,13 +1756,14 @@ function renderRealtime() {
   const eventsHTML = renderRecentEventsSection();
 
   if (!houseSections.length && !otherSections.length) {
-    grid.innerHTML = eventsHTML + `<div class="rt-empty">No sensors yet — wait for the first poll.</div>`;
+    grid.innerHTML = `<div class="rt-empty">No sensors yet — wait for the first poll.</div>` + eventsHTML;
   } else if (useTwoCol) {
-    grid.innerHTML = eventsHTML +
+    grid.innerHTML =
       `<div class="rt-col">${houseSections.join('')}</div>` +
-      `<div class="rt-col">${otherSections.join('')}</div>`;
+      `<div class="rt-col">${otherSections.join('')}</div>` +
+      eventsHTML;
   } else {
-    grid.innerHTML = eventsHTML + houseSections.concat(otherSections).join('');
+    grid.innerHTML = houseSections.concat(otherSections).join('') + eventsHTML;
   }
 }
 
