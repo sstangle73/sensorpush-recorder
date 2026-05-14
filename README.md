@@ -13,11 +13,11 @@ Polls the SensorPush cloud every 5 minutes, stores all readings locally in SQLit
 - **Gap analysis** — detects missing windows (interior, leading, and trailing), sparse hours, and per-gap gateway-online status. A dead sensor reports as one big trailing gap, not as 100% coverage.
 - **Targeted backfill** — "Fix all gaps" button re-fetches only the windows the local DB shows as missing, instead of broadly re-pulling the whole range.
 - **Data QA** — exclude individual readings or whole hourly buckets from charts and aggregates; hourly aggregates auto-recompute on exclusion.
-- **Explorer UI** — multi-sensor chart with toggleable series (temp, humidity, pressure, dewpoint, heat index, VPD), zoom, edit mode, analytics view with coverage timeline.
+- **Five-tab UI** — Live (real-time cards with feels-like, alert thresholds, anomaly flags), Stats (records, hour/minute-of-day heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle, alert breach history, comfort presets), Explorer (multi-sensor chart with toggleable series, zoom, exclusion edit mode), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings.
 - **PWA** — installable, offline-shell cached via service worker.
 - **Cross-origin friendly** — explicit CORS allowlist so the same recorder can serve a primary dashboard, a kiosk, and local dev.
 - **Self-healing** — daily auto gap-fill at 03:00 plus daily SQLite snapshot to `/data/backups/` (7-day retention).
-- **Battery monitoring** — UI badges sensors with low (≤2.7V) or critical (≤2.5V) battery voltage.
+- **Battery monitoring** — UI badges sensors with low (≤2.7V) or critical (≤2.5V) battery voltage, plus projected days-until-replacement via `/battery`.
 - **CSV export** — `GET /:id/history.csv?range=7d` for spreadsheet analysis.
 
 ## Quick start
@@ -108,7 +108,8 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 |---|---|---|
 | GET | `/health` | `{ok, sensorCount, lastPoll, pollError}` |
 | GET | `/` | sensors list (JSON) or Explorer UI (HTML) |
-| GET | `/gateways` | per-gateway status: name, last seen, version, paired |
+| GET | `/gateways` | per-gateway status; optional `?range=Xd` adds uptime % + primary-sensor count |
+| GET | `/battery` | per-sensor battery voltage trend + projected days-until-replacement |
 | GET | `/:id/history?range=24h` | time series; ranges: `1h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg) |
 | GET | `/:id/history/all?range=7d` | includes excluded points (data QA) |
 | GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition |
@@ -119,7 +120,8 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | POST | `/backfill` | start broad historical re-fetch from `{fromDate: 'YYYY-MM-DD'}` (UTC midnight) |
 | POST | `/backfill-gaps` | start targeted gap-only re-fetch over `{range}` |
 | GET | `/backfill/status` | poll backfill progress (shared by both backfill modes) |
-| GET / PUT | `/settings` | persist Explorer UI preferences |
+| GET / PUT | `/settings` | persist UI preferences (comfort presets, default range, etc.) |
+| GET / POST / DELETE | `/settings/auth` | recorder-token state, generate/rotate, clear file token |
 
 PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.json`.
 
@@ -127,15 +129,18 @@ PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.
 
 ```
 config.js → db.js (SQLite + schema)
+       ↓
+     auth.js → server.js (Express + ui.html)
               ↑
-sensorpush.js (cloud) → poller.js → server.js (Express + ui.html)
+sensorpush.js (cloud) → poller.js
 ```
 
 - **`sensorpush.js`** — 2-step OAuth (email/pw → authorization code → access token, cached 11h); `fetchSensors`, `fetchSamples`, `fetchGateways`.
 - **`poller.js`** — 5-minute loop. On first run backfills 30 days in 2-day chunks. On subsequent runs looks back 24h before the latest reading to catch late-published cloud data (`INSERT OR IGNORE` makes the overlap free). Also pulls gateway status and appends to `gateway_status`. Exposes `triggerPoll`, `triggerBackfill` (broad), `triggerGapBackfill` (targeted).
-- **`db.js`** — schema (`sensors`, `readings`, `hourly_agg`, `gateways`, `gateway_status`, `meta`); migrations on every `openDb()`. Hourly buckets auto-recompute on insert/exclusion changes; zombie rows (sample_count=0) are deleted rather than persisted.
+- **`db.js`** — schema (`sensors`, `readings`, `hourly_agg`, `gateways`, `gateway_status`, `meta`); migrations on every `openDb()`. Hourly buckets auto-recompute on insert/exclusion changes; zombie rows (sample_count=0) are deleted rather than persisted. Also home to battery-forecast and gateway-uptime queries.
+- **`auth.js`** — recorder-token resolution (env > `/data/recorder-token` file > null); generate/set/clear helpers; the bearer middleware in `server.js` calls `getToken()` on every request so rotation takes effect without a restart.
 - **`server.js`** — Express bootstrap + all routes + CORS middleware + procedurally-rendered PNG icons + service worker JS.
-- **`ui.html`** — single-page Explorer with multi-sensor chart, exclusion toggle, zoom, edit mode, analytics view (coverage timeline, gap detail, gateway panel), targeted "Fix all gaps" button.
+- **`ui.html`** — single-page app with 5 tabs (Live / Stats / Explorer / Analytics / Settings). Stats holds records, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle, breach history, battery forecast. Explorer remains the deep-dive chart with edit mode + targeted "Fix all gaps" button.
 
 ## Tests
 
@@ -144,7 +149,7 @@ npm install
 npm test
 ```
 
-192 vitest tests across `db.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `config.test.js`. All run in-memory (no DB or network required); `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively.
+250 vitest tests across 7 files: `auth.test.js`, `config.test.js`, `db.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`. All run in-memory (no DB or network required); `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively.
 
 CI: `.gitlab-ci.yml` runs `npm test` on every push and merge request against a Node 22-alpine runner.
 

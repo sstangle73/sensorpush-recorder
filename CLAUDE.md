@@ -27,16 +27,17 @@ CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.y
 ```
 server.js       — Express bootstrap, all routes, CORS middleware, PWA assets, procedural PNG icons
 config.js       — loadConfig() reads /config/config.local.js via new Function sandbox; parseConfig() exported for tests
-db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking
+db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking; battery history + forecast; gateway uptime + primary-sensor counts
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
 poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune
-ui.html         — self-contained Explorer SPA (multi-sensor chart, exclusion, zoom, analytics view with gateway panel + per-gap gateway annotation)
-tests/          — 192 vitest tests; in-memory SQLite + http.createServer for route tests
+auth.js         — recorder-token resolution (env > /data/recorder-token > null); generate/set/clear helpers; bearer middleware in server.js calls getToken() on every request
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, security/token)
+tests/          — 250 vitest tests across 7 files; in-memory SQLite + http.createServer for route tests
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `db`, `auth`, `poller` → `server`.
 
 ## Configuration
 
@@ -50,7 +51,8 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 
 - **Auth**: `GET /settings/auth` (state), `POST /settings/auth/generate` (bootstrap-only), `POST /settings/auth/rotate` (requires bearer), `DELETE /settings/auth` (clear file token)
 - **Sensors / data**: `GET /` (JSON or HTML), `GET /:id/history`, `GET /:id/history/all`, `GET /:id/gaps`
-- **Gateways**: `GET /gateways`
+- **Battery forecast**: `GET /battery` — per-sensor voltage trend + projected days-until-replacement
+- **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
 - **Settings**: `GET /settings`, `PUT /settings`
@@ -70,11 +72,12 @@ Import graph is acyclic: `config` → `db`, `sensorpush` → `poller` → `serve
 ## Testing
 
 ```bash
-npm test                       # all 192 tests
+npm test                       # all 250 tests
 npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
+- Test files: `auth.test.js` (15), `config.test.js` (7), `db.test.js` (78), `poller.test.js` (26), `sensorpush.test.js` (15), `server.test.js` (65), `ui-helpers.test.js` (44).
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.
