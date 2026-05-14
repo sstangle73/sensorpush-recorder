@@ -580,3 +580,79 @@ describe('priorYearWindow', () => {
     expect(Number.isInteger(r.endTs)).toBe(true);
   });
 });
+
+// ── computeOutdoorDelta ───────────────────────────────────────────────────
+// Duplicated from ui.html (see file header). Update both when changing.
+function computeOutdoorDelta(indoor, outdoor) {
+  if (!indoor || !outdoor) return null;
+  const out = { temp: null, hum: null, dewpoint: null };
+  if (indoor.temp != null && outdoor.temp != null) {
+    out.temp = { indoor: indoor.temp, outdoor: outdoor.temp, delta: indoor.temp - outdoor.temp };
+  }
+  if (indoor.humidity != null && outdoor.humidity != null) {
+    out.hum = { indoor: indoor.humidity, outdoor: outdoor.humidity, delta: indoor.humidity - outdoor.humidity };
+  }
+  if (outdoor.dewpoint != null) {
+    out.dewpoint = { outdoor: outdoor.dewpoint };
+  }
+  if (out.temp == null && out.hum == null && out.dewpoint == null) return null;
+  return out;
+}
+
+describe('computeOutdoorDelta', () => {
+  it('returns null when either side is null', () => {
+    expect(computeOutdoorDelta(null, { temp: 60, humidity: 50, dewpoint: 40 })).toBeNull();
+    expect(computeOutdoorDelta({ temp: 70, humidity: 50 }, null)).toBeNull();
+    expect(computeOutdoorDelta(null, null)).toBeNull();
+  });
+
+  it('computes positive delta when indoor is warmer than outdoor', () => {
+    const d = computeOutdoorDelta({ temp: 72, humidity: 45 }, { temp: 50, humidity: 75, dewpoint: 43 });
+    expect(d.temp.indoor).toBe(72);
+    expect(d.temp.outdoor).toBe(50);
+    expect(d.temp.delta).toBe(22);
+    expect(d.hum.delta).toBe(-30);  // indoor drier than outdoor → negative
+    expect(d.dewpoint.outdoor).toBe(43);
+  });
+
+  it('computes negative delta when indoor is cooler than outdoor', () => {
+    const d = computeOutdoorDelta({ temp: 68, humidity: 50 }, { temp: 90, humidity: 80, dewpoint: 82 });
+    expect(d.temp.delta).toBe(-22);
+    expect(d.hum.delta).toBe(-30);
+  });
+
+  it('returns null temp section when indoor temp is missing, keeps humidity', () => {
+    const d = computeOutdoorDelta({ temp: null, humidity: 50 }, { temp: 60, humidity: 70, dewpoint: 50 });
+    expect(d.temp).toBeNull();
+    expect(d.hum.delta).toBe(-20);
+  });
+
+  it('returns null hum section when outdoor humidity is missing, keeps temp', () => {
+    const d = computeOutdoorDelta({ temp: 70, humidity: 50 }, { temp: 60, humidity: null, dewpoint: 45 });
+    expect(d.temp.delta).toBe(10);
+    expect(d.hum).toBeNull();
+    expect(d.dewpoint.outdoor).toBe(45);
+  });
+
+  it('returns null overall when no axis has matched data', () => {
+    const d = computeOutdoorDelta({ temp: null, humidity: null }, { temp: null, humidity: null, dewpoint: null });
+    expect(d).toBeNull();
+  });
+
+  it('returns just dewpoint when only outdoor.dewpoint is available', () => {
+    // No indoor temp/humidity and no outdoor temp/humidity, but a dewpoint reading.
+    const d = computeOutdoorDelta({ temp: null, humidity: null }, { temp: null, humidity: null, dewpoint: 38 });
+    expect(d).not.toBeNull();
+    expect(d.temp).toBeNull();
+    expect(d.hum).toBeNull();
+    expect(d.dewpoint.outdoor).toBe(38);
+  });
+
+  it('handles zero indoor / zero outdoor values (no truthiness bug)', () => {
+    // Cold-side edge case: 0°F indoor (unrealistic but tests null-vs-zero handling)
+    const d = computeOutdoorDelta({ temp: 0, humidity: 0 }, { temp: 0, humidity: 0, dewpoint: 0 });
+    expect(d.temp.delta).toBe(0);
+    expect(d.hum.delta).toBe(0);
+    expect(d.dewpoint.outdoor).toBe(0);
+  });
+});

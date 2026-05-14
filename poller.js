@@ -1,5 +1,6 @@
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways } from './db.js';
+import { fetchCurrentWeather, fetchHourlyWeather } from './weather.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs } from './db.js';
 import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
 import { runNotifications } from './notifications.js';
 
@@ -8,6 +9,8 @@ let _lastPollTime      = null;
 let _backfillState     = { status: 'idle', progress: null, error: null };
 let _lastDiscoveryAt   = 0;
 const DISCOVERY_INTERVAL_MS = 3600 * 1000;
+let _lastWeatherPollTime = null;
+let _lastWeatherError    = null;
 
 // Run one poll immediately, then every 5 minutes. Errors are intentionally
 // swallowed here so a transient cloud outage doesn't stop the interval — the
@@ -32,6 +35,22 @@ export function startPoller(db, config) {
       console.error('[poller] error:', err.message);
     });
   }, 5 * 60 * 1000);
+
+  // Outdoor weather is a separate hourly loop. It only runs when
+  // config.weather.{lat,lon} are configured — otherwise the table stays
+  // empty and the UI's Outdoor toggle hides itself.
+  if (config?.weather?.lat != null && config?.weather?.lon != null) {
+    _pollWeather(db, config).catch(err => {
+      _lastWeatherError = err.message;
+      console.error('[poller] weather error:', err.message);
+    });
+    setInterval(() => {
+      _pollWeather(db, config).catch(err => {
+        _lastWeatherError = err.message;
+        console.error('[poller] weather error:', err.message);
+      });
+    }, 60 * 60 * 1000);
+  }
 
   scheduleDaily(3,  0, () => _autoGapBackfill(db, config));
   scheduleDaily(3, 30, () => _snapshotDb(db));
@@ -220,13 +239,49 @@ async function _runNotifications(db) {
 }
 
 export function getPollStatus() {
-  return { lastPollTime: _lastPollTime, lastPollError: _lastPollError };
+  return {
+    lastPollTime:        _lastPollTime,
+    lastPollError:       _lastPollError,
+    lastWeatherPollTime: _lastWeatherPollTime,
+    lastWeatherError:    _lastWeatherError,
+  };
 }
 
 export function _resetPollerState() {
-  _lastPollError   = null;
-  _lastPollTime    = null;
-  _lastDiscoveryAt = 0;
+  _lastPollError       = null;
+  _lastPollTime        = null;
+  _lastDiscoveryAt     = 0;
+  _lastWeatherPollTime = null;
+  _lastWeatherError    = null;
+}
+
+// Hourly weather poll. On first run (no outdoor_readings yet) backfills a
+// week of past_days hours from Open-Meteo's forecast endpoint; thereafter
+// just fetches the current reading. INSERT OR IGNORE makes the inevitable
+// overlap free.
+async function _pollWeather(db, config) {
+  const { lat, lon } = config?.weather ?? {};
+  if (lat == null || lon == null) return;
+
+  const haveAny = getLatestOutdoorTs(db) != null;
+  const samples = haveAny
+    ? await fetchCurrentWeather(lat, lon)
+    : await fetchHourlyWeather(lat, lon, 7);
+
+  if (samples.length) {
+    insertOutdoorReadings(db, samples);
+  }
+  _lastWeatherError    = null;
+  _lastWeatherPollTime = Date.now();
+}
+
+// Manual trigger — exposed for a future POST /weather/poll route or test use.
+export function triggerWeatherPoll(db, config) {
+  return _pollWeather(db, config).catch(err => {
+    _lastWeatherError = err.message;
+    console.error('[poller] weather manual error:', err.message);
+    throw err;
+  });
 }
 
 // Expose manual trigger so the dashboard refresh button can force an immediate poll.

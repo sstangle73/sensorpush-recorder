@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import { createApp } from '../server.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus } from '../db.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings } from '../db.js';
 import { vi } from 'vitest';
 
 let server, baseUrl, db;
@@ -1313,5 +1313,55 @@ describe('Events routes', () => {
     expect(del.status).toBe(200);
     const del2 = await api('DELETE', `/events/${id}`);
     expect(del2.status).toBe(404);
+  });
+});
+
+describe('GET /weather', () => {
+  it('returns configured:false when no weather block is present in config', async () => {
+    // The shared `db` + app has no config bound (createApp(db) with no
+    // second arg) — so /weather should reflect "not configured".
+    const { body, status } = await get('/weather?range=24h');
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.configured).toBe(false);
+  });
+
+  it('returns 400 for an invalid range', async () => {
+    const { status, body } = await get('/weather?range=99y');
+    expect(status).toBe(400);
+    expect(body.ok).toBe(false);
+  });
+
+  it('defaults to range=24h when omitted', async () => {
+    const { body } = await get('/weather');
+    expect(body.range).toBe('24h');
+  });
+
+  it('returns latest reading + samples when outdoor_readings has data', async () => {
+    // Insert two readings, one out of the 24h window (filtered out by getOutdoorHistory)
+    // and one inside it. /weather should expose the latest as `latest`
+    // (regardless of range) and the in-range row in `samples`.
+    const now = Math.floor(Date.now() / 1000);
+    insertOutdoorReadings(db, [
+      { ts: now - 30 * 86400, temp: 30, humidity: 60, dewpoint: 20 },
+      { ts: now - 600,        temp: 65, humidity: 50, dewpoint: 45 },
+    ]);
+    const { body } = await get('/weather?range=24h');
+    expect(body.ok).toBe(true);
+    expect(body.latest).not.toBeNull();
+    expect(body.latest.temp).toBe(65);
+    expect(Array.isArray(body.samples)).toBe(true);
+    expect(body.samples.length).toBe(1);
+    expect(body.samples[0].temp).toBe(65);
+  });
+});
+
+describe('POST /weather/poll', () => {
+  it('returns 503 when weather is not configured (no config bound)', async () => {
+    const res = await fetch(baseUrl + '/weather/poll', { method: 'POST' });
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toMatch(/not configured/i);
   });
 });

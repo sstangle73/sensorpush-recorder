@@ -934,6 +934,7 @@ header .spacer { flex: 1; }
       <button id="custom-range-btn" class="range-btn" onclick="toggleCustomRange()">Custom…</button>
       <button id="zoom-reset" onclick="resetZoom()">✕ Reset zoom</button>
       <button id="add-event-btn" onclick="openEventModal()" title="Annotate the chart with a labeled event">＋ Add event</button>
+      <button id="outdoor-btn" class="range-btn" style="display:none" onclick="toggleOutdoor()" title="Overlay Open-Meteo outdoor temperature & humidity on the chart">+ Outdoor</button>
       <div class="ctrl-sep"></div>
       <span id="mode-hint"></span>
       <button id="edit-btn" onclick="toggleEditMode()">Edit</button>
@@ -1315,6 +1316,19 @@ let _events = []; // [{ id, ts, sensorId, label, note }]
 let _liveBaselines        = {};   // id → { 0..23: { tempMean, tempSd, humMean, humSd, nT, nH } }
 let _liveBaselinesAt      = 0;
 const BASELINE_TTL_MS     = 60 * 60 * 1000;
+
+// Outdoor (Open-Meteo) overlay state. Configured-ness comes from the server
+// once on init; samples are refetched whenever the chart range changes and
+// the overlay is enabled.
+let _outdoorConfigured = false;
+let _outdoorEnabled    = false;
+let _outdoorSamples    = [];     // [{ ts, temp, humidity, dewpoint }]
+let _outdoorLatest     = null;   // { ts, temp, humidity, dewpoint } | null
+let _outdoorRange      = null;   // range that _outdoorSamples was fetched for
+// Color-blind-safe neutral overlay color: low-saturation gray reads as
+// "ambient/atmospheric" and is hue-distinct from every Wong palette entry.
+// Pairing with the explicit "Outdoor" legend label provides the redundant cue.
+const OUTDOOR_COLOR    = '#9aa0a6';
 // Floor sigma so a perfectly stable room doesn't fire on every tenth of a
 // degree. ±2σ is the anomaly threshold; for T we floor σ at 0.4°F so the
 // window is at least ±0.8°F, and at 1.0 %RH similarly.
@@ -2226,6 +2240,9 @@ async function loadStats() {
       // HVAC analysis always uses 24h for the "today" gauge — independent of
       // _statsRange. The route's daily breakdown covers the last 7 days.
       fetch(`${API_BASE}/hvac?range=24h`).then(r => r.json()).catch(() => null),
+      // Stats only needs the latest outdoor reading for the "current delta"
+      // panel; range=24h is just to satisfy the API contract.
+      _outdoorConfigured ? fetch(`${API_BASE}/weather?range=24h`).then(r => r.json()).catch(() => null) : null,
     ];
     if (wantYoY) {
       pending.push(Promise.all(ids.map(id =>
@@ -2233,7 +2250,7 @@ async function loadStats() {
           .then(r => r.json()).catch(() => null)
       )));
     }
-    const [results, batt, pairs, hvac, yoyResults] = await Promise.all(pending);
+    const [results, batt, pairs, hvac, weather, yoyResults] = await Promise.all(pending);
 
     _statsHistory = {};
     results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
@@ -2251,6 +2268,10 @@ async function loadStats() {
     _pairDrift = {};
     drifts.forEach((d, i) => { if (d?.ok) _pairDrift[_pairs[i].id] = d; });
     _hvacInfo = (hvac?.ok) ? hvac : null;
+    if (weather?.ok) {
+      _outdoorConfigured = !!weather.configured;
+      _outdoorLatest     = weather.latest || _outdoorLatest;
+    }
     renderStats();
   } finally {
     _statsLoading = false;
@@ -2492,6 +2513,65 @@ function renderIndoorOutdoor(all) {
       ${humLine}
       ${dampLine}
     </div>
+  </div>`;
+}
+
+// Today's indoor-vs-outdoor delta against Open-Meteo. Distinct from
+// renderIndoorOutdoor (which compares house sensors to *outside* sensors) —
+// this one uses the externally-fetched outdoor reading so it works even when
+// you don't have an outdoor SensorPush. Renders nothing when weather isn't
+// configured or no reading has come in yet.
+function renderOutdoorWeatherDelta(all) {
+  if (!_outdoorConfigured || !_outdoorLatest) return '';
+  const house = all.filter(x => x.group.group === 'house' && x.stats.tempAvg != null);
+  if (!house.length) return '';
+
+  const indoorMean = {
+    temp:     _mean(house.map(x => x.stats.tempAvg)),
+    humidity: _mean(house.filter(x => x.stats.humAvg != null).map(x => x.stats.humAvg)),
+  };
+  const outdoor = {
+    temp:     _outdoorLatest.temp,
+    humidity: _outdoorLatest.humidity,
+    dewpoint: _outdoorLatest.dewpoint,
+  };
+  const d = computeOutdoorDelta(indoorMean, outdoor);
+  if (!d) return '';
+
+  const lines = [];
+  if (d.temp) {
+    const arrow = d.temp.delta > 0 ? '↑' : d.temp.delta < 0 ? '↓' : '=';
+    const cls   = d.temp.delta > 0 ? 'stats-up' : d.temp.delta < 0 ? 'stats-down' : 'stats-flat';
+    lines.push(`<div class="stats-io-line">
+      <span class="rt-dim">Temperature:</span>
+      <b>${d.temp.indoor.toFixed(1)}°F</b>
+      <span class="${cls}">${arrow} ${Math.abs(d.temp.delta).toFixed(1)}°F</span>
+      <span class="rt-dim">vs outdoor</span> <b>${d.temp.outdoor.toFixed(1)}°F</b>
+    </div>`);
+  }
+  if (d.hum) {
+    const arrow = d.hum.delta > 1 ? '↑' : d.hum.delta < -1 ? '↓' : '≈';
+    const cls   = d.hum.delta > 1 ? 'stats-up' : d.hum.delta < -1 ? 'stats-down' : 'stats-flat';
+    lines.push(`<div class="stats-io-line">
+      <span class="rt-dim">Humidity:</span>
+      <b>${Math.round(d.hum.indoor)}% RH</b>
+      <span class="${cls}">${arrow} ${Math.abs(d.hum.delta).toFixed(0)}%</span>
+      <span class="rt-dim">vs outdoor</span> <b>${Math.round(d.hum.outdoor)}% RH</b>
+    </div>`);
+  }
+  if (d.dewpoint) {
+    lines.push(`<div class="stats-io-line">
+      <span class="rt-dim">Outdoor dew point:</span> <b>${d.dewpoint.outdoor.toFixed(1)}°F</b>
+    </div>`);
+  }
+
+  const age = Math.round((Date.now() - _outdoorLatest.ts * 1000) / 60000);
+  const ageLabel = age < 60 ? `${age} min ago` : age < 24*60 ? `${Math.round(age/60)} hr ago` : `${Math.round(age/60/24)} d ago`;
+  return `<div class="an-section"><h2>Indoor vs Outdoor (Open-Meteo · current)</h2>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      ${lines.join('')}
+    </div>
+    <div class="stats-footnote">Outdoor reading fetched ${ageLabel}. Indoor figure is the average across House-zone sensors.</div>
   </div>`;
 }
 
@@ -3736,6 +3816,7 @@ function renderStats() {
     renderIndoorOutdoor(all),
     renderCalibration(),
     renderYearOverYear(all),
+    renderOutdoorWeatherDelta(all),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
     renderBreachHistory(all),
@@ -3826,6 +3907,7 @@ async function init() {
 
     renderSidebar();
     await loadEvents();
+    await _bootstrapOutdoor();
     await refreshChart();
     updateLastUpdatedLabel();
     startAutoRefresh();
@@ -3833,6 +3915,70 @@ async function init() {
     document.getElementById('poll-status').textContent = 'Error loading sensors';
     console.error(e);
   }
+}
+
+// ── Outdoor (Open-Meteo) overlay ───────────────────────────────────────────
+
+// Fetch the configured-ness flag + latest reading once at startup. Cheap —
+// just one round-trip and it lets us decide whether to show the button.
+async function _bootstrapOutdoor() {
+  try {
+    const r = await fetch(`${API_BASE}/weather?range=24h`).then(r => r.json());
+    if (!r?.ok) return;
+    _outdoorConfigured = !!r.configured;
+    _outdoorLatest     = r.latest || null;
+    // Seed cache when 24h matches the current range; saves a round trip.
+    if (_range === '24h') {
+      _outdoorSamples = r.samples || [];
+      _outdoorRange   = '24h';
+    }
+  } catch (_) { /* leave _outdoorConfigured = false */ }
+  _renderOutdoorBtn();
+}
+
+function _renderOutdoorBtn() {
+  const btn = document.getElementById('outdoor-btn');
+  if (!btn) return;
+  btn.style.display = _outdoorConfigured ? '' : 'none';
+  btn.classList.toggle('active', _outdoorEnabled);
+  btn.textContent = _outdoorEnabled ? '✓ Outdoor' : '+ Outdoor';
+}
+
+async function _fetchOutdoor(range) {
+  try {
+    const r = await fetch(`${API_BASE}/weather?range=${encodeURIComponent(range)}`).then(r => r.json());
+    if (!r?.ok) return;
+    _outdoorSamples = r.samples || [];
+    _outdoorRange   = range;
+    _outdoorLatest  = r.latest || _outdoorLatest;
+  } catch (_) { /* keep prior samples */ }
+}
+
+async function toggleOutdoor() {
+  _outdoorEnabled = !_outdoorEnabled;
+  _renderOutdoorBtn();
+  if (_outdoorEnabled && _outdoorRange !== _range) await _fetchOutdoor(_range);
+  renderChart();
+}
+
+// Pure helper — exported in spirit for ui-helpers.test.js. Given indoor
+// temperature/humidity readings (one number each, the indoor mean) and the
+// latest outdoor reading, returns the delta summary the Stats panel renders.
+// Returns null if either side is missing the data needed to compute the delta.
+function computeOutdoorDelta(indoor, outdoor) {
+  if (!indoor || !outdoor) return null;
+  const out = { temp: null, hum: null, dewpoint: null };
+  if (indoor.temp != null && outdoor.temp != null) {
+    out.temp = { indoor: indoor.temp, outdoor: outdoor.temp, delta: indoor.temp - outdoor.temp };
+  }
+  if (indoor.humidity != null && outdoor.humidity != null) {
+    out.hum = { indoor: indoor.humidity, outdoor: outdoor.humidity, delta: indoor.humidity - outdoor.humidity };
+  }
+  if (outdoor.dewpoint != null) {
+    out.dewpoint = { outdoor: outdoor.dewpoint };
+  }
+  if (out.temp == null && out.hum == null && out.dewpoint == null) return null;
+  return out;
 }
 
 async function refreshChart({ force = false } = {}) {
@@ -3861,6 +4007,10 @@ async function refreshChart({ force = false } = {}) {
   if (_chartDataRange !== _range) {
     _chartData = {};
     _chartDataRange = _range;
+  }
+  // Outdoor overlay tracks the same range; refetch when stale.
+  if (_outdoorEnabled && _outdoorRange !== _range) {
+    await _fetchOutdoor(_range);
   }
   for (const id of Object.keys(_chartData)) {
     if (!_selected.has(id)) delete _chartData[id];
@@ -4991,6 +5141,12 @@ function renderChart() {
 
   let yTFn, yHFn, yBFn, yVFn;
 
+  // Outdoor overlay can contribute to the temp/hum axes even when no sensor is
+  // currently visible on those axes. We collect outdoor temp samples here so
+  // makeYScale sees them, then render the overlay path further down.
+  const outdoorOn = _outdoorEnabled && _outdoorConfigured && _outdoorSamples.length > 0;
+  const outdoorInView = outdoorOn ? _outdoorSamples.filter(inView) : [];
+
   if (showTempPanel) {
     const allT = [];
     for (const [id, { samples }] of entries) {
@@ -5011,6 +5167,12 @@ function renderChart() {
           const hi = heatIndex(s.temperature, s.humidity);
           if (hi != null) allT.push(hi);
         }
+      }
+    }
+    if (outdoorOn) {
+      for (const s of outdoorInView) {
+        if (s.temp     != null) allT.push(s.temp);
+        if (s.dewpoint != null) allT.push(s.dewpoint);
       }
     }
     // Expand scale to include threshold values so they're always visible
@@ -5036,6 +5198,9 @@ function renderChart() {
         if (al.humidity.max != null) allH.push(al.humidity.max);
         if (al.humidity.min != null) allH.push(al.humidity.min);
       }
+    }
+    if (outdoorOn) {
+      for (const s of outdoorInView) if (s.humidity != null) allH.push(s.humidity);
     }
     const sc = makeYScale(allH, 0.12, 5);
     const top = panelTop('hum'), ht = panelHeight('hum');
@@ -5280,6 +5445,28 @@ function renderChart() {
     eventHits.push({ id: ev.id, cx, top: PT });
   }
 
+  // ── Outdoor overlay (Open-Meteo) ──
+  // Rendered after sensor data so it sits visually on top — but with a
+  // distinct neutral gray + solid stroke style, paired with the explicit
+  // "Outdoor" legend label so the redundant cue is CB-safe even at a glance.
+  if (outdoorOn && outdoorInView.length >= 2) {
+    if (showTempPanel && yTFn) {
+      const tp = outdoorInView.filter(s => s.temp != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yTFn(s.temp).toFixed(1)}`).join('');
+      if (tp) dataSvg += `<path d="${tp}" fill="none" stroke="${OUTDOOR_COLOR}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".85"/>`;
+      if (showDew) {
+        const dp = outdoorInView.filter(s => s.dewpoint != null)
+          .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yTFn(s.dewpoint).toFixed(1)}`).join('');
+        if (dp) dataSvg += `<path d="${dp}" fill="none" stroke="${OUTDOOR_COLOR}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="3,3" opacity=".55"/>`;
+      }
+    }
+    if (showHum && yHFn) {
+      const hp = outdoorInView.filter(s => s.humidity != null)
+        .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yHFn(s.humidity).toFixed(1)}`).join('');
+      if (hp) dataSvg += `<path d="${hp}" fill="none" stroke="${OUTDOOR_COLOR}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".75"/>`;
+    }
+  }
+
   // Selection rectangle (updated dynamically on drag)
   const selRectSvg = `<rect id="sel-rect" x="0" y="${PT}" width="0" height="${chartBottom-PT}" fill="var(--accent)" fill-opacity=".08" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4,4" display="none"/>`;
 
@@ -5315,6 +5502,14 @@ function renderChart() {
     if (showVPD && ser.has('vpd') && hasV)
       legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} VPD</div>`);
   });
+  if (outdoorOn && outdoorInView.length >= 2) {
+    if (showTempPanel)
+      legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor temp</div>`);
+    if (showHum)
+      legItems.push(`<div class="leg-item" style="opacity:.75"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor humidity</div>`);
+    if (showDew && showTempPanel)
+      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor dewpoint</div>`);
+  }
   document.getElementById('legend').innerHTML = legItems.join('');
 
   // ── Mouse interaction ──
@@ -5366,6 +5561,20 @@ function renderChart() {
       html += `<div class="tt-row">
         <div class="tt-dot" style="background:${color}"></div>
         <span class="tt-name">${esc(name)}${exTag}</span>
+        <span class="tt-vals">${vals}</span>
+      </div>`;
+    }
+
+    if (outdoorOn && outdoorInView.length) {
+      const near = outdoorInView.reduce((a, b) =>
+        Math.abs(b.ts * 1000 - hoverMs) < Math.abs(a.ts * 1000 - hoverMs) ? b : a);
+      const t  = near.temp     != null ? near.temp.toFixed(1)     + '°F' : null;
+      const h  = near.humidity != null ? Math.round(near.humidity) + '%' : null;
+      const d  = near.dewpoint != null ? 'dp ' + near.dewpoint.toFixed(1) + '°' : null;
+      const vals = [t, h, d].filter(Boolean).join(' · ') || '—';
+      html += `<div class="tt-row">
+        <div class="tt-dot" style="background:${OUTDOOR_COLOR}"></div>
+        <span class="tt-name">Outdoor</span>
         <span class="tt-vals">${vals}</span>
       </div>`;
     }

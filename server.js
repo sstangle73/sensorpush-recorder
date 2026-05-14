@@ -3,9 +3,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, getOldestReadingTs } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, getOldestReadingTs, getOutdoorHistory, getLatestOutdoorReading } from './db.js';
 import { computeDriftStats } from './drift.js';
-import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
+import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
 import { detectCycles, pickDefaultThermostatSensor } from './hvac.js';
@@ -124,7 +124,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery|hvac)\\b/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|settings|battery|hvac|weather)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -646,6 +646,35 @@ export function createApp(db, config = null) {
       autoDefaultId: autoDefault,
       sensors: sensorsOut,
     });
+  });
+
+  // Outdoor weather (Open-Meteo). Returns the configured-or-not state +
+  // the latest reading + a history series for the requested range. The
+  // `configured` flag lets the UI hide its Outdoor controls cleanly when
+  // no lat/lon was supplied.
+  app.get('/weather', (req, res) => {
+    const range    = req.query.range || '24h';
+    const rangeSecs = rangeToSeconds(range);
+    if (!rangeSecs) return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 2h, 24h, 7d, 30d, 1yr.' });
+    const configured = !!(config?.weather?.lat != null && config?.weather?.lon != null);
+    const samples  = getOutdoorHistory(db, range);
+    const latest   = getLatestOutdoorReading(db);
+    res.json({ ok: true, configured, range, latest, samples });
+  });
+
+  // Manual weather poll (mirrors POST /poll for sensors). Skips if weather
+  // isn't configured. Useful for an ops button if/when we surface one.
+  app.post('/weather/poll', async (_req, res) => {
+    if (!config?.weather?.lat || config.weather.lon == null) {
+      return res.status(503).json({ ok: false, error: 'weather not configured' });
+    }
+    try {
+      await triggerWeatherPoll(db, config);
+      const { lastWeatherPollTime } = getPollStatus();
+      res.json({ ok: true, lastPoll: lastWeatherPollTime ? new Date(lastWeatherPollTime).toISOString() : null });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   app.get('/gateways', (req, res) => {

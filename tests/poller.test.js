@@ -7,9 +7,15 @@ vi.mock('../sensorpush.js', () => ({
   fetchGateways: vi.fn(),
 }));
 
+vi.mock('../weather.js', () => ({
+  fetchCurrentWeather: vi.fn(),
+  fetchHourlyWeather:  vi.fn(),
+}));
+
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg } from '../db.js';
-import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb } from '../poller.js';
+import { fetchCurrentWeather, fetchHourlyWeather } from '../weather.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs } from '../db.js';
+import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, triggerWeatherPoll } from '../poller.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -35,6 +41,10 @@ beforeEach(() => {
   _resetPollerState();
   // Default: no gateways. Tests that care override this.
   fetchGateways.mockResolvedValue([]);
+  // Default: weather endpoints return empty so tests that don't care don't
+  // accidentally insert outdoor rows.
+  fetchCurrentWeather.mockResolvedValue([]);
+  fetchHourlyWeather.mockResolvedValue([]);
 });
 
 describe('triggerPoll — credential guards', () => {
@@ -476,5 +486,57 @@ describe('triggerPoll — hourly recompute', () => {
 
     const row = db.prepare('SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id = ?').get('agg1');
     expect(row.n).toBeGreaterThan(0);
+  });
+});
+
+describe('triggerWeatherPoll', () => {
+  const WEATHER_CFG = { ...CREDS, weather: { lat: 43.65, lon: -79.38 } };
+
+  it('skips when no weather block is configured', async () => {
+    await triggerWeatherPoll(makeDb(), CREDS);
+    expect(fetchCurrentWeather).not.toHaveBeenCalled();
+    expect(fetchHourlyWeather).not.toHaveBeenCalled();
+  });
+
+  it('first run uses hourly backfill (DB is empty)', async () => {
+    const db = makeDb();
+    fetchHourlyWeather.mockResolvedValue([
+      { ts: 1000, temp: 60, humidity: 50, dewpoint: 40 },
+      { ts: 4600, temp: 61, humidity: 51, dewpoint: 41 },
+    ]);
+    await triggerWeatherPoll(db, WEATHER_CFG);
+    expect(fetchHourlyWeather).toHaveBeenCalledTimes(1);
+    expect(fetchCurrentWeather).not.toHaveBeenCalled();
+    expect(db.prepare('SELECT COUNT(*) AS n FROM outdoor_readings').get().n).toBe(2);
+  });
+
+  it('subsequent runs use current-weather fetch (DB has rows)', async () => {
+    const db = makeDb();
+    // Seed one row so the poller takes the "current" path.
+    fetchHourlyWeather.mockResolvedValueOnce([{ ts: 1000, temp: 60, humidity: 50, dewpoint: 40 }]);
+    await triggerWeatherPoll(db, WEATHER_CFG);
+    expect(getLatestOutdoorTs(db)).toBe(1000);
+
+    fetchCurrentWeather.mockResolvedValueOnce([{ ts: 5000, temp: 65, humidity: 55, dewpoint: 50 }]);
+    await triggerWeatherPoll(db, WEATHER_CFG);
+    expect(fetchCurrentWeather).toHaveBeenCalledTimes(1);
+    expect(getLatestOutdoorTs(db)).toBe(5000);
+  });
+
+  it('updates lastWeatherPollTime and clears lastWeatherError on success', async () => {
+    fetchHourlyWeather.mockResolvedValue([{ ts: 1000, temp: 60, humidity: 50, dewpoint: 40 }]);
+    const before = Date.now();
+    await triggerWeatherPoll(makeDb(), WEATHER_CFG);
+    const { lastWeatherPollTime, lastWeatherError } = getPollStatus();
+    expect(lastWeatherPollTime).toBeGreaterThanOrEqual(before);
+    expect(lastWeatherError).toBeNull();
+  });
+
+  it('does nothing destructive when the fetch returns no samples (transient failure)', async () => {
+    const db = makeDb();
+    fetchHourlyWeather.mockResolvedValue([]);
+    await triggerWeatherPoll(db, WEATHER_CFG);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM outdoor_readings').get().n).toBe(0);
+    expect(getPollStatus().lastWeatherError).toBeNull();
   });
 });

@@ -8,6 +8,7 @@ import {
   getBatteryHistory, computeBatteryForecast, getOldestReadingTs,
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
+  insertOutdoorReadings, getLatestOutdoorTs, getOutdoorHistory, getLatestOutdoorReading,
 } from '../db.js';
 
 function makeDb() {
@@ -1348,5 +1349,115 @@ describe('events CRUD', () => {
 
   it('deleteEvent returns false for unknown id', () => {
     expect(deleteEvent(makeDb(), 9999)).toBe(false);
+  });
+});
+
+describe('outdoor_readings schema + helpers', () => {
+  it('creates outdoor_readings table at openDb', () => {
+    const db = makeDb();
+    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map(r => r.name);
+    expect(tables).toContain('outdoor_readings');
+  });
+
+  it('insertOutdoorReadings inserts rows and returns count', () => {
+    const db = makeDb();
+    const n = insertOutdoorReadings(db, [
+      { ts: 1000, temp: 60, humidity: 50, dewpoint: 40 },
+      { ts: 1100, temp: 61, humidity: 51, dewpoint: 41 },
+    ]);
+    expect(n).toBe(2);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM outdoor_readings').get().n).toBe(2);
+  });
+
+  it('insertOutdoorReadings is idempotent on duplicate ts (INSERT OR IGNORE)', () => {
+    const db = makeDb();
+    insertOutdoorReadings(db, [{ ts: 1000, temp: 60, humidity: 50, dewpoint: 40 }]);
+    const n2 = insertOutdoorReadings(db, [
+      { ts: 1000, temp: 99, humidity: 99, dewpoint: 99 },  // dup → ignored
+      { ts: 1100, temp: 61, humidity: 51, dewpoint: 41 },  // new
+    ]);
+    expect(n2).toBe(1);
+    // Original row preserved — INSERT OR IGNORE doesn't overwrite
+    const row = db.prepare('SELECT temp FROM outdoor_readings WHERE ts = 1000').get();
+    expect(row.temp).toBe(60);
+  });
+
+  it('insertOutdoorReadings skips rows with non-finite ts (defensive)', () => {
+    const db = makeDb();
+    const n = insertOutdoorReadings(db, [
+      { ts: 1000, temp: 60, humidity: 50, dewpoint: 40 },
+      { ts: NaN, temp: 99, humidity: 99, dewpoint: 99 },
+      null,                                              // explicit null sample
+      { ts: 1100, temp: 61, humidity: 51, dewpoint: 41 },
+    ]);
+    expect(n).toBe(2);
+  });
+
+  it('insertOutdoorReadings coerces missing fields to null', () => {
+    const db = makeDb();
+    insertOutdoorReadings(db, [{ ts: 2000 }]); // no temp/humidity/dewpoint
+    const row = db.prepare('SELECT * FROM outdoor_readings WHERE ts = 2000').get();
+    expect(row.temp).toBeNull();
+    expect(row.humidity).toBeNull();
+    expect(row.dewpoint).toBeNull();
+  });
+
+  it('getLatestOutdoorTs returns null on empty table', () => {
+    expect(getLatestOutdoorTs(makeDb())).toBeNull();
+  });
+
+  it('getLatestOutdoorTs returns MAX(ts) after inserts', () => {
+    const db = makeDb();
+    insertOutdoorReadings(db, [
+      { ts: 1000, temp: 60, humidity: 50, dewpoint: 40 },
+      { ts: 3000, temp: 62, humidity: 52, dewpoint: 42 },
+      { ts: 2000, temp: 61, humidity: 51, dewpoint: 41 },
+    ]);
+    expect(getLatestOutdoorTs(db)).toBe(3000);
+  });
+
+  it('getOutdoorHistory returns rows within the requested range, in ts order', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    insertOutdoorReadings(db, [
+      { ts: now - 30 * 86400, temp: 50, humidity: 60, dewpoint: 40 },  // outside 24h
+      { ts: now - 3600,       temp: 60, humidity: 55, dewpoint: 45 },  // inside 24h
+      { ts: now - 60,         temp: 65, humidity: 50, dewpoint: 48 },
+    ]);
+    const rows = getOutdoorHistory(db, '24h');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].ts).toBeLessThan(rows[1].ts);
+    expect(rows[0].temp).toBe(60);
+    expect(rows[1].temp).toBe(65);
+  });
+
+  it('getOutdoorHistory respects 7d range', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    insertOutdoorReadings(db, [
+      { ts: now - 8 * 86400, temp: 1, humidity: 1, dewpoint: 1 },  // outside 7d
+      { ts: now - 86400,     temp: 2, humidity: 2, dewpoint: 2 },  // inside 7d
+    ]);
+    const rows = getOutdoorHistory(db, '7d');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].temp).toBe(2);
+  });
+
+  it('getLatestOutdoorReading returns null on empty table', () => {
+    expect(getLatestOutdoorReading(makeDb())).toBeNull();
+  });
+
+  it('getLatestOutdoorReading returns the row with max ts', () => {
+    const db = makeDb();
+    insertOutdoorReadings(db, [
+      { ts: 1000, temp: 60, humidity: 50, dewpoint: 40 },
+      { ts: 3000, temp: 70, humidity: 55, dewpoint: 48 },
+      { ts: 2000, temp: 65, humidity: 53, dewpoint: 45 },
+    ]);
+    const row = getLatestOutdoorReading(db);
+    expect(row.ts).toBe(3000);
+    expect(row.temp).toBe(70);
+    expect(row.humidity).toBe(55);
+    expect(row.dewpoint).toBe(48);
   });
 });

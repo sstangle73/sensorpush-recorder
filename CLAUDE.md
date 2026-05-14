@@ -18,7 +18,7 @@ Runs as a single-container compose stack. After source changes:
 git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js notifications.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js drift.js mqtt.js hvac.js notifications.js weather.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
 
 CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
@@ -27,25 +27,26 @@ CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.y
 ```
 server.js       — Express bootstrap, all routes, CORS middleware, PWA assets, procedural PNG icons
 config.js       — loadConfig() reads /config/config.local.js via new Function sandbox; parseConfig() exported for tests
-db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking; battery history + forecast; gateway uptime + primary-sensor counts
+db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking; battery history + forecast; gateway uptime + primary-sensor counts; outdoor_readings (Open-Meteo)
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
-poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune; per-poll MQTT publish + hourly HA discovery
+weather.js      — Open-Meteo (no API key): fetchCurrentWeather (current_weather) + fetchHourlyWeather (past_days 1..92); both soft-fail to []
+poller.js       — 5-min sensor poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); separate hourly weather loop (skipped when weather.{lat,lon} absent); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune; per-poll MQTT publish + hourly HA discovery
 auth.js         — recorder-token resolution (env > /data/recorder-token > null); generate/set/clear helpers; bearer middleware in server.js calls getToken() on every request
 drift.js        — pure-function drift detector: computeDriftStats(samples) → mean delta + linear-regression slope per day; classifyDrift() returns 'drifting'|'stable'|'unknown'
 mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
 hvac.js         — pure-function module: detectCycles(readings, opts) infers HVAC on/off cycles by smoothing the temperature series, sign-thresholding the slope, and grouping contiguous same-sign runs into heating/cooling cycles; pickDefaultThermostatSensor picks the lowest-variance indoor sensor
 notifications.js — outbound webhook + ntfy dispatch with per-(condition, target) DB-backed state machine; fires on transition→active and transition→recovered, dedupes while stuck; condition evaluators for threshold breach, hour-of-day anomaly, sensor-offline, gateway-offline; runNotifications() is called from the poll loop after each successful poll
-ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel), Explorer (multi-sensor chart, exclusion, zoom, event markers), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
+ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies, recent events), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets, year-over-year overlay, HVAC zone analysis panel, indoor-vs-outdoor weather delta), Explorer (multi-sensor chart, exclusion, zoom, event markers, outdoor overlay), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, security/token, notification sinks + condition toggles)
 tests/          — vitest test suite (in-memory SQLite + http.createServer for route tests). Run `npm test` for the current count.
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db` → `notifications`; `notifications` → `poller`, `server`; `db`, `auth`, `poller`, `hvac` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `weather` → `poller`; `mqtt` → `poller`; `db` → `notifications`; `notifications` → `poller`, `server`; `db`, `auth`, `poller`, `hvac` → `server`.
 
 ## Configuration
 
-- `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern; only `sensorpush.email` and `sensorpush.password` are read.
+- `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password }, weather: { lat, lon } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern. Only `sensorpush.{email,password}` and (optionally) `weather.{lat,lon}` are read. Weather can also come from `WEATHER_LAT` / `WEATHER_LON` env vars (env overrides file independently of sensorpush creds).
 - `CORS_ORIGINS` env var — comma-separated allowlist. The middleware echoes the request `Origin` only when it matches an entry; never sends `*`.
 - `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. Set in `docker-compose.yml` env if you want config-as-code; otherwise leave unset and use the Settings → Security UI (see below) to generate + persist a token to `/data/recorder-token`. Resolution order: env > file > null (no auth). Bearer required on all routes except `/health`, icon/manifest/sw assets, HTML `GET /`, and same-origin requests (`Sec-Fetch-Site: same-origin`).
 - `DB_PATH` (default `/data/sensorpush.db`)
@@ -57,6 +58,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 - **Sensors / data**: `GET /` (JSON or HTML; response includes `oldestReadingTs` so the Stats YoY toggle can decide whether ≥1y of data exists), `GET /:id/history` (optional `endTs` query param anchors the window at an arbitrary epoch — used by the YoY overlay), `GET /:id/history/all`, `GET /:id/gaps`
 - **Battery forecast**: `GET /battery` — per-sensor voltage trend + projected days-until-replacement
 - **HVAC**: `GET /hvac?range=24h` — duty-cycle inference for thermostat-reference sensors; returns per-cycle list, heating/cooling runtime %, daily breakdown for the last 7 days, and short-cycle warnings. Reference sensors come from `settings.hvac.sensors.<id>.thermostat=true`; with none flagged, the most-stable indoor sensor over 24 h is auto-selected.
+- **Outdoor weather**: `GET /weather?range=Xd` — Open-Meteo samples + latest reading (returns `configured: false` when no `weather.{lat,lon}` is configured); `POST /weather/poll` for a manual fetch
 - **Gateways**: `GET /gateways` (optional `?range=Xd` adds uptime % + primary-sensor count per gateway)
 - **Mutations**: `PATCH /:id/readings/exclude`, `PATCH /:id/hourly/exclude`
 - **Polling / backfill**: `POST /poll`, `POST /backfill` (broad, fromDate), `POST /backfill-gaps` (targeted, range), `GET /backfill/status`
@@ -76,6 +78,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorp
 - `gateways (id, name, last_seen, last_alert, version, paired, message, last_synced)` — current state, upserted each poll.
 - `gateway_status (gateway_id, polled_at, last_seen)` — append-only per poll, pruned to 30 days. Used by `gatewayOnlineDuringWindow()` to answer "was this gateway online during this gap?"
 - `notification_state (key, active, last_notified_at, last_transition_at, last_payload)` — one row per (condition, target). `key` shape is `"condition:targetId"` (e.g. `threshold:sensor123`, `gateway-offline:gw1`). State persists across container restarts so a stuck-firing condition isn't re-buzzed after redeploy; `evaluateAndNotify` fires only on transitions in/out of `active`.
+- `outdoor_readings (ts PRIMARY KEY, temp, humidity, dewpoint)` — Open-Meteo hourly samples for the configured `weather.{lat,lon}`. `INSERT OR IGNORE` matches the readings table's de-dup semantics; the hourly poller can safely overlap. No location_id column — one recorder = one location.
 
 ## Testing
 
@@ -85,7 +88,7 @@ npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
-- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`.
+- Test files: `auth.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `weather.test.js`.
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.

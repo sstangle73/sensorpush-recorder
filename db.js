@@ -108,6 +108,17 @@ export function openDb(path) {
       last_transition_at INTEGER,
       last_payload       TEXT
     );
+
+    -- Outdoor weather samples from Open-Meteo. Single-location series (we only
+    -- track one lat/lon per recorder), so no location_id column. UNIQUE(ts)
+    -- + INSERT OR IGNORE matches the readings table's de-dup semantics, so
+    -- the hourly poller can safely overlap the previous fetch window.
+    CREATE TABLE IF NOT EXISTS outdoor_readings (
+      ts        INTEGER PRIMARY KEY,
+      temp      REAL,
+      humidity  REAL,
+      dewpoint  REAL
+    );
   `);
   // Migrate existing DBs that predate the excluded columns.
   for (const [table, col] of [['readings', 'excluded'], ['hourly_agg', 'excluded']]) {
@@ -907,4 +918,60 @@ export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {
     humSd:    sd(hSum, hSum2, hN),
     nT: tN, nH: hN,
   };
+}
+
+// ── Outdoor weather (Open-Meteo) ──────────────────────────────────────────
+// Samples come in shaped as { ts, temp, humidity, dewpoint }. INSERT OR
+// IGNORE makes overlapping fetches free, same as the sensor readings path.
+// Returns the number of rows newly inserted (the rest were duplicates).
+export function insertOutdoorReadings(db, samples) {
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO outdoor_readings (ts, temp, humidity, dewpoint)
+    VALUES (?, ?, ?, ?)
+  `);
+  let inserted = 0;
+  db.exec('BEGIN');
+  try {
+    for (const s of samples) {
+      if (s == null || !Number.isFinite(s.ts)) continue;
+      const r = stmt.run(s.ts, s.temp ?? null, s.humidity ?? null, s.dewpoint ?? null);
+      if (r.changes > 0) inserted++;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return inserted;
+}
+
+// MAX(ts) of outdoor_readings, or null if empty. Mirrors getLatestTs.
+export function getLatestOutdoorTs(db) {
+  const row = db.prepare('SELECT MAX(ts) AS ts FROM outdoor_readings').get();
+  return row?.ts ?? null;
+}
+
+// Hourly-cadence outdoor history over the same range parser used for sensor
+// history. Returns [{ ts, temp, humidity, dewpoint }]. The shape mirrors
+// getHistory's sensor rows so the UI can plot them on the same axes with
+// minimal special-casing.
+export function getOutdoorHistory(db, range) {
+  const rangeSeconds = rangeToSeconds(range) ?? 86400;
+  const since = Math.floor(Date.now() / 1000) - rangeSeconds;
+  return db.prepare(`
+    SELECT ts, temp, humidity, dewpoint
+    FROM outdoor_readings
+    WHERE ts >= ?
+    ORDER BY ts
+  `).all(since);
+}
+
+// Most recent outdoor reading, or null. Used by the live Stats panel.
+export function getLatestOutdoorReading(db) {
+  const row = db.prepare(`
+    SELECT ts, temp, humidity, dewpoint
+    FROM outdoor_readings
+    ORDER BY ts DESC LIMIT 1
+  `).get();
+  return row ?? null;
 }
