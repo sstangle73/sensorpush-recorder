@@ -1138,6 +1138,12 @@ header .spacer { flex: 1; }
   </div>
 
   <div class="set-section">
+    <h2>Backups</h2>
+    <p class="set-hint" style="margin-bottom:10px">Daily SQLite snapshots are written automatically at 03:30 to <code>/data/backups/</code> (7-day retention). Restore swaps the live DB to the chosen snapshot; a pre-restore safety copy is preserved before the swap.</p>
+    <div id="backups-table-wrap" style="font-size:12px;color:var(--text2)">Loading…</div>
+  </div>
+
+  <div class="set-section">
     <h2>Security</h2>
     <p class="set-hint" style="margin-bottom:10px">A bearer token gates non-public routes. Browsers loading the Explorer UI from this hostname bypass it via <code>Sec-Fetch-Site: same-origin</code>; cross-origin programmatic callers (the rosestorie dashboard, etc.) must include <code>Authorization: Bearer &lt;token&gt;</code>.</p>
     <div id="auth-state" style="margin-bottom:10px;font-size:13px;color:var(--text2)">Loading…</div>
@@ -4413,6 +4419,7 @@ async function renderSettings() {
   } catch(e) {}
   renderAuthSection();
   renderNotifications();
+  renderBackupsSection();
 }
 
 // ── Notifications panel ──────────────────────────────────────────────────
@@ -4884,6 +4891,84 @@ function copyFreshToken() {
 function dismissFreshToken() {
   _freshToken = null;
   document.getElementById('auth-fresh-token').style.display = 'none';
+}
+
+// ── Backups (list + restore daily SQLite snapshots) ────────────────────────
+function _fmtBytes(n) {
+  if (n == null || isNaN(n)) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function _fmtAge(mtimeSecs) {
+  if (!mtimeSecs) return '';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - mtimeSecs);
+  if (secs < 60) return 'just now';
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return mins + ' min ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + ' hr ago';
+  const days = Math.floor(hrs / 24);
+  return days + (days === 1 ? ' day ago' : ' days ago');
+}
+
+async function renderBackupsSection() {
+  const el = document.getElementById('backups-table-wrap');
+  if (!el) return;
+  try {
+    const resp = await fetch(`${API_BASE}/backups`).then(r => r.json());
+    if (!resp.ok) throw new Error(resp.error || 'failed');
+    const list = resp.backups || [];
+    if (!list.length) {
+      el.innerHTML = '<span style="color:var(--text3)">No snapshots yet — the first one is written at 03:30 host-local.</span>';
+      return;
+    }
+    el.innerHTML = `
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="text-align:left;color:var(--text3)">
+            <th style="padding:6px 8px;border-bottom:1px solid var(--border)">Filename</th>
+            <th style="padding:6px 8px;border-bottom:1px solid var(--border)">Size</th>
+            <th style="padding:6px 8px;border-bottom:1px solid var(--border)">Age</th>
+            <th style="padding:6px 8px;border-bottom:1px solid var(--border)"></th>
+          </tr>
+        </thead>
+        <tbody id="backups-tbody"></tbody>
+      </table>`;
+    const tbody = document.getElementById('backups-tbody');
+    tbody.innerHTML = list.map(b => {
+      const safeName = esc(b.filename);
+      const action = b.restorable
+        ? `<button class="set-btn danger" data-restore="${safeName}">Restore</button>`
+        : `<span style="color:var(--text3);font-size:11px">pre-restore snapshot</span>`;
+      return `<tr>
+        <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-family:monospace">${safeName}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${_fmtBytes(b.size)}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text3)">${_fmtAge(b.mtime)}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid var(--border);text-align:right">${action}</td>
+      </tr>`;
+    }).join('');
+    tbody.querySelectorAll('button[data-restore]').forEach(btn => {
+      btn.onclick = () => restoreBackupConfirm(btn.dataset.restore);
+    });
+  } catch (e) {
+    el.textContent = 'Could not load backups: ' + e.message;
+  }
+}
+
+async function restoreBackupConfirm(filename) {
+  const msg = `Restore from ${filename}?\n\nThis will replace the current database. A pre-restore snapshot will be saved automatically so you can roll back via SSH if needed.\n\nIn-flight requests will error briefly while the swap happens.`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await fetch(`${API_BASE}/backups/${encodeURIComponent(filename)}/restore`, { method: 'POST' });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    showToast(`Restored from ${filename}. Safety copy: ${data.preRestoreFilename}`);
+    renderBackupsSection();
+  } catch (e) {
+    showToast('Restore failed: ' + e.message);
+  }
 }
 
 function rangeResolution(r) {
