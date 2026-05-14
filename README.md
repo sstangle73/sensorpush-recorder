@@ -20,6 +20,40 @@ Polls the SensorPush cloud every 5 minutes, stores all readings locally in SQLit
 - **Battery monitoring** — UI badges sensors with low (≤2.7V) or critical (≤2.5V) battery voltage, plus projected days-until-replacement via `/battery`.
 - **CSV export** — `GET /:id/history.csv?range=7d` for spreadsheet analysis.
 
+## Tour
+
+Sensor names in the screenshots below are anonymized (`Bedroom A/B/C`); the UI shows your real SensorPush labels.
+
+### Live
+
+Real-time cards grouped by zone (House / Outside / Appliances / Other), with trend arrows, feels-like, dewpoint spread, and battery RSSI badges. Anomalous readings for the current hour-of-day get flagged automatically.
+
+![Live tab](docs/screenshots/live.png)
+
+### Stats
+
+Aggregated view over the selected range: per-zone highlights (warmest/coolest/most-humid/driest/most-variable/in-comfort), indoor-vs-outdoor swing, per-sensor temperature + humidity tables, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation matrix, mold/condensation risk, HVAC duty-cycle, alert breach history, and a battery-replacement forecast.
+
+![Stats tab](docs/screenshots/stats.png)
+
+### Explorer
+
+Multi-sensor chart with togglable series (temperature, humidity, pressure, dewpoint, heat index, VPD) and zoom, plus an edit mode for excluding bad readings or whole hourly buckets from aggregates.
+
+![Explorer tab](docs/screenshots/explorer.png)
+
+### Analytics
+
+Per-gateway status with uptime % and primary-sensor count, plus a coverage summary and timeline showing each sensor's missing windows. Each gap is annotated with whether the gateway was online during it (so a sensor outage can be told apart from a gateway outage).
+
+![Analytics tab](docs/screenshots/analytics.png)
+
+### Settings
+
+Range-button configuration, per-zone and per-sensor "comfort" presets used by the Stats tab, and the bearer-token controls under Security.
+
+![Settings tab](docs/screenshots/settings.png)
+
 ## Quick start
 
 ```bash
