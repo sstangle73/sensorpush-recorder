@@ -1,9 +1,12 @@
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
 import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus } from './db.js';
+import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
 
-let _lastPollError = null;
-let _lastPollTime  = null;
-let _backfillState = { status: 'idle', progress: null, error: null };
+let _lastPollError     = null;
+let _lastPollTime      = null;
+let _backfillState     = { status: 'idle', progress: null, error: null };
+let _lastDiscoveryAt   = 0;
+const DISCOVERY_INTERVAL_MS = 3600 * 1000;
 
 // Run one poll immediately, then every 5 minutes. Errors are intentionally
 // swallowed here so a transient cloud outage doesn't stop the interval — the
@@ -14,6 +17,10 @@ let _backfillState = { status: 'idle', progress: null, error: null };
 //   03:30 — SQLite snapshot to /data/backups/sensorpush-YYYY-MM-DD.db
 //           with retention pruning beyond 7 daily snapshots
 export function startPoller(db, config) {
+  // Bring up the optional MQTT publisher. No-op when MQTT_URL is unset.
+  // Failures here must not block sample polling — wrap in try/catch.
+  try { mqttConnect(config?.mqtt || {}); } catch (err) { console.error('[poller] mqtt connect:', err.message); }
+
   _poll(db, config).catch(err => {
     _lastPollError = err.message;
     console.error('[poller] error:', err.message);
@@ -148,6 +155,30 @@ async function _poll(db, config) {
   _lastPollError = null;
   _lastPollTime  = Date.now();
   setLastPollTime(db, _lastPollTime);
+
+  // MQTT publish. Failures must not surface as poll errors — the readings are
+  // already in the DB. We always publish the latest known reading per sensor
+  // (heartbeat semantics), even on polls that yielded no new samples, so HA
+  // entities stay "fresh" with retained messages.
+  if (mqttIsConnected()) {
+    try {
+      if (Date.now() - _lastDiscoveryAt > DISCOVERY_INTERVAL_MS) {
+        publishDiscovery(sensors);
+        _lastDiscoveryAt = Date.now();
+      }
+      const latestStmt = db.prepare(
+        `SELECT ts, temperature, humidity, dewpoint, vpd, battery_voltage
+         FROM readings WHERE sensor_id = ? AND excluded = 0
+         ORDER BY ts DESC LIMIT 1`,
+      );
+      for (const sensor of sensors) {
+        const reading = latestStmt.get(sensor.id);
+        if (reading) publishReading(sensor, reading);
+      }
+    } catch (err) {
+      console.error('[poller] mqtt publish:', err.message);
+    }
+  }
 }
 
 export function getPollStatus() {
@@ -155,8 +186,9 @@ export function getPollStatus() {
 }
 
 export function _resetPollerState() {
-  _lastPollError = null;
-  _lastPollTime  = null;
+  _lastPollError   = null;
+  _lastPollTime    = null;
+  _lastDiscoveryAt = 0;
 }
 
 // Expose manual trigger so the dashboard refresh button can force an immediate poll.

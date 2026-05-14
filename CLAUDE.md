@@ -18,7 +18,7 @@ Runs as a single-container compose stack. After source changes:
 git pull && docker compose up -d --build
 ```
 
-The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
+The Dockerfile uses an explicit `COPY server.js config.js db.js sensorpush.js poller.js auth.js mqtt.js ui.html ./` list (not `COPY . .`). **Adding a new module without updating the Dockerfile causes `ERR_MODULE_NOT_FOUND` and crash-loops.**
 
 CORS allowlist is configured via the `CORS_ORIGINS` env var in `docker-compose.yml`. Comma-separated; each value must match a request's `Origin` header exactly. Empty is fine for same-origin / reverse-proxy setups.
 
@@ -29,15 +29,16 @@ server.js       — Express bootstrap, all routes, CORS middleware, PWA assets, 
 config.js       — loadConfig() reads /config/config.local.js via new Function sandbox; parseConfig() exported for tests
 db.js           — node:sqlite schema + queries; migrations on every openDb(); excluded flag; gateway tracking; battery history + forecast; gateway uptime + primary-sensor counts
 sensorpush.js   — 2-step OAuth + fetchSensors / fetchSamples / fetchGateways; samples API has 10000-row hard limit, chunked in 2-day windows
-poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune
+poller.js       — 5-min poll loop; 24h lookback; 30-day initial backfill; triggerBackfill (broad), triggerGapBackfill (targeted); daily clock-aligned jobs at 03:00 (auto gap-fill 7d) and 03:30 (SQLite VACUUM INTO /data/backups/, 7-day retention); gateway-status recording + 30-day prune; per-poll MQTT publish + hourly HA discovery
 auth.js         — recorder-token resolution (env > /data/recorder-token > null); generate/set/clear helpers; bearer middleware in server.js calls getToken() on every request
+mqtt.js         — optional publish-only MQTT bridge (HA discovery + retained state). No-op when MQTT_URL is unset. Env-configured (MQTT_URL/USERNAME/PASSWORD/TOPIC_PREFIX/DISCOVERY_PREFIX). Failures isolated from poll path
 ui.html         — self-contained 5-tab SPA: Live (real-time cards, feels-like, alert thresholds, anomalies), Stats (records, hour-of-day + minute-of-hour heatmaps, correlation, mold/HVAC, battery forecast, breach history, comfort presets), Explorer (multi-sensor chart, exclusion, zoom), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, security/token)
 tests/          — 250 vitest tests across 7 files; in-memory SQLite + http.createServer for route tests
 .gitlab-ci.yml  — runs npm test on every push/MR (Node 22-alpine)
 Dockerfile      — explicit COPY list — update when adding new files
 ```
 
-Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `db`, `auth`, `poller` → `server`.
+Import graph is acyclic: `config` → `db`, `auth`, `poller`, `server`; `sensorpush` → `poller`; `mqtt` → `poller`; `db`, `auth`, `poller` → `server`.
 
 ## Configuration
 
