@@ -2032,7 +2032,10 @@ function renderRecentEventsSection() {
     }).join('');
   }
   return `<section class="rt-events-section">
-    <div class="rt-events-title">Recent events <span style="color:var(--text3);font-weight:400">${recent.length} of ${_events.length}</span></div>
+    <div class="rt-events-title">
+      <span>Recent events <span style="color:var(--text3);font-weight:400">${recent.length} of ${_events.length}</span></span>
+      <button class="set-btn" style="padding:3px 10px;font-size:11px" onclick="openEventModal()">＋ Add event</button>
+    </div>
     ${body}
   </section>`;
 }
