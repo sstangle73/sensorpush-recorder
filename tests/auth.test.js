@@ -182,4 +182,16 @@ describe('Bearer middleware', () => {
     const res = await fetch(baseUrl + '/', { headers: { 'Sec-Fetch-Site': 'cross-site' } });
     expect(res.status).toBe(401);
   });
+
+  it('gates sensor-pairs routes when token set', async () => {
+    const tok = '22222222222222222222222222222222';
+    writeFileSync(TOKEN_FILE, tok);
+    // Without bearer → 401
+    const unauth = await api('GET', '/sensor-pairs');
+    expect(unauth.status).toBe(401);
+    // With bearer → 200 (empty list)
+    const ok = await api('GET', '/sensor-pairs', { token: tok });
+    expect(ok.status).toBe(200);
+    expect(ok.body.ok).toBe(true);
+  });
 });

@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly } from './db.js';
+import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
@@ -105,7 +106,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v10';
+const CACHE='sensorpush-v11';
 // Pre-cache the root with an explicit Accept: text/html so the server's
 // content negotiation returns the Explorer HTML, not the JSON sensor list.
 // Without this, the install fetch goes out as Accept: */*, the cached entry
@@ -183,6 +184,22 @@ function _validComfortConfig(c) {
     for (const k2 of Object.keys(v)) {
       if (!_validComfortEntry(v[k2])) return false;
     }
+  }
+  return true;
+}
+
+// Drift thresholds shape:
+//   { temp?: number, hum?: number }
+// Both keys are positive finite numbers (°F/day and %RH/day). Null or
+// missing means "use defaults".
+function _validDriftThresholds(d) {
+  if (d == null) return true;
+  if (typeof d !== 'object' || Array.isArray(d)) return false;
+  for (const k of Object.keys(d)) {
+    if (k !== 'temp' && k !== 'hum') return false;
+    const v = d[k];
+    if (v == null) continue;
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) return false;
   }
   return true;
 }
@@ -370,6 +387,86 @@ export function createApp(db, config = null) {
     res.json({ ok: true, forecasts });
   });
 
+  // ── Sensor pairs (calibration drift) ────────────────────────────────────
+  app.get('/sensor-pairs', (_req, res) => {
+    const rows = listSensorPairs(db);
+    res.json({
+      ok: true,
+      pairs: rows.map(r => ({
+        id:           r.id,
+        sensorAId:    r.sensor_a_id,
+        sensorBId:    r.sensor_b_id,
+        sensorAName:  r.sensor_a_name,
+        sensorBName:  r.sensor_b_name,
+        label:        r.label,
+        createdAt:    r.created_at ? new Date(r.created_at * 1000).toISOString() : null,
+      })),
+    });
+  });
+
+  app.post('/sensor-pairs', (req, res) => {
+    const { sensorAId, sensorBId, label } = req.body ?? {};
+    if (typeof sensorAId !== 'string' || typeof sensorBId !== 'string' || !sensorAId || !sensorBId) {
+      return res.status(400).json({ ok: false, error: 'Body must include sensorAId and sensorBId (strings)' });
+    }
+    if (sensorAId === sensorBId) {
+      return res.status(400).json({ ok: false, error: 'sensorAId and sensorBId must differ' });
+    }
+    if (label != null && typeof label !== 'string') {
+      return res.status(400).json({ ok: false, error: 'label must be a string when provided' });
+    }
+    const a = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorAId);
+    const b = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorBId);
+    if (!a || !b) return res.status(404).json({ ok: false, error: 'One or both sensors not found' });
+    try {
+      const row = createSensorPair(db, { sensorAId, sensorBId, label: label ?? null });
+      res.json({ ok: true, pair: {
+        id:        row.id,
+        sensorAId: row.sensor_a_id,
+        sensorBId: row.sensor_b_id,
+        label:     row.label,
+        createdAt: row.created_at ? new Date(row.created_at * 1000).toISOString() : null,
+      } });
+    } catch (e) {
+      if (/UNIQUE/i.test(e.message)) {
+        return res.status(409).json({ ok: false, error: 'pair already exists' });
+      }
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.delete('/sensor-pairs/:id', (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'Invalid id' });
+    const ok = deleteSensorPair(db, id);
+    if (!ok) return res.status(404).json({ ok: false, error: 'Pair not found' });
+    res.json({ ok: true });
+  });
+
+  // GET /sensor-pairs/:id/drift?range=30d
+  // Returns the aligned hourly delta series + computeDriftStats summary so
+  // the Calibration panel can render a sparkline and a "stable / drifting"
+  // verdict for each pair.
+  app.get('/sensor-pairs/:id/drift', (req, res) => {
+    const id    = parseInt(req.params.id, 10);
+    const range = req.query.range || '30d';
+    const rangeSecs = rangeToSeconds(range);
+    if (!rangeSecs) return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 7d, 30d, 90d.' });
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: 'Invalid id' });
+    const pair = getSensorPair(db, id);
+    if (!pair) return res.status(404).json({ ok: false, error: 'Pair not found' });
+    const sinceTs = Math.floor(Date.now() / 1000) - rangeSecs;
+    const samples = getPairAlignedHourly(db, pair.sensor_a_id, pair.sensor_b_id, sinceTs);
+    const stats   = computeDriftStats(samples);
+    res.json({
+      ok:      true,
+      pairId:  id,
+      range,
+      samples,
+      stats,
+    });
+  });
+
   app.get('/gateways', (req, res) => {
     const rows  = getGateways(db);
     // Optional ?range=Xd attaches uptime % and sensor counts. Backward-compatible:
@@ -462,18 +559,22 @@ export function createApp(db, config = null) {
   });
 
   app.put('/settings', (req, res) => {
-    const { ranges, comfort } = req.body ?? {};
+    const { ranges, comfort, driftThresholds } = req.body ?? {};
     if (!Array.isArray(ranges) || !ranges.every(r => /^\d+(h|d|yr)$/.test(r))) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: ranges' });
     }
     if (comfort !== undefined && !_validComfortConfig(comfort)) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: comfort' });
     }
+    if (driftThresholds !== undefined && !_validDriftThresholds(driftThresholds)) {
+      return res.status(400).json({ ok: false, error: 'Invalid settings: driftThresholds' });
+    }
     // Merge with whatever else is in the meta blob (future fields stay untouched
     // even when the client only sends ranges, and vice versa).
     const existing = getUiSettings(db) || {};
     const payload = { ...existing, ranges };
-    if (comfort !== undefined) payload.comfort = comfort;
+    if (comfort !== undefined)          payload.comfort = comfort;
+    if (driftThresholds !== undefined)  payload.driftThresholds = driftThresholds;
     setUiSettings(db, payload);
     res.json({ ok: true });
   });

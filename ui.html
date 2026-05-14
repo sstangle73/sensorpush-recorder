@@ -819,6 +819,34 @@ header .spacer { flex: 1; }
   </div>
 
   <div class="set-section">
+    <h2>Sensor Pairs (Calibration Drift)</h2>
+    <p class="set-hint" style="margin-bottom:10px">Pair two sensors that measure the same environment. The Stats tab's Calibration panel will compare them and flag pairs whose 30-day delta is trending — usually a sign one sensor's calibration is drifting.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+      <select id="pair-a" class="set-text-input" style="flex:0 0 auto;width:170px;color-scheme:dark"></select>
+      <span style="color:var(--text3)">↔</span>
+      <select id="pair-b" class="set-text-input" style="flex:0 0 auto;width:170px;color-scheme:dark"></select>
+      <input type="text" id="pair-label" class="set-text-input" placeholder="Label (optional)" style="flex:0 0 auto;width:160px">
+      <button class="set-btn" onclick="createPair()">Add pair</button>
+    </div>
+    <div id="pair-list" style="margin-top:10px"></div>
+    <div class="set-subheader" style="margin-top:14px">Drift thresholds</div>
+    <p class="set-hint" style="margin:-2px 0 8px">A pair is flagged "drifting" when its 30-day slope exceeds these per-day thresholds.</p>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)">
+        Temperature
+        <input type="number" id="drift-thresh-temp" class="comfort-input" step="0.1" min="0" style="width:72px">
+        <span style="color:var(--text3)">°F/d</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)">
+        Humidity
+        <input type="number" id="drift-thresh-hum" class="comfort-input" step="0.5" min="0" style="width:72px">
+        <span style="color:var(--text3)">%RH/d</span>
+      </label>
+      <button class="set-btn" onclick="saveDriftThresholds()">Save thresholds</button>
+    </div>
+  </div>
+
+  <div class="set-section">
     <h2>Backfill Historical Data</h2>
     <p class="set-hint" style="margin-bottom:10px">Re-fetch all sensor readings from SensorPush from a start date to now. Safe to run anytime — existing data is never overwritten.</p>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -1683,6 +1711,13 @@ let _statsHistory = {};        // id → samples[]
 let _batteryForecasts = {};    // id → { slopeVPerDay, currentV, daysTo27, daysTo25, daysTo24, sampleDays } | null
 let _statsLoading = false;
 
+// Sensor-pair calibration drift. _pairs is the list from /sensor-pairs;
+// _pairDrift[pairId] caches { samples, stats } from /sensor-pairs/:id/drift.
+// Thresholds default to 0.5 °F/day and 5 %RH/day — overridable via Settings.
+let _pairs       = [];
+let _pairDrift   = {};
+const DEFAULT_DRIFT_THRESH = { temp: 0.5, hum: 5.0 };
+
 // ── stats math ─────────────────────────────────────────────────────────────
 function _mean(xs) {
   if (!xs.length) return null;
@@ -1823,16 +1858,25 @@ async function loadStats() {
       if (!_colorMap[id]) _colorMap[id] = COLORS[i % COLORS.length];
     });
     const ids = Object.keys(_sensors);
-    const [results, batt] = await Promise.all([
+    const [results, batt, pairs] = await Promise.all([
       Promise.all(ids.map(id =>
         fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
           .then(r => r.json()).catch(() => null)
       )),
       fetch(`${API_BASE}/battery`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/sensor-pairs`).then(r => r.json()).catch(() => null),
     ]);
     _statsHistory = {};
     results.forEach((d, i) => { if (d?.ok) _statsHistory[ids[i]] = d.samples || []; });
     _batteryForecasts = (batt?.ok && batt.forecasts) ? batt.forecasts : {};
+    _pairs = pairs?.ok ? pairs.pairs : [];
+    // Fetch 30-day drift for every pair in parallel. Cache on _pairDrift to
+    // avoid refetching when the user just toggles the stats range — drift is
+    // always evaluated over 30 days regardless of _statsRange.
+    const drifts = await Promise.all(_pairs.map(p =>
+      fetch(`${API_BASE}/sensor-pairs/${p.id}/drift?range=30d`).then(r => r.json()).catch(() => null)));
+    _pairDrift = {};
+    drifts.forEach((d, i) => { if (d?.ok) _pairDrift[_pairs[i].id] = d; });
     renderStats();
   } finally {
     _statsLoading = false;
@@ -2367,6 +2411,118 @@ function _batteryStatus(f) {
   return { glyph: '✓', color: 'var(--text2)', label: `~${Math.round(d25)} d`, dateStr: dateForDays(d25) };
 }
 
+// Tiny inline-SVG sparkline of a numeric series. Returns an empty placeholder
+// when there's nothing to plot. Uses a single colorblind-safe accent stroke
+// — the visual cue for "drifting vs stable" comes from the badge next to it,
+// not the line color (color is never the only carrier of meaning).
+function _sparkline(values, { w = 90, h = 22, stroke = '#888' } = {}) {
+  const nums = values.filter(v => v != null && isFinite(v));
+  if (nums.length < 2) {
+    return `<svg width="${w}" height="${h}" style="overflow:visible"><line x1="0" y1="${h/2}" x2="${w}" y2="${h/2}" stroke="${stroke}" stroke-opacity="0.25" stroke-dasharray="2 2"/></svg>`;
+  }
+  const min = Math.min(...nums), max = Math.max(...nums);
+  const range = max - min || 1;
+  const stepX = w / (values.length - 1);
+  const pts = values.map((v, i) => {
+    if (v == null || !isFinite(v)) return null;
+    const x = i * stepX;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).filter(Boolean).join(' ');
+  // Zero line so the eye can quickly see "delta ≈ 0" vs an offset.
+  const zeroY = min <= 0 && max >= 0 ? (h - ((0 - min) / range) * (h - 2) - 1) : null;
+  const zero = zeroY != null
+    ? `<line x1="0" y1="${zeroY.toFixed(1)}" x2="${w}" y2="${zeroY.toFixed(1)}" stroke="${stroke}" stroke-opacity="0.18" stroke-dasharray="2 2"/>`
+    : '';
+  return `<svg width="${w}" height="${h}" style="overflow:visible">${zero}<polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
+}
+
+// Mean of the last `windowSecs` of the delta series. Returns null when no
+// in-window samples exist (caller decides whether that's "—" or "n/a").
+function _trailingMean(samples, field, windowSecs) {
+  if (!samples.length) return null;
+  const cutoff = samples[samples.length - 1].ts - windowSecs;
+  const vals = samples.filter(s => s.ts >= cutoff).map(s => s[field]).filter(v => v != null && isFinite(v));
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+// One row per pair: sensor names, 7-day mean delta T/H, 30-day slope T/H,
+// sparkline of the 30-day delta-T series, and a status pill. Status uses
+// both shape (▲/●) and color (amber/slate) per the global accessibility
+// rule — never color alone.
+function renderCalibration() {
+  if (!_pairs?.length) return '';
+  const th = _driftThresholds();
+  const rows = _pairs.map(p => {
+    const d = _pairDrift[p.id];
+    const samples = d?.samples || [];
+    const stats   = d?.stats   || {};
+    const mean7T  = _trailingMean(samples, 'deltaTemp',     7 * 86400);
+    const mean7H  = _trailingMean(samples, 'deltaHumidity', 7 * 86400);
+    const slopeT  = stats.slopeTempPerDay;
+    const slopeH  = stats.slopeHumidityPerDay;
+    // Drift verdict: pair is "drifting" if either |slope| exceeds its
+    // threshold. Either-or because a calibration drift typically shows up
+    // on just one channel (T or RH), not both at once.
+    const driftingT = slopeT != null && Math.abs(slopeT) > th.temp;
+    const driftingH = slopeH != null && Math.abs(slopeH) > th.hum;
+    const hasData   = stats.nPairs > 0;
+    let pill;
+    if (!hasData) {
+      // ◇ + slate "no data" — distinct shape from stable/drifting so the
+      // user doesn't confuse "we haven't seen overlap" with "we checked
+      // and it's fine".
+      pill = `<span style="color:var(--text3)"><span class="stg" style="font-family:monospace;font-weight:bold">◇</span> no data</span>`;
+    } else if (driftingT || driftingH) {
+      // ▲ + amber: triangle is universally read as "attention", amber is
+      // safe for protan/deutan deficiencies.
+      const which = [driftingT ? 'T' : null, driftingH ? 'RH' : null].filter(Boolean).join('+');
+      pill = `<span style="color:var(--warn)"><span class="stg" style="font-family:monospace;font-weight:bold">▲</span> drifting (${which})</span>`;
+    } else {
+      // ● + slate: circle = "nominal", neutral color so a stable pair
+      // doesn't compete for attention with a drifting one.
+      pill = `<span style="color:var(--text3)"><span class="stg" style="font-family:monospace;font-weight:bold">●</span> stable</span>`;
+    }
+    const aColor = _colorMap[p.sensorAId] || '#888';
+    const bColor = _colorMap[p.sensorBId] || '#888';
+    const aName  = _sensors[p.sensorAId]?.name || p.sensorAName || p.sensorAId;
+    const bName  = _sensors[p.sensorBId]?.name || p.sensorBName || p.sensorBId;
+    return `<tr>
+      <td>
+        <div style="display:flex;align-items:center;gap:4px">
+          <span class="stats-dot" style="background:${aColor}"></span>${esc(aName)}
+          <span style="color:var(--text3);margin:0 4px">↔</span>
+          <span class="stats-dot" style="background:${bColor}"></span>${esc(bName)}
+        </div>
+        ${p.label ? `<div style="color:var(--text3);font-size:10px;margin-left:14px">${esc(p.label)}</div>` : ''}
+      </td>
+      <td>${mean7T != null ? fmtNum(mean7T, 2) + '°F' : '<span class="rt-dim">—</span>'}</td>
+      <td>${mean7H != null ? fmtNum(mean7H, 1) + '%'  : '<span class="rt-dim">—</span>'}</td>
+      <td>${slopeT != null ? fmtSlope(slopeT, '°F') : '<span class="rt-dim">—</span>'}</td>
+      <td>${slopeH != null ? fmtSlope(slopeH, '%')  : '<span class="rt-dim">—</span>'}</td>
+      <td>${_sparkline(samples.map(s => s.deltaTemp), { stroke: 'var(--accent)' })}</td>
+      <td>${pill}</td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="an-section"><h2>Calibration drift</h2>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr>
+        <th>Pair</th>
+        <th>Mean ΔT (7d)</th>
+        <th>Mean ΔRH (7d)</th>
+        <th>Trend T (30d)</th>
+        <th>Trend RH (30d)</th>
+        <th>ΔT sparkline (30d)</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <div class="stats-footnote">Δ = sensor A − sensor B at matched hourly buckets. "Drifting" means the 30-day linear-regression slope of the delta exceeds the per-day threshold (configurable in Settings → Sensor Pairs). A stable pair can still have a non-zero mean Δ — the sensors are in slightly different microclimates; only a *trend* in that offset means calibration is moving.</div>
+  </div>`;
+}
+
 function renderBatteryHealth(all) {
   // Include every sensor that has a current voltage OR a forecast, even if
   // the forecast came back null (a freshly-paired sensor with <7 days of
@@ -2889,6 +3045,7 @@ function renderStats() {
   c.innerHTML = [
     renderStatsHighlights(all, valid),
     renderIndoorOutdoor(all),
+    renderCalibration(),
     renderStatsTable(all, 'temperature'),
     renderStatsTable(all, 'humidity'),
     renderBreachHistory(all),
@@ -3364,6 +3521,9 @@ async function loadSettings() {
       if (resp.settings.comfort !== undefined) {
         _settings.comfort = resp.settings.comfort;
       }
+      if (resp.settings.driftThresholds !== undefined) {
+        _settings.driftThresholds = resp.settings.driftThresholds;
+      }
       return;
     }
   } catch(e) {}
@@ -3392,6 +3552,8 @@ async function renderSettings() {
   document.getElementById('ranges-input').value = _settings.ranges.join(' ');
   previewRanges();
   renderComfortPresets();
+  renderPairsPanel();
+  loadAndRenderPairs();
   // Resume progress display if a backfill is already in progress
   try {
     const state = await fetch(`${API_BASE}/backfill/status`).then(r => r.json());
@@ -3399,6 +3561,103 @@ async function renderSettings() {
     if (state.status === 'running') _schedulePollBackfill();
   } catch(e) {}
   renderAuthSection();
+}
+
+// ── Sensor pairs (calibration drift) ──────────────────────────────────────
+function _driftThresholds() {
+  const t = _settings.driftThresholds || {};
+  return {
+    temp: (typeof t.temp === 'number' && isFinite(t.temp) && t.temp >= 0) ? t.temp : DEFAULT_DRIFT_THRESH.temp,
+    hum:  (typeof t.hum  === 'number' && isFinite(t.hum)  && t.hum  >= 0) ? t.hum  : DEFAULT_DRIFT_THRESH.hum,
+  };
+}
+
+// Populate the pair-picker dropdowns and the threshold inputs. Doesn't
+// fetch the pair list — that's loadAndRenderPairs().
+function renderPairsPanel() {
+  const aSel = document.getElementById('pair-a');
+  const bSel = document.getElementById('pair-b');
+  if (!aSel || !bSel) return;
+  const ids = Object.keys(_sensors);
+  const opts = ['<option value="">— pick a sensor —</option>',
+    ...ids.map(id => `<option value="${esc(id)}">${esc(_sensors[id].name || id)}</option>`)];
+  aSel.innerHTML = opts.join('');
+  bSel.innerHTML = opts.join('');
+  const th = _driftThresholds();
+  document.getElementById('drift-thresh-temp').value = th.temp;
+  document.getElementById('drift-thresh-hum').value  = th.hum;
+}
+
+async function loadAndRenderPairs() {
+  try {
+    const r = await fetch(`${API_BASE}/sensor-pairs`).then(r => r.json());
+    _pairs = r?.ok ? r.pairs : [];
+  } catch (e) { _pairs = []; }
+  const list = document.getElementById('pair-list');
+  if (!list) return;
+  if (!_pairs.length) {
+    list.innerHTML = '<div style="color:var(--text3);font-size:11px;padding:6px 0">No pairs yet. Pick two sensors above and click "Add pair".</div>';
+    return;
+  }
+  list.innerHTML = `
+    <table class="comfort-table"><thead>
+      <tr><th>Pair</th><th>Label</th><th style="width:60px"></th></tr>
+    </thead><tbody>
+      ${_pairs.map(p => `<tr>
+        <td>${esc(p.sensorAName || p.sensorAId)} <span style="color:var(--text3)">↔</span> ${esc(p.sensorBName || p.sensorBId)}</td>
+        <td style="color:var(--text2)">${esc(p.label || '—')}</td>
+        <td><button class="set-btn danger" onclick="deletePair(${p.id})" style="padding:3px 10px;font-size:11px">Remove</button></td>
+      </tr>`).join('')}
+    </tbody></table>`;
+}
+
+async function createPair() {
+  const sensorAId = document.getElementById('pair-a').value;
+  const sensorBId = document.getElementById('pair-b').value;
+  const label     = document.getElementById('pair-label').value.trim() || null;
+  if (!sensorAId || !sensorBId) { showToast('Pick two sensors'); return; }
+  if (sensorAId === sensorBId)  { showToast('Sensors must differ'); return; }
+  try {
+    const r = await fetch(`${API_BASE}/sensor-pairs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sensorAId, sensorBId, label }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    document.getElementById('pair-label').value = '';
+    showToast('Pair added ✓');
+    await loadAndRenderPairs();
+    // Invalidate drift cache so Stats reflects the new pair next time.
+    _pairDrift = {};
+  } catch (e) {
+    showToast('Failed: ' + e.message);
+  }
+}
+
+async function deletePair(id) {
+  if (!confirm('Remove this sensor pair?')) return;
+  try {
+    const r = await fetch(`${API_BASE}/sensor-pairs/${id}`, { method: 'DELETE' });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    showToast('Pair removed');
+    delete _pairDrift[id];
+    await loadAndRenderPairs();
+  } catch (e) {
+    showToast('Failed: ' + e.message);
+  }
+}
+
+async function saveDriftThresholds() {
+  const t = parseFloat(document.getElementById('drift-thresh-temp').value);
+  const h = parseFloat(document.getElementById('drift-thresh-hum').value);
+  const next = {};
+  if (isFinite(t) && t >= 0) next.temp = t;
+  if (isFinite(h) && h >= 0) next.hum  = h;
+  _settings.driftThresholds = next;
+  await saveSettings();
+  showToast('Drift thresholds saved ✓');
 }
 
 // ── Comfort presets editor ────────────────────────────────────────────────
