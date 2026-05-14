@@ -7,6 +7,7 @@ import {
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
   getBatteryHistory, computeBatteryForecast,
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
+  createEvent, listEvents, getEventById, updateEvent, deleteEvent,
 } from '../db.js';
 
 function makeDb() {
@@ -1167,5 +1168,110 @@ describe('getPairAlignedHourly', () => {
     insertHour(db, 'sA', h0, 70, 50);
     insertHour(db, 'sB', h0 + 7200, 70, 50);
     expect(getPairAlignedHourly(db, 'sA', 'sB', h0)).toEqual([]);
+  });
+});
+
+describe('events CRUD', () => {
+  it('openDb creates the events table with the expected columns and indexes', () => {
+    const db = makeDb();
+    const tables  = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map(r => r.name);
+    const indexes = db.prepare(`SELECT name FROM sqlite_master WHERE type='index'`).all().map(r => r.name);
+    expect(tables).toContain('events');
+    expect(indexes).toContain('idx_events_ts');
+    expect(indexes).toContain('idx_events_sensor_id');
+    const cols = db.prepare(`PRAGMA table_info(events)`).all().map(r => r.name);
+    expect(cols).toEqual(expect.arrayContaining(['id', 'ts', 'sensor_id', 'label', 'note']));
+  });
+
+  it('createEvent persists a global event and returns it with an id', () => {
+    const db = makeDb();
+    const ev = createEvent(db, { ts: 1000, sensorId: null, label: 'first', note: 'hello' });
+    expect(ev).toMatchObject({ ts: 1000, sensorId: null, label: 'first', note: 'hello' });
+    expect(ev.id).toBeGreaterThan(0);
+  });
+
+  it('createEvent persists a sensor-scoped event', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'Kitchen', type: 'HT1', active: true, batteryVoltage: null }]);
+    const ev = createEvent(db, { ts: 2000, sensorId: 's1', label: 'furnace on', note: null });
+    expect(ev.sensorId).toBe('s1');
+    expect(ev.note).toBeNull();
+  });
+
+  it('getEventById returns null for unknown id', () => {
+    expect(getEventById(makeDb(), 9999)).toBeNull();
+  });
+
+  it('listEvents returns all events DESC by ts when no filters', () => {
+    const db = makeDb();
+    createEvent(db, { ts: 1000, sensorId: null, label: 'a' });
+    createEvent(db, { ts: 3000, sensorId: null, label: 'b' });
+    createEvent(db, { ts: 2000, sensorId: null, label: 'c' });
+    const rows = listEvents(db);
+    expect(rows.map(r => r.label)).toEqual(['b', 'c', 'a']);
+  });
+
+  it('listEvents filters by from/to range (inclusive)', () => {
+    const db = makeDb();
+    createEvent(db, { ts: 1000, sensorId: null, label: 'a' });
+    createEvent(db, { ts: 2000, sensorId: null, label: 'b' });
+    createEvent(db, { ts: 3000, sensorId: null, label: 'c' });
+    const rows = listEvents(db, { from: 1500, to: 2500 });
+    expect(rows.map(r => r.label)).toEqual(['b']);
+  });
+
+  it('listEvents with sensorId returns sensor-scoped + global events', () => {
+    const db = makeDb();
+    upsertSensors(db, [
+      { id: 's1', name: 'A', type: 'HT1', active: true, batteryVoltage: null },
+      { id: 's2', name: 'B', type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    createEvent(db, { ts: 1000, sensorId: null, label: 'global' });
+    createEvent(db, { ts: 2000, sensorId: 's1',  label: 's1-only' });
+    createEvent(db, { ts: 3000, sensorId: 's2',  label: 's2-only' });
+    const rows = listEvents(db, { sensorId: 's1' });
+    const labels = rows.map(r => r.label).sort();
+    expect(labels).toEqual(['global', 's1-only']);
+  });
+
+  it('listEvents with sensorId="__global__" returns only globals', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'A', type: 'HT1', active: true, batteryVoltage: null }]);
+    createEvent(db, { ts: 1000, sensorId: null, label: 'global' });
+    createEvent(db, { ts: 2000, sensorId: 's1',  label: 's1-only' });
+    const rows = listEvents(db, { sensorId: '__global__' });
+    expect(rows.map(r => r.label)).toEqual(['global']);
+  });
+
+  it('updateEvent patches fields and leaves others intact', () => {
+    const db = makeDb();
+    const ev = createEvent(db, { ts: 1000, sensorId: null, label: 'orig', note: 'orig-note' });
+    const updated = updateEvent(db, ev.id, { label: 'new' });
+    expect(updated.label).toBe('new');
+    expect(updated.note).toBe('orig-note');
+    expect(updated.ts).toBe(1000);
+  });
+
+  it('updateEvent can clear sensorId (set to null)', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'A', type: 'HT1', active: true, batteryVoltage: null }]);
+    const ev = createEvent(db, { ts: 1000, sensorId: 's1', label: 'scoped' });
+    const updated = updateEvent(db, ev.id, { sensorId: null });
+    expect(updated.sensorId).toBeNull();
+  });
+
+  it('updateEvent returns null for unknown id', () => {
+    expect(updateEvent(makeDb(), 9999, { label: 'x' })).toBeNull();
+  });
+
+  it('deleteEvent removes the row and returns true', () => {
+    const db = makeDb();
+    const ev = createEvent(db, { ts: 1000, sensorId: null, label: 'gone' });
+    expect(deleteEvent(db, ev.id)).toBe(true);
+    expect(getEventById(db, ev.id)).toBeNull();
+  });
+
+  it('deleteEvent returns false for unknown id', () => {
+    expect(deleteEvent(makeDb(), 9999)).toBe(false);
   });
 });

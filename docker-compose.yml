@@ -15,6 +15,22 @@ services:
       # Example:
       #   CORS_ORIGINS: "https://dashboard.example.com,http://localhost:8080"
       CORS_ORIGINS: ""
+      # Optional MQTT publisher (for Home Assistant or other consumers).
+      # Leave MQTT_URL empty/unset to disable — the publisher becomes a no-op
+      # and no broker connection is attempted. When set, the recorder publishes
+      # per-sensor state JSON to <MQTT_TOPIC_PREFIX><sensor_id>/state after
+      # every poll, and HA MQTT discovery configs to
+      # <MQTT_DISCOVERY_PREFIX>sensor/<sensor_id>_<metric>/config on connect
+      # and hourly thereafter. Topics use retained messages.
+      # Example:
+      #   MQTT_URL: "mqtt://broker.lan:1883"
+      #   MQTT_USERNAME: "sensorpush"
+      #   MQTT_PASSWORD: "changeme"
+      MQTT_URL: ""
+      MQTT_USERNAME: ""
+      MQTT_PASSWORD: ""
+      MQTT_TOPIC_PREFIX: "sensorpush/"
+      MQTT_DISCOVERY_PREFIX: "homeassistant/"
     volumes:
       - ./config.local.js:/config/config.local.js:ro
       - ./data:/data
