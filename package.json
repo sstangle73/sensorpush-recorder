@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.0",
+    "mqtt": "^5.15.0",
     "node-fetch": "^3.3.2"
   },
   "devDependencies": {
