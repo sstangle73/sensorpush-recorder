@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { detectCycles, pickDefaultThermostatSensor, DEFAULT_OPTS } from '../hvac.js';
+import { detectCycles, pickDefaultThermostatSensor, combineZoneSeries, DEFAULT_OPTS } from '../hvac.js';
 
 // Synthesize a `{ ts, temperature }[]` trace at `cadenceSecs` resolution
 // using a per-sample temperature function. Times start at 0 (epoch) — they
@@ -310,6 +310,78 @@ describe('detectCycles — outdoor-temp gate', () => {
     const indoor = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 6);
     const r = detectCycles(indoor, { outdoorSamples: [] });
     expect(r.gated).toBe(false);
+    expect(r.heatingCycleCount).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('combineZoneSeries', () => {
+  it('returns an empty array when no members provided', () => {
+    expect(combineZoneSeries([])).toEqual([]);
+    expect(combineZoneSeries(null)).toEqual([]);
+  });
+
+  it('passes a single sensor through one bucket per non-empty 5-min window', () => {
+    // 1h trace at 60 s cadence = 60 samples. 5-min bucketing → 12 buckets,
+    // each averaging 5 samples.
+    const samples = trace(60 * 60 - 60, 60, t => 70 + t / 3600); // 70 → 71 linear
+    const combined = combineZoneSeries([samples], 5 * 60);
+    expect(combined.length).toBe(12);
+    // Sorted by ts ascending.
+    for (let i = 1; i < combined.length; i++) {
+      expect(combined[i].ts).toBeGreaterThan(combined[i - 1].ts);
+    }
+    // Temperature is roughly monotonic with the trend.
+    expect(combined[combined.length - 1].temperature).toBeGreaterThan(combined[0].temperature);
+  });
+
+  it('averages across members per bucket — each member contributes one value', () => {
+    // Two sensors over the same window with constant temps 70 and 76.
+    // Each bucket gets one value per sensor, mean = 73.
+    const sensorA = trace(60 * 60 - 60, 60, () => 70);
+    const sensorB = trace(60 * 60 - 60, 60, () => 76);
+    const combined = combineZoneSeries([sensorA, sensorB], 5 * 60);
+    expect(combined.length).toBeGreaterThan(0);
+    for (const p of combined) {
+      expect(p.temperature).toBeCloseTo(73, 6);
+    }
+  });
+
+  it('does not let a fast-cadence sensor drown out a slow one', () => {
+    // Sensor A samples every 30s (120 samples over 1h, mean 70°F).
+    // Sensor B samples every 5 min (12 samples over 1h, mean 80°F).
+    // Without per-sensor bucketing, raw union would weight A 10× → mean ≈ 71.
+    // With bucketing, each contributes one value per 5-min bucket → mean = 75.
+    const fastA = trace(60 * 60 - 30, 30, () => 70);
+    const slowB = trace(60 * 60 - 300, 300, () => 80);
+    const combined = combineZoneSeries([fastA, slowB], 5 * 60);
+    expect(combined.length).toBeGreaterThan(0);
+    for (const p of combined) {
+      expect(p.temperature).toBeCloseTo(75, 1);
+    }
+  });
+
+  it('drops buckets where no member reported', () => {
+    // Two sensors that don't overlap in time — sensor A covers 0–30min,
+    // sensor B covers 60–90min. The 30–60min gap should have no buckets.
+    const sensorA = [];
+    for (let t = 0; t < 30 * 60; t += 60) sensorA.push({ ts: t, temperature: 70 });
+    const sensorB = [];
+    for (let t = 60 * 60; t < 90 * 60; t += 60) sensorB.push({ ts: t, temperature: 80 });
+    const combined = combineZoneSeries([sensorA, sensorB], 5 * 60);
+    // No bucket should land in the gap.
+    for (const p of combined) {
+      const inGap = p.ts >= 30 * 60 && p.ts < 60 * 60;
+      expect(inGap).toBe(false);
+    }
+  });
+
+  it('produces a series detectCycles can consume directly', () => {
+    // Two-sensor zone with a synchronized heating event.
+    const sensorA = trace(2 * 3600, 60, t => 68 + (t / (2 * 3600)) * 6);
+    const sensorB = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 6);
+    const combined = combineZoneSeries([sensorA, sensorB], 5 * 60);
+    const r = detectCycles(combined);
+    expect(r.ok).toBe(true);
     expect(r.heatingCycleCount).toBeGreaterThanOrEqual(1);
   });
 });

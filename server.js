@@ -8,7 +8,7 @@ import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
 import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
-import { detectCycles, pickDefaultThermostatSensor } from './hvac.js';
+import { detectCycles, pickDefaultThermostatSensor, combineZoneSeries } from './hvac.js';
 import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
 import { listBackups, isRestorableName, restoreBackup } from './backups.js';
 
@@ -109,7 +109,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v16';
+const CACHE='sensorpush-v17';
 // Pre-cache the root with an explicit Accept: text/html so the server's
 // content negotiation returns the UI HTML, not the JSON sensor list.
 // Without this, the install fetch goes out as Accept: */*, the cached entry
@@ -228,14 +228,14 @@ function _validHvacConfig(c) {
         for (const k2 of Object.keys(e)) {
           if (k2 === 'thermostat') {
             if (typeof e.thermostat !== 'boolean') return false;
-          } else if (k2 === 'zone') {
-            if (e.zone != null && typeof e.zone !== 'string') return false;
+          } else if (k2 === 'zone' || k2 === 'coolingZone') {
+            if (e[k2] != null && typeof e[k2] !== 'string') return false;
           } else {
             return false;
           }
         }
       }
-    } else if (k === 'shortCycleMinutes' || k === 'slopeThresholdF') {
+    } else if (k === 'shortCycleMinutes' || k === 'slopeThresholdF' || k === 'outdoorMarginF') {
       const v = c[k];
       if (v == null) continue;
       if (typeof v !== 'number' || !isFinite(v) || v <= 0) return false;
@@ -640,51 +640,74 @@ export function createApp(db, config = null, onSwap = null) {
 
     const referenceIds = explicit.length ? explicit : (autoDefault ? [autoDefault] : []);
 
-    // Per-reference analysis. For each, fetch raw history over the chosen
-    // range, plus seven 24h slices for the daily breakdown.
-    const sensorsOut = {};
+    // Group thermostat sensors into heating and cooling zones. The two zone
+    // dimensions are independent — a sensor can sit in a multi-room heating
+    // zone (e.g. furnace-served rooms share "Steam") while having its own
+    // cooling zone (e.g. its own window AC). When the user hasn't set a zone
+    // for a direction, the sensor stands alone (zone name defaults to its
+    // own sensor name).
+    const sensorById = Object.fromEntries(sensorRows.map(s => [s.id, s]));
+    const heatingZoneMap = {};
+    const coolingZoneMap = {};
+    for (const id of referenceIds) {
+      const sensor = sensorById[id];
+      if (!sensor) continue;
+      const cfg   = flagged[id] || {};
+      const hZone = (cfg.zone        || '').toString().trim() || sensor.name;
+      const cZone = (cfg.coolingZone || '').toString().trim() || sensor.name;
+      (heatingZoneMap[hZone] ||= []).push(sensor);
+      (coolingZoneMap[cZone] ||= []).push(sensor);
+    }
+
     const dayStart = (offsetDays) => {
       const d = new Date();
       d.setUTCHours(0, 0, 0, 0);
       d.setUTCDate(d.getUTCDate() - offsetDays);
       return Math.floor(d.getTime() / 1000);
     };
+    const sinceRange = Math.floor(Date.now() / 1000) - rangeSecs;
+    const sinceWeek  = dayStart(7);
 
-    for (const id of referenceIds) {
-      const sensor = sensorRows.find(s => s.id === id);
-      if (!sensor) continue;
+    const fetchSamples = (id, since) => db.prepare(
+      'SELECT ts, temperature FROM readings WHERE sensor_id=? AND ts>=? AND excluded=0 ORDER BY ts'
+    ).all(id, since);
 
-      const samples = getHistory(db, id, range);   // raw if range≤24h, hourly otherwise
-      const analysis = detectCycles(samples, opts);
+    // Analyze a zone (one or more member sensors). detectCycles runs once on
+    // the cross-member mean; the caller picks which direction's cycles to
+    // display. Daily breakdown uses the same mean over each UTC day.
+    const analyzeZone = (members) => {
+      const memberSamples = members.map(m => fetchSamples(m.id, sinceRange));
+      const combined = combineZoneSeries(memberSamples, 5 * 60);
+      const analysis = detectCycles(combined, opts);
 
-      // Daily breakdown: last 7 days, including today. Each day's samples
-      // come from getHistory at 24h resolution → raw data. We re-bucket
-      // them ourselves because getHistory only takes a "look back N" range,
-      // not an arbitrary [start, end] window.
-      const all24hRaw = db.prepare(
-        'SELECT ts, temperature FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0 ORDER BY ts'
-      ).all(id, dayStart(7));
-
+      const week = members.map(m => fetchSamples(m.id, sinceWeek));
       const dailyRuntime = [];
       for (let i = 6; i >= 0; i--) {
         const d0 = dayStart(i);
         const d1 = d0 + 86400;
-        const slice = all24hRaw.filter(r => r.ts >= d0 && r.ts < d1);
-        const day   = detectCycles(slice, opts);
-        const iso   = new Date(d0 * 1000).toISOString().slice(0, 10);
+        const slices = week.map(arr => arr.filter(r => r.ts >= d0 && r.ts < d1));
+        const dayCombined = combineZoneSeries(slices, 5 * 60);
+        const day = detectCycles(dayCombined, opts);
+        const iso = new Date(d0 * 1000).toISOString().slice(0, 10);
         dailyRuntime.push(day.ok
           ? { date: iso, heatingRuntimePct: day.heatingRuntimePct, coolingRuntimePct: day.coolingRuntimePct, cycleCount: day.cycleCount }
           : { date: iso, heatingRuntimePct: null, coolingRuntimePct: null, cycleCount: 0 });
       }
-
-      sensorsOut[id] = {
-        name:           sensor.name,
-        zone:           flagged[id]?.zone ?? null,
-        isThermostat:   flagged[id]?.thermostat === true,
-        isAutoSelected: !explicit.length && id === autoDefault,
+      return {
+        members:      members.map(m => ({ id: m.id, name: m.name })),
+        memberCount:  members.length,
         analysis,
         dailyRuntime,
       };
+    };
+
+    const heatingZones = {};
+    for (const [name, members] of Object.entries(heatingZoneMap)) {
+      heatingZones[name] = analyzeZone(members);
+    }
+    const coolingZones = {};
+    for (const [name, members] of Object.entries(coolingZoneMap)) {
+      coolingZones[name] = analyzeZone(members);
     }
 
     res.json({
@@ -694,7 +717,8 @@ export function createApp(db, config = null, onSwap = null) {
       referenceIds,
       autoDefaultId: autoDefault,
       outdoorSource,
-      sensors: sensorsOut,
+      heatingZones,
+      coolingZones,
     });
   });
 
