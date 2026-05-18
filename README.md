@@ -13,10 +13,14 @@ Polls the SensorPush cloud every 5 minutes, stores all readings locally in SQLit
 - **Gap analysis** — detects missing windows (interior, leading, and trailing), sparse hours, and per-gap gateway-online status. A dead sensor reports as one big trailing gap, not as 100% coverage.
 - **Targeted backfill** — "Fix all gaps" button re-fetches only the windows the local DB shows as missing, instead of broadly re-pulling the whole range.
 - **Data QA** — exclude individual readings or whole hourly buckets from charts and aggregates; hourly aggregates auto-recompute on exclusion.
-- **Five-tab UI** — Live (real-time cards with feels-like, alert thresholds, anomaly flags), Stats (records, hour/minute-of-day heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle, alert breach history, comfort presets), Explorer (multi-sensor chart with toggleable series, zoom, exclusion edit mode), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings.
+- **Five-tab UI** — Live (real-time cards with feels-like, alert thresholds, anomaly flags, recent events), Stats (records, hour/minute-of-day heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle, HVAC zone analysis, alert breach history, comfort presets, year-over-year overlay, indoor-vs-outdoor weather delta, battery forecast), Explorer (multi-sensor chart with toggleable series, zoom, exclusion edit mode, event markers, outdoor weather overlay), Analytics (coverage timeline, gap detail, gateway panel with uptime), Settings (comfort presets, HVAC thermostat flags, bearer token, notification sinks + condition toggles, backups list + restore).
+- **Outdoor weather correlation** — pulls hourly conditions from [Open-Meteo](https://open-meteo.com/) (no API key) for a configured `lat,lon` and overlays them on charts plus an indoor-vs-outdoor delta panel.
+- **MQTT bridge** — optional publish-only Home Assistant integration. Emits HA discovery messages hourly and retained per-sensor state every poll when `MQTT_URL` is set; no-op otherwise.
+- **Outbound notifications** — webhook + ntfy.sh sinks with per-(condition, target) state machine. Fires on transition→active and transition→recovered; conditions include threshold breach, hour-of-day anomaly, sensor-offline, gateway-offline.
+- **Prometheus `/metrics`** — text-exposition endpoint (LAN-scrape pattern; bypasses bearer auth) covering temperature/humidity/dewpoint/VPD/battery/RSSI, gateway last-seen, and poll-health.
 - **PWA** — installable, offline-shell cached via service worker.
 - **Cross-origin friendly** — explicit CORS allowlist so the same recorder can serve a primary dashboard, a kiosk, and local dev.
-- **Self-healing** — daily auto gap-fill at 03:00 plus daily SQLite snapshot to `/data/backups/` (7-day retention).
+- **Self-healing** — daily auto gap-fill at 03:00 plus daily SQLite snapshot (`VACUUM INTO`) to `/data/backups/` (7-day retention, with restore-from-snapshot UI).
 - **Battery monitoring** — UI badges sensors with low (≤2.7V) or critical (≤2.5V) battery voltage, plus projected days-until-replacement via `/battery`.
 - **CSV export** — `GET /:id/history.csv?range=7d` for spreadsheet analysis.
 
@@ -32,13 +36,13 @@ Real-time cards grouped by zone (House / Outside / Appliances / Other), with tre
 
 ### Stats
 
-Aggregated view over the selected range: per-zone highlights (warmest/coolest/most-humid/driest/most-variable/in-comfort), indoor-vs-outdoor swing, per-sensor temperature + humidity tables, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation matrix, mold/condensation risk, HVAC duty-cycle, alert breach history, and a battery-replacement forecast.
+Aggregated view over the selected range: per-zone highlights (warmest/coolest/most-humid/driest/most-variable/in-comfort), indoor-vs-outdoor swing and weather delta, per-sensor temperature + humidity tables, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation matrix, mold/condensation risk, HVAC duty-cycle + zone analysis, alert breach history, comfort presets, a battery-replacement forecast, and an opt-in year-over-year overlay when ≥1 year of data is present.
 
 ![Stats tab](docs/screenshots/stats.png)
 
 ### Explorer
 
-Multi-sensor chart with togglable series (temperature, humidity, pressure, dewpoint, heat index, VPD) and zoom, plus an edit mode for excluding bad readings or whole hourly buckets from aggregates.
+Multi-sensor chart with togglable series (temperature, humidity, pressure, dewpoint, heat index, VPD) and zoom, an outdoor-weather overlay (when `weather.{lat,lon}` is configured), user-annotated event markers, plus an edit mode for excluding bad readings or whole hourly buckets from aggregates.
 
 ![Explorer tab](docs/screenshots/explorer.png)
 
@@ -50,7 +54,7 @@ Per-gateway status with uptime % and primary-sensor count, plus a coverage summa
 
 ### Settings
 
-Range-button configuration, per-zone and per-sensor "comfort" presets used by the Stats tab, and the bearer-token controls under Security.
+Range-button configuration, per-zone and per-sensor "comfort" presets used by the Stats tab, HVAC thermostat-reference sensor flags, bearer-token controls under Security, notification sinks (webhook + ntfy) with per-condition enable toggles, and a backups panel listing daily SQLite snapshots with one-click restore.
 
 ![Settings tab](docs/screenshots/settings.png)
 
@@ -141,20 +145,30 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | `{ok, sensorCount, lastPoll, pollError}` |
-| GET | `/` | sensors list (JSON) or Explorer UI (HTML) |
+| GET | `/metrics` | Prometheus text exposition (bypasses bearer auth — LAN-scrape pattern) |
+| GET | `/` | sensors list (JSON) or Explorer UI (HTML); JSON response includes `oldestReadingTs` so the Stats YoY toggle knows whether ≥1y of data exists |
 | GET | `/gateways` | per-gateway status; optional `?range=Xd` adds uptime % + primary-sensor count |
 | GET | `/battery` | per-sensor battery voltage trend + projected days-until-replacement |
-| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg) |
+| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `2h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg); optional `endTs` anchors the window for the YoY overlay |
 | GET | `/:id/history/all?range=7d` | includes excluded points (data QA) |
 | GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition |
 | GET | `/:id/gaps?range=7d` | missing windows + sparse hours + coverage %; each gap annotated with `gatewayOnline: true \| false \| null` |
 | PATCH | `/:id/readings/exclude` | toggle reading exclusion (auto-recomputes hourly bucket) |
 | PATCH | `/:id/hourly/exclude` | toggle hourly bucket exclusion |
+| GET | `/weather?range=Xd` | Open-Meteo outdoor samples + latest reading; `{configured: false}` when no `weather.{lat,lon}` is set |
+| POST | `/weather/poll` | trigger immediate outdoor-weather fetch |
+| GET | `/hvac?range=24h` | duty-cycle inference for thermostat-reference sensors (per-cycle list, heating/cooling runtime %, 7-day daily breakdown, short-cycle warnings) |
+| GET / POST / DELETE | `/sensor-pairs` | manage same-environment sensor pairs used by drift analysis |
+| GET | `/sensor-pairs/:id/drift?range=30d` | mean delta + linear-regression slope per day; `drifting` / `stable` / `unknown` |
 | POST | `/poll` | trigger immediate cloud poll |
 | POST | `/backfill` | start broad historical re-fetch from `{fromDate: 'YYYY-MM-DD'}` (UTC midnight) |
 | POST | `/backfill-gaps` | start targeted gap-only re-fetch over `{range}` |
 | GET | `/backfill/status` | poll backfill progress (shared by both backfill modes) |
-| GET / PUT | `/settings` | persist UI preferences (comfort presets, default range, etc.) |
+| GET | `/backups` | list daily SQLite snapshots + pre-restore safety snapshots |
+| POST | `/backups/:filename/restore` | swap live DB to the chosen daily snapshot; returns the pre-restore safety filename |
+| GET / PUT | `/settings` | persist UI preferences (comfort presets, HVAC flags, notification sinks, default range, etc.) |
+| POST | `/settings/notifications/test` | one-off dispatch to webhook / ntfy / all (bypasses state machine) |
+| GET | `/settings/notifications/state` | per-condition firing state map |
 | GET / POST / DELETE | `/settings/auth` | recorder-token state, generate/rotate, clear file token |
 
 PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.json`.
@@ -162,19 +176,25 @@ PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.
 ## Architecture
 
 ```
-config.js → db.js (SQLite + schema)
+config.js → db.js (SQLite + schema) ──► notifications.js, backups.js
        ↓
-     auth.js → server.js (Express + ui.html)
-              ↑
-sensorpush.js (cloud) → poller.js
+     auth.js, hvac.js, drift.js ──► server.js (Express + ui.html)
+                                     ↑
+sensorpush.js (cloud) ──► poller.js ◄── weather.js (Open-Meteo), mqtt.js (HA)
 ```
 
 - **`sensorpush.js`** — 2-step OAuth (email/pw → authorization code → access token, cached 11h); `fetchSensors`, `fetchSamples`, `fetchGateways`.
-- **`poller.js`** — 5-minute loop. On first run backfills 30 days in 2-day chunks. On subsequent runs looks back 24h before the latest reading to catch late-published cloud data (`INSERT OR IGNORE` makes the overlap free). Also pulls gateway status and appends to `gateway_status`. Exposes `triggerPoll`, `triggerBackfill` (broad), `triggerGapBackfill` (targeted).
-- **`db.js`** — schema (`sensors`, `readings`, `hourly_agg`, `gateways`, `gateway_status`, `meta`); migrations on every `openDb()`. Hourly buckets auto-recompute on insert/exclusion changes; zombie rows (sample_count=0) are deleted rather than persisted. Also home to battery-forecast and gateway-uptime queries.
+- **`weather.js`** — Open-Meteo (no API key): `fetchCurrentWeather` + `fetchHourlyWeather` (1–92 days lookback). Both soft-fail to `[]`.
+- **`poller.js`** — 5-minute sensor loop with 24h lookback; 30-day initial backfill in 2-day chunks; separate hourly weather loop (skipped when `weather.{lat,lon}` is absent); clock-aligned daily jobs at 03:00 (auto gap-fill 7d) and 03:30 (`VACUUM INTO` snapshot + 7-day retention prune); appends to `gateway_status` each poll; per-poll MQTT publish + hourly HA discovery; exposes `triggerPoll`, `triggerBackfill`, `triggerGapBackfill`.
+- **`db.js`** — schema (`sensors`, `readings`, `hourly_agg`, `gateways`, `gateway_status`, `sensor_pairs`, `events`, `notification_state`, `outdoor_readings`, `meta`); migrations on every `openDb()`. Hourly buckets auto-recompute on insert/exclusion changes; zombie rows (sample_count=0) are deleted rather than persisted. Also home to battery-forecast and gateway-uptime queries.
+- **`hvac.js`** — pure-function module: smooths the temperature series, sign-thresholds the slope, and groups contiguous same-sign runs into heating/cooling cycles; auto-picks the lowest-variance indoor sensor when no thermostat reference is flagged.
+- **`drift.js`** — pure-function calibration-drift detector: mean delta + linear-regression slope per day for sensor pairs; classifies `drifting` / `stable` / `unknown`.
+- **`notifications.js`** — outbound webhook + ntfy dispatch with per-(condition, target) DB-backed state machine. Fires on transition→active and transition→recovered only; dedupes while stuck. Called from the poll loop after each successful poll.
+- **`mqtt.js`** — optional publish-only Home Assistant bridge. No-op when `MQTT_URL` is unset; failures isolated from the poll path.
+- **`backups.js`** — list / restore daily SQLite snapshots. Restore copies a pre-restore safety snapshot, swaps the live DB file, removes WAL/SHM sidecars, and re-opens.
 - **`auth.js`** — recorder-token resolution (env > `/data/recorder-token` file > null); generate/set/clear helpers; the bearer middleware in `server.js` calls `getToken()` on every request so rotation takes effect without a restart.
 - **`server.js`** — Express bootstrap + all routes + CORS middleware + procedurally-rendered PNG icons + service worker JS.
-- **`ui.html`** — single-page app with 5 tabs (Live / Stats / Explorer / Analytics / Settings). Stats holds records, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle, breach history, battery forecast. Explorer remains the deep-dive chart with edit mode + targeted "Fix all gaps" button.
+- **`ui.html`** — single-page app with 5 tabs (Live / Stats / Explorer / Analytics / Settings). Stats holds records, hour-of-day + minute-of-hour heatmaps, sensor-pair correlation, mold/condensation risk, HVAC duty-cycle + zone analysis, breach history, comfort presets, battery forecast, year-over-year overlay, and an indoor-vs-outdoor weather delta panel. Explorer remains the deep-dive chart with edit mode, event markers, outdoor overlay, and a targeted "Fix all gaps" button.
 
 ## Tests
 
@@ -183,7 +203,7 @@ npm install
 npm test
 ```
 
-250 vitest tests across 7 files: `auth.test.js`, `config.test.js`, `db.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`. All run in-memory (no DB or network required); `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively.
+Vitest suite across 14 files: `auth`, `backups`, `config`, `db`, `drift`, `events-auth`, `hvac`, `mqtt`, `notifications`, `poller`, `sensorpush`, `server`, `ui-helpers`, `weather`. Most run in-memory (no DB or network required); `backups.test.js` uses a filesystem fixture since restore is fs-level. `sensorpush.test.js` and `poller.test.js` mock `node-fetch` and `../sensorpush.js` respectively. Run `npm test` for the current pass count.
 
 CI: `.gitlab-ci.yml` runs `npm test` on every push and merge request against a Node 22-alpine runner.
 

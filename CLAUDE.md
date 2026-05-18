@@ -91,7 +91,7 @@ npx vitest run tests/db.test.js
 npm run test:watch
 ```
 
-- Test files: `auth.test.js`, `backups.test.js`, `config.test.js`, `db.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `weather.test.js`.
+- Test files: `auth.test.js`, `backups.test.js`, `config.test.js`, `db.test.js`, `drift.test.js`, `events-auth.test.js`, `hvac.test.js`, `mqtt.test.js`, `notifications.test.js`, `poller.test.js`, `sensorpush.test.js`, `server.test.js`, `ui-helpers.test.js`, `weather.test.js`.
 - Server tests use `http.createServer(createApp(db))` on port 0 with an in-memory SQLite.
 - `sensorpush.test.js` mocks `node-fetch` to drive the OAuth + samples flows.
 - `poller.test.js` mocks `../sensorpush.js` (getToken / fetchSensors / fetchSamples / fetchGateways) — the default `fetchGateways.mockResolvedValue([])` is set in `beforeEach` so tests that don't care about gateways don't have to.
