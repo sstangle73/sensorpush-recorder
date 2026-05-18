@@ -2291,7 +2291,7 @@ async function loadStats() {
       fetch(`${API_BASE}/sensor-pairs`).then(r => r.json()).catch(() => null),
       // HVAC analysis always uses 24h for the "today" gauge — independent of
       // _statsRange. The route's daily breakdown covers the last 7 days.
-      fetch(`${API_BASE}/hvac?range=24h`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/hvac?range=24h&tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC')}`).then(r => r.json()).catch(() => null),
       // Stats only needs the latest outdoor reading for the "current delta"
       // panel; range=24h is just to satisfy the API contract.
       _outdoorConfigured ? fetch(`${API_BASE}/weather?range=24h`).then(r => r.json()).catch(() => null) : null,

@@ -109,7 +109,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v17';
+const CACHE='sensorpush-v18';
 // Pre-cache the root with an explicit Accept: text/html so the server's
 // content negotiation returns the UI HTML, not the JSON sensor list.
 // Without this, the install fetch goes out as Accept: */*, the cached entry
@@ -250,6 +250,41 @@ function _validHvacConfig(c) {
 // kept in sync with the keyword set there. Used to scope the auto-default
 // thermostat reference to indoor sensors only. If you tweak the keyword
 // lists in ui.html, update them here too.
+// Compute (epochMs - "wall clock as if it were UTC") for a given IANA tz at a
+// given instant — i.e. the tz's offset in seconds, with DST applied. Returns
+// 0 for an unknown tz so callers degrade to UTC behavior rather than
+// erroring. Uses Intl.DateTimeFormat for tz arithmetic (no library deps).
+function _tzOffsetSecs(epochMs, tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', second: 'numeric',
+    });
+    const parts = fmt.formatToParts(new Date(epochMs));
+    const get = k => parts.find(p => p.type === k)?.value;
+    const h = +get('hour') === 24 ? 0 : +get('hour');
+    const localAsUtc = Date.UTC(+get('year'), +get('month') - 1, +get('day'),
+                                h, +get('minute'), +get('second'));
+    return Math.round((localAsUtc - epochMs) / 1000);
+  } catch {
+    return 0;
+  }
+}
+
+// Format a UTC epoch-seconds value as a YYYY-MM-DD string in the given tz.
+// Used so daily-breakdown date labels match the user's calendar day.
+function _localDateStr(epochSecs, tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    return fmt.format(new Date(epochSecs * 1000));
+  } catch {
+    return new Date(epochSecs * 1000).toISOString().slice(0, 10);
+  }
+}
+
 function _classifySensorGroup(name) {
   const n = name || '';
   if (/\b(fridge|refrig|freezer|cabinet|rack|server|cooler|wine|incubator|pantry)\b/i.test(n))
@@ -659,12 +694,20 @@ export function createApp(db, config = null, onSwap = null) {
       (coolingZoneMap[cZone] ||= []).push(sensor);
     }
 
-    const dayStart = (offsetDays) => {
-      const d = new Date();
-      d.setUTCHours(0, 0, 0, 0);
-      d.setUTCDate(d.getUTCDate() - offsetDays);
-      return Math.floor(d.getTime() / 1000);
-    };
+    // Daily buckets must align with the *user's* local calendar day, not the
+    // server's UTC day — otherwise a user east of UTC sees "today's" data
+    // labeled with tomorrow's date (the UTC day rolls over while their local
+    // clock still shows yesterday-evening). The UI passes the browser's tz
+    // as a query param; we fall back to UTC if absent or invalid.
+    const tz = (req.query.tz || 'UTC').toString();
+    const tzOffsetSecs = _tzOffsetSecs(Date.now(), tz);
+    const todayLocalMidnightUtcSecs = (() => {
+      const nowMs = Date.now();
+      const m = new Date(nowMs + tzOffsetSecs * 1000);
+      m.setUTCHours(0, 0, 0, 0);
+      return Math.floor(m.getTime() / 1000) - tzOffsetSecs;
+    })();
+    const dayStart = (offsetDays) => todayLocalMidnightUtcSecs - offsetDays * 86400;
     const sinceRange = Math.floor(Date.now() / 1000) - rangeSecs;
     const sinceWeek  = dayStart(7);
 
@@ -688,7 +731,7 @@ export function createApp(db, config = null, onSwap = null) {
         const slices = week.map(arr => arr.filter(r => r.ts >= d0 && r.ts < d1));
         const dayCombined = combineZoneSeries(slices, 5 * 60);
         const day = detectCycles(dayCombined, opts);
-        const iso = new Date(d0 * 1000).toISOString().slice(0, 10);
+        const iso = _localDateStr(d0, tz);
         dailyRuntime.push(day.ok
           ? { date: iso, heatingRuntimePct: day.heatingRuntimePct, coolingRuntimePct: day.coolingRuntimePct, cycleCount: day.cycleCount }
           : { date: iso, heatingRuntimePct: null, coolingRuntimePct: null, cycleCount: 0 });
