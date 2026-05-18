@@ -416,7 +416,8 @@ export function getSensors(db) {
   return db.prepare(`
     SELECT s.id, s.name, s.type, s.active, s.battery_voltage, s.alerts,
            s.rssi, s.address, s.device_id,
-           r.temperature, r.humidity, r.baro_pressure, r.ts AS last_ts
+           r.temperature, r.humidity, r.baro_pressure, r.dewpoint, r.vpd,
+           r.ts AS last_ts
     FROM sensors s
     LEFT JOIN readings r ON r.sensor_id = s.id
       AND r.ts = (SELECT MAX(ts) FROM readings WHERE sensor_id = s.id AND excluded = 0)
