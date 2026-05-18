@@ -3682,9 +3682,12 @@ function renderHvacPanel() {
   }).join('');
 
   const anyGated = ids.some(id => info.sensors?.[id]?.analysis?.gated);
+  const sourceLabel = info.outdoorSource === 'outside-sensor' ? 'an outside-tagged sensor'
+                    : info.outdoorSource === 'open-meteo'     ? 'Open-Meteo'
+                    :                                           'outdoor data';
   const gateNote = anyGated
-    ? ` When outdoor data is available, cycles are <b>gated by direction</b>: a heating cycle requires outdoor temp at least ${info.config?.outdoorMarginF ?? 2}°F below indoor (and vice versa for cooling), so "AC just shut off and the room warmed back up" no longer registers as a heating cycle.`
-    : ` Outdoor gating is currently inactive — configure <code>weather.lat/lon</code> to suppress off-recovery mislabeling.`;
+    ? ` Cycles are <b>gated by direction</b> using ${sourceLabel}: a heating cycle requires outdoor temp at least ${info.config?.outdoorMarginF ?? 2}°F below indoor (and vice versa for cooling), so "AC just shut off and the room warmed back up" no longer registers as a heating cycle.`
+    : ` Outdoor gating is currently inactive — tag a sensor with "outside" / "outdoor" / "yard" / "patio" / "deck" in its name, or configure <code>weather.lat/lon</code>, to suppress off-recovery mislabeling.`;
   return `<div class="an-section"><h2>HVAC zone analysis</h2>
     ${blocks}
     <div class="stats-footnote">Runtime is the fraction of the window where the room's smoothed temperature was changing faster than ${info.config?.slopeThresholdF ?? 0.5}°F/hr — positive slope = heating, negative = cooling. Cycle boundaries come from slope sign changes after a 15-min smoothing pass.${gateNote} Short cycles (compressor or burner runs that end before the threshold) often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Flag additional thermostat-reference sensors in Settings → HVAC if you have multiple zones.</div>
