@@ -109,7 +109,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v14';
+const CACHE='sensorpush-v15';
 // Pre-cache the root with an explicit Accept: text/html so the server's
 // content negotiation returns the UI HTML, not the JSON sensor list.
 // Without this, the install fetch goes out as Accept: */*, the cached entry
@@ -574,16 +574,47 @@ export function createApp(db, config = null, onSwap = null) {
     const outdoorMarginF  = hvacCfg.outdoorMarginF    != null ? hvacCfg.outdoorMarginF    : 2.0;
     const flagged         = hvacCfg.sensors || {};
 
+    const sensorRows = db.prepare('SELECT id, name FROM sensors').all();
+    const explicit   = sensorRows.filter(s => flagged[s.id]?.thermostat === true).map(s => s.id);
+
     // Outdoor samples (when available) gate cycle classification: a heating
     // cycle requires outdoor < indoor − margin, cooling requires the reverse.
     // Without this, "AC just shut off and the room is warming back up" gets
-    // labeled as a heating cycle. Fetch the union of the request range and
-    // the 7-day daily-breakdown window so a single dataset covers every
-    // detectCycles call below.
+    // labeled as a heating cycle. Source priority:
+    //   1. Sensors classified as 'outside' by name — preferred because they
+    //      sample at 5 min cadence with the same hardware as indoor sensors,
+    //      so deltas are apples-to-apples and there's no external dependency.
+    //   2. outdoor_readings (Open-Meteo) — fallback when no outside-tagged
+    //      sensor exists in the install.
+    // Fetch the union of the request range and the 7-day daily-breakdown
+    // window so a single dataset covers every detectCycles call below.
     const outdoorLookbackSecs = Math.max(rangeSecs, 7 * 86400);
-    const outdoorSamples = db.prepare(
-      'SELECT ts, temp FROM outdoor_readings WHERE ts >= ? ORDER BY ts'
-    ).all(Math.floor(Date.now() / 1000) - outdoorLookbackSecs);
+    const since = Math.floor(Date.now() / 1000) - outdoorLookbackSecs;
+    const outsideIds = sensorRows
+      .filter(s => _classifySensorGroup(s.name) === 'outside')
+      .map(s => s.id);
+    let outdoorSamples = [];
+    let outdoorSource  = null;
+    if (outsideIds.length) {
+      // UNION across all outside sensors; ORDER BY ts so the gate's
+      // sliding window can short-circuit on sorted input. If a cycle's
+      // window catches readings from multiple outside sensors they're
+      // averaged together — fine because two outside sensors a few feet
+      // apart should agree to within a degree.
+      const placeholders = outsideIds.map(() => '?').join(',');
+      outdoorSamples = db.prepare(
+        `SELECT ts, temperature AS temp FROM readings
+         WHERE sensor_id IN (${placeholders}) AND ts >= ? AND excluded = 0
+         ORDER BY ts`
+      ).all(...outsideIds, since);
+      if (outdoorSamples.length) outdoorSource = 'outside-sensor';
+    }
+    if (!outdoorSamples.length) {
+      outdoorSamples = db.prepare(
+        'SELECT ts, temp FROM outdoor_readings WHERE ts >= ? ORDER BY ts'
+      ).all(since);
+      if (outdoorSamples.length) outdoorSource = 'open-meteo';
+    }
 
     const opts = {
       shortCycleSecs:  Math.max(1, shortCycleMins * 60),
@@ -591,9 +622,6 @@ export function createApp(db, config = null, onSwap = null) {
       outdoorMarginF:  outdoorMarginF,
       outdoorSamples:  outdoorSamples.length ? outdoorSamples : undefined,
     };
-
-    const sensorRows = db.prepare('SELECT id, name FROM sensors').all();
-    const explicit   = sensorRows.filter(s => flagged[s.id]?.thermostat === true).map(s => s.id);
 
     // Auto-default: most-stable indoor sensor over last 24h. Skip when the
     // user has explicit flags (they've made their choice).
@@ -665,6 +693,7 @@ export function createApp(db, config = null, onSwap = null) {
       config: { shortCycleMinutes: shortCycleMins, slopeThresholdF, outdoorMarginF },
       referenceIds,
       autoDefaultId: autoDefault,
+      outdoorSource,
       sensors: sensorsOut,
     });
   });
