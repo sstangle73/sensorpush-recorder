@@ -571,11 +571,25 @@ export function createApp(db, config = null, onSwap = null) {
     const hvacCfg         = settings.hvac || {};
     const shortCycleMins  = hvacCfg.shortCycleMinutes != null ? hvacCfg.shortCycleMinutes : 5;
     const slopeThresholdF = hvacCfg.slopeThresholdF   != null ? hvacCfg.slopeThresholdF   : 0.5;
+    const outdoorMarginF  = hvacCfg.outdoorMarginF    != null ? hvacCfg.outdoorMarginF    : 2.0;
     const flagged         = hvacCfg.sensors || {};
+
+    // Outdoor samples (when available) gate cycle classification: a heating
+    // cycle requires outdoor < indoor − margin, cooling requires the reverse.
+    // Without this, "AC just shut off and the room is warming back up" gets
+    // labeled as a heating cycle. Fetch the union of the request range and
+    // the 7-day daily-breakdown window so a single dataset covers every
+    // detectCycles call below.
+    const outdoorLookbackSecs = Math.max(rangeSecs, 7 * 86400);
+    const outdoorSamples = db.prepare(
+      'SELECT ts, temp FROM outdoor_readings WHERE ts >= ? ORDER BY ts'
+    ).all(Math.floor(Date.now() / 1000) - outdoorLookbackSecs);
 
     const opts = {
       shortCycleSecs:  Math.max(1, shortCycleMins * 60),
       slopeThresholdF: slopeThresholdF,
+      outdoorMarginF:  outdoorMarginF,
+      outdoorSamples:  outdoorSamples.length ? outdoorSamples : undefined,
     };
 
     const sensorRows = db.prepare('SELECT id, name FROM sensors').all();
@@ -648,7 +662,7 @@ export function createApp(db, config = null, onSwap = null) {
     res.json({
       ok: true,
       range,
-      config: { shortCycleMinutes: shortCycleMins, slopeThresholdF },
+      config: { shortCycleMinutes: shortCycleMins, slopeThresholdF, outdoorMarginF },
       referenceIds,
       autoDefaultId: autoDefault,
       sensors: sensorsOut,
