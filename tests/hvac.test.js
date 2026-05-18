@@ -164,6 +164,136 @@ describe('detectCycles — runtime % bounds', () => {
   });
 });
 
+describe('detectCycles — outdoor-temp gate', () => {
+  // Build a flat outdoor trace at a constant temperature across the same
+  // window as the indoor trace, hourly cadence (matches real Open-Meteo
+  // sampling). Start at t=0 to align with `trace()`.
+  function flatOutdoor(durationSecs, temp) {
+    const out = [];
+    for (let t = 0; t <= durationSecs; t += 3600) out.push({ ts: t, temp });
+    return out;
+  }
+
+  it('keeps a heating cycle when outdoor is colder than indoor by ≥ margin', () => {
+    // Indoor ramps 68 → 74 (heater running on a cold day). Outdoor steady 40°F,
+    // well below indoor − 2°F margin ⇒ direction matches, cycle kept.
+    const indoor   = trace(2 * 3600, 60, t => 68 + (t / (2 * 3600)) * 6);
+    const outdoor  = flatOutdoor(2 * 3600, 40);
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.gated).toBe(true);
+    expect(r.heatingCycleCount).toBeGreaterThanOrEqual(1);
+    expect(r.heatingRuntimePct).toBeGreaterThan(0.5);
+  });
+
+  it('drops a "heating" cycle when outdoor is warmer than indoor (AC off-recovery scenario)', () => {
+    // Indoor warms 72 → 78 — same slope as a heating cycle, but outdoor is
+    // 88°F (summer afternoon). This is the building re-warming after the AC
+    // cycled off, not the heater. Gate should drop it entirely.
+    const indoor  = trace(2 * 3600, 60, t => 72 + (t / (2 * 3600)) * 6);
+    const outdoor = flatOutdoor(2 * 3600, 88);
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.gated).toBe(true);
+    expect(r.heatingCycleCount).toBe(0);
+    expect(r.heatingRuntimePct).toBe(0);
+    expect(r.dominantKind).toBe('idle');
+  });
+
+  it('drops a "cooling" cycle when outdoor is colder than indoor (heater off-recovery)', () => {
+    // Indoor cools 74 → 68, but it's 30°F outside — this is heat loss after
+    // the furnace shut off, not the AC.
+    const indoor  = trace(2 * 3600, 60, t => 74 - (t / (2 * 3600)) * 6);
+    const outdoor = flatOutdoor(2 * 3600, 30);
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.gated).toBe(true);
+    expect(r.coolingCycleCount).toBe(0);
+    expect(r.coolingRuntimePct).toBe(0);
+  });
+
+  it('drops cycles within the margin (indoor and outdoor too close to disambiguate)', () => {
+    // Indoor 70 → 73 (heating slope), outdoor 72°F. delta = -2°F at most,
+    // not beyond the 2°F default margin ⇒ drop.
+    const indoor  = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 3);
+    const outdoor = flatOutdoor(2 * 3600, 72);
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.heatingCycleCount).toBe(0);
+  });
+
+  it('respects a custom outdoorMarginF', () => {
+    // Same indoor heating ramp 70 → 73 with outdoor 65°F (delta = ~6°F).
+    // Margin = 8°F → outdoor (65) is NOT ≥ indoor (~71.5) − 8 = 63.5, so cycle kept.
+    // Wait: heating gate is "drop if outdoor >= indoor - margin". outdoor=65,
+    // indoor≈71.5, margin=8 → indoor-margin=63.5, outdoor(65) >= 63.5 → drop.
+    const indoor   = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 3);
+    const outdoor  = flatOutdoor(2 * 3600, 65);
+    const lenient = detectCycles(indoor, { outdoorSamples: outdoor, outdoorMarginF: 0.5 });
+    const strict  = detectCycles(indoor, { outdoorSamples: outdoor, outdoorMarginF: 8.0 });
+    expect(lenient.heatingCycleCount).toBeGreaterThanOrEqual(1);
+    expect(strict.heatingCycleCount).toBe(0);
+  });
+
+  it('behaves identically to ungated when outdoorSamples are absent', () => {
+    const indoor    = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 6);
+    const ungated   = detectCycles(indoor);
+    const noSamples = detectCycles(indoor, { outdoorSamples: undefined });
+    expect(ungated.gated).toBe(false);
+    expect(noSamples.gated).toBe(false);
+    expect(noSamples.heatingCycleCount).toBe(ungated.heatingCycleCount);
+    expect(noSamples.heatingRuntimePct).toBeCloseTo(ungated.heatingRuntimePct, 6);
+  });
+
+  it('keeps a cycle whose time window has no outdoor coverage (no-opinion fallback)', () => {
+    // Indoor heating cycle in the early window; outdoor data only available
+    // far in the future. Cycle should be kept because gate has no opinion.
+    const indoor   = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 6);
+    const outdoor  = [{ ts: 30 * 3600, temp: 80 }, { ts: 31 * 3600, temp: 80 }];
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.gated).toBe(true);
+    expect(r.heatingCycleCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('partitions a mixed day correctly: keeps real cycles, drops off-recovery', () => {
+    // Continuous 24h trace split into a cold morning and a warm afternoon.
+    // Each half has one real cycle + one off-recovery cycle, separated by an
+    // idle hold. The outdoor temp transition happens during the long idle
+    // stretch at hour 12, so the smoother can't bridge the seasons.
+    //
+    //   0– 2h: heating ramp 68→74    (outdoor 35 ⇒ kept, real heater run)
+    //   2– 4h: cooling drift 74→71   (outdoor 35 ⇒ dropped, heater off-recovery)
+    //   4–12h: hold at 71            (idle)
+    //  12–14h: cooling ramp 71→65    (outdoor 85 ⇒ kept, real AC run)
+    //  14–16h: heating drift 65→68   (outdoor 85 ⇒ dropped, AC off-recovery)
+    //  16–24h: hold at 68            (idle)
+    const indoor = trace(24 * 3600, 60, t => {
+      if (t <  2 * 3600) return 68 + (t / (2 * 3600)) * 6;                       // 68→74
+      if (t <  4 * 3600) return 74 - ((t -  2 * 3600) / (2 * 3600)) * 3;          // 74→71
+      if (t < 12 * 3600) return 71;
+      if (t < 14 * 3600) return 71 - ((t - 12 * 3600) / (2 * 3600)) * 6;          // 71→65
+      if (t < 16 * 3600) return 65 + ((t - 14 * 3600) / (2 * 3600)) * 3;          // 65→68
+      return 68;
+    });
+    const outdoor = [];
+    for (let t = 0; t <= 24 * 3600; t += 3600) {
+      outdoor.push({ ts: t, temp: t < 12 * 3600 ? 35 : 85 });
+    }
+    const r = detectCycles(indoor, { outdoorSamples: outdoor });
+    expect(r.gated).toBe(true);
+    // One real heating + one real cooling survive; the two drifts drop.
+    expect(r.heatingCycleCount).toBe(1);
+    expect(r.coolingCycleCount).toBe(1);
+    // Sanity: ungated baseline would have caught the drifts too.
+    const baseline = detectCycles(indoor);
+    expect(baseline.heatingCycleCount + baseline.coolingCycleCount)
+      .toBeGreaterThan(r.heatingCycleCount + r.coolingCycleCount);
+  });
+
+  it('reports gated=false explicitly when outdoor list is empty array', () => {
+    const indoor = trace(2 * 3600, 60, t => 70 + (t / (2 * 3600)) * 6);
+    const r = detectCycles(indoor, { outdoorSamples: [] });
+    expect(r.gated).toBe(false);
+    expect(r.heatingCycleCount).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('pickDefaultThermostatSensor', () => {
   // Build a 24h trace at 5min cadence around `base` with given noise amplitude.
   function tr(base, noise) {

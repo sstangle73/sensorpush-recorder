@@ -17,8 +17,18 @@
 //   5. Group adjacent same-state samples into cycles. The cycle's duration
 //      is `endTs - startTs`; cycles strictly shorter than `shortCycleSecs`
 //      are flagged as short-cycling.
-//   6. Aggregate runtime % per state (heating, cooling, idle) and per-cycle
-//      mean length, both overall and split by kind.
+//   6. Optional outdoor-temp gate: when `opts.outdoorSamples` are supplied,
+//      each cycle is checked against the mean outdoor temperature during
+//      its window. A heating cycle requires outdoor < indoor − margin
+//      (heater is doing real work against the environment); a cooling
+//      cycle requires outdoor > indoor + margin. Cycles that fail are
+//      passive thermal drift — most commonly the building re-equilibrating
+//      after the *opposite* unit shut off — and are dropped. This is the
+//      only mechanism in the algorithm that can distinguish "the heater
+//      ran" from "the AC just stopped and the room is warming back up,"
+//      which have identical signatures in temperature alone.
+//   7. Aggregate runtime % per state (heating, cooling, idle) and per-cycle
+//      mean length from the (gated) cycle list.
 //
 // "Distinguish heating vs cooling by sign of the dominant trend": each
 // cycle's `kind` is set from the average slope across that cycle. A cycle
@@ -33,7 +43,67 @@ export const DEFAULT_OPTS = {
   slopeThresholdF:   0.5,     // °F/hr — "the room is being driven"
   shortCycleSecs:    5 * 60,  // cycles shorter than 5 min are flagged
   minSamples:        12,      // <12 valid samples → return empty analysis
+  outdoorMarginF:    2.0,     // °F — indoor must beat outdoor by this much in the
+                              // cycle's direction for the cycle to count (heating
+                              // requires outdoor < indoor − margin, cooling the
+                              // reverse). Only consulted when outdoorSamples are
+                              // supplied. Defeats off-recovery mislabeling — when
+                              // an AC unit shuts off the building warms back up,
+                              // which looks identical to a heating cycle in a
+                              // pure-temperature trace.
 };
+
+// Mean indoor (smoothed) temperature across a [startTs, endTs] window.
+// Used by the outdoor-temp gate. Returns null if no smoothed samples fall
+// within the window (shouldn't happen for any cycle emitted by _segmentCycles,
+// since cycle bounds come from sample timestamps, but defensive).
+function _meanIndoorOver(smoothed, startTs, endTs) {
+  let sum = 0, n = 0;
+  for (const p of smoothed) {
+    if (p.ts < startTs) continue;
+    if (p.ts > endTs) break; // smoothed is sorted by ts
+    sum += p.t; n++;
+  }
+  return n ? sum / n : null;
+}
+
+// Mean outdoor temperature near a [startTs, endTs] cycle window. We accept
+// samples up to `maxGapSecs` outside the window because outdoor data lives
+// at hourly cadence and most cycles are shorter than an hour. Returns null
+// when no outdoor sample is within reach — caller treats that as "no opinion"
+// (keep the cycle) rather than evidence either way.
+function _meanOutdoorOver(outdoorSamples, startTs, endTs, maxGapSecs = 2 * 3600) {
+  if (!outdoorSamples?.length) return null;
+  let sum = 0, n = 0;
+  const lo = startTs - maxGapSecs, hi = endTs + maxGapSecs;
+  for (const s of outdoorSamples) {
+    if (s.ts < lo) continue;
+    if (s.ts > hi) break; // sorted
+    if (s.temp == null || !isFinite(s.temp)) continue;
+    sum += s.temp; n++;
+  }
+  return n ? sum / n : null;
+}
+
+// Direction-of-energy check: a heating cycle requires the building to be
+// losing heat to outdoors (so the heater is doing real work); a cooling
+// cycle requires the building to be gaining heat from outdoors. Cycles that
+// fail this test are passive thermal drift (sun, occupancy, building
+// re-equilibrating after the *opposite* unit just shut off) and get
+// silently dropped — they're not HVAC, even if the slope qualified.
+function _applyOutdoorGate(cycles, smoothed, outdoorSamples, marginF) {
+  if (!outdoorSamples?.length) return { filtered: cycles, gated: false };
+  const kept = [];
+  for (const c of cycles) {
+    const meanIndoor  = _meanIndoorOver(smoothed, c.startTs, c.endTs);
+    const meanOutdoor = _meanOutdoorOver(outdoorSamples, c.startTs, c.endTs);
+    if (meanIndoor == null || meanOutdoor == null) { kept.push(c); continue; }
+    if (c.kind === 'heating' && meanOutdoor >= meanIndoor - marginF) continue;
+    if (c.kind === 'cooling' && meanOutdoor <= meanIndoor + marginF) continue;
+    kept.push(c);
+  }
+  return { filtered: kept, gated: true };
+}
 
 // Build the centered rolling mean of `points` (already sorted by ts).
 // For each point, average all samples whose ts is within ±halfWindow.
@@ -139,8 +209,16 @@ function _segmentCycles(smoothed, slopes, thresh) {
 //     meanCoolingCycleSecs: null if no cooling cycles,
 //     dominantKind:         'heating' | 'cooling' | 'idle' — whichever has the
 //                           larger runtime (idle if both runtimes are zero),
+//     gated:                true iff opts.outdoorSamples was supplied and the
+//                           outdoor-temp direction check was applied,
 //     opts:                 the effective options used (for callers/tests),
 //   }
+//
+// Opts (additional, beyond DEFAULT_OPTS):
+//   outdoorSamples: [{ ts, temp }] — optional; when present enables the
+//                   outdoor-temp gate (see step 6 above). Hourly cadence is
+//                   fine; cycles within 2h of an outdoor sample are gated,
+//                   ones without nearby outdoor data are left alone.
 //
 // For traces with fewer than `minSamples` valid temperature points, returns
 // `{ ok: false, reason: 'insufficient-data', validSamples }` so callers can
@@ -158,7 +236,10 @@ export function detectCycles(readings, opts = {}) {
 
   const smoothed = _rollingMean(valid, Math.floor(o.smoothWindowSecs / 2));
   const slopes   = _slopes(smoothed);
-  const cycles   = _segmentCycles(smoothed, slopes, o.slopeThresholdF);
+  const rawCycles = _segmentCycles(smoothed, slopes, o.slopeThresholdF);
+  const { filtered: cycles, gated } = _applyOutdoorGate(
+    rawCycles, smoothed, opts.outdoorSamples, o.outdoorMarginF,
+  );
 
   const totalSecs = smoothed[smoothed.length - 1].ts - smoothed[0].ts;
   let heatingRuntimeSecs = 0, coolingRuntimeSecs = 0;
@@ -193,6 +274,7 @@ export function detectCycles(readings, opts = {}) {
     meanHeatingCycleSecs: meanOf(heatingCycles),
     meanCoolingCycleSecs: meanOf(coolingCycles),
     dominantKind,
+    gated,
     opts: o,
   };
 }
