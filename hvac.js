@@ -9,15 +9,25 @@
 //      900s = 15min window). Smoothing kills per-sample sensor noise and the
 //      fast oscillations a real HVAC compressor causes inside its on-state,
 //      so the slope reflects the building's response, not the duty cycle.
-//   3. At each smoothed sample, compute the instantaneous slope dT/dt from
-//      a centered finite difference (uses the neighbors closest in time).
-//      Slope is reported in °F per hour for human-readable thresholding.
-//   4. Classify each sample's state: HEATING when slope ≥ +slopeThresholdF,
-//      COOLING when slope ≤ −slopeThresholdF, IDLE otherwise.
-//   5. Group adjacent same-state samples into cycles. The cycle's duration
+//   3. Decimate the smoothed series to a fixed-cadence grid (default
+//      300s = 5min). Without this, sensors that transmit faster than once
+//      per minute produce per-sample slope jitter that flickers across the
+//      classification threshold, emitting phantom sub-minute cycles. The
+//      grid resolution is also the minimum possible cycle duration.
+//   4. At each decimated sample, compute the instantaneous slope dT/dt from
+//      a centered finite difference. Slope is reported in °F per hour for
+//      human-readable thresholding.
+//   5. Classify each sample's state via a Schmitt trigger: ENTER heating
+//      when slope ≥ +slopeThresholdF, STAY heating until slope drops below
+//      slopeThresholdF × slopeHysteresisRatio (default 40%, i.e. 0.2 °F/hr
+//      for a 0.5 °F/hr enter threshold). Cooling is the symmetric inverse.
+//      Hysteresis suppresses idle↔driven flicker when the slope hovers near
+//      the threshold.
+//   6. Group adjacent same-state samples into cycles. The cycle's duration
 //      is `endTs - startTs`; cycles strictly shorter than `shortCycleSecs`
-//      are flagged as short-cycling.
-//   6. Optional outdoor-temp gate: when `opts.outdoorSamples` are supplied,
+//      are flagged as short-cycling. (Default shortCycleSecs equals
+//      decimateSecs, so the flag is meaningful only when raised.)
+//   7. Optional outdoor-temp gate: when `opts.outdoorSamples` are supplied,
 //      each cycle is checked against the mean outdoor temperature during
 //      its window. A heating cycle requires outdoor < indoor − margin
 //      (heater is doing real work against the environment); a cooling
@@ -27,7 +37,7 @@
 //      only mechanism in the algorithm that can distinguish "the heater
 //      ran" from "the AC just stopped and the room is warming back up,"
 //      which have identical signatures in temperature alone.
-//   7. Aggregate runtime % per state (heating, cooling, idle) and per-cycle
+//   8. Aggregate runtime % per state (heating, cooling, idle) and per-cycle
 //      mean length from the (gated) cycle list.
 //
 // "Distinguish heating vs cooling by sign of the dominant trend": each
@@ -39,18 +49,37 @@
 // produce nonsensical durations — callers must convert first.
 
 export const DEFAULT_OPTS = {
-  smoothWindowSecs:  15 * 60, // 15 min rolling mean
-  slopeThresholdF:   0.5,     // °F/hr — "the room is being driven"
-  shortCycleSecs:    5 * 60,  // cycles shorter than 5 min are flagged
-  minSamples:        12,      // <12 valid samples → return empty analysis
-  outdoorMarginF:    2.0,     // °F — indoor must beat outdoor by this much in the
-                              // cycle's direction for the cycle to count (heating
-                              // requires outdoor < indoor − margin, cooling the
-                              // reverse). Only consulted when outdoorSamples are
-                              // supplied. Defeats off-recovery mislabeling — when
-                              // an AC unit shuts off the building warms back up,
-                              // which looks identical to a heating cycle in a
-                              // pure-temperature trace.
+  smoothWindowSecs:    15 * 60, // 15 min rolling mean
+  decimateSecs:         5 * 60, // resample smoothed series to this grid (5 min)
+                                // before slope/classification. Without this, a
+                                // sensor that transmits every 30 s would have
+                                // its slopes flicker around the threshold at
+                                // sample resolution, generating sub-minute
+                                // phantom cycles. 5 min is the natural
+                                // minimum-event resolution for residential
+                                // HVAC and matches the hourly aggregate
+                                // cadence used elsewhere.
+  slopeThresholdF:     0.5,     // °F/hr to ENTER a non-idle state
+  slopeHysteresisRatio: 0.4,    // exit-state threshold = slopeThresholdF × this.
+                                // Schmitt-trigger style: enter heating at 0.5
+                                // °F/hr, stay heating until slope falls below
+                                // 0.2 °F/hr. Suppresses idle↔heating flicker
+                                // when the slope hovers near the threshold.
+  shortCycleSecs:      5 * 60,  // cycles shorter than this are flagged in
+                                // shortCycles[]; with the new 5-min decimation
+                                // the minimum cycle duration is already
+                                // decimateSecs, so this acts as a no-op at
+                                // defaults — raise it (e.g. 10 min) to flag
+                                // genuinely brief cycles as suspicious.
+  minSamples:          12,      // <12 valid samples → return empty analysis
+  outdoorMarginF:      2.0,     // °F — indoor must beat outdoor by this much in the
+                                // cycle's direction for the cycle to count (heating
+                                // requires outdoor < indoor − margin, cooling the
+                                // reverse). Only consulted when outdoorSamples are
+                                // supplied. Defeats off-recovery mislabeling — when
+                                // an AC unit shuts off the building warms back up,
+                                // which looks identical to a heating cycle in a
+                                // pure-temperature trace.
 };
 
 // Mean indoor (smoothed) temperature across a [startTs, endTs] window.
@@ -143,10 +172,55 @@ function _slopes(smoothed) {
   return s;
 }
 
-function _classify(slope, thresh) {
-  if (slope >=  thresh) return 'heating';
-  if (slope <= -thresh) return 'cooling';
-  return 'idle';
+// Resample a (sorted) smoothed series to a fixed-cadence grid by averaging
+// all samples that fall within each bucket. Returns one point per bucket
+// (skipping empty buckets), with ts at the bucket midpoint and value at the
+// bucket mean. This is the step that makes the cycle detector immune to
+// sample-rate variation — without it, a sensor on a 30 s cadence produces
+// per-sample slope jitter that flickers across the classification threshold,
+// emitting phantom sub-minute cycles. A 5 min grid is the natural floor for
+// residential HVAC events.
+function _decimate(smoothed, gridSecs) {
+  if (!smoothed.length || !gridSecs) return smoothed;
+  const out = [];
+  // Anchor the grid to the first sample's bucket so traces with arbitrary
+  // start times produce stable bucket boundaries within the trace.
+  let bucketStart = smoothed[0].ts;
+  let i = 0;
+  while (i < smoothed.length) {
+    let sum = 0, n = 0;
+    const bucketEnd = bucketStart + gridSecs;
+    while (i < smoothed.length && smoothed[i].ts < bucketEnd) {
+      sum += smoothed[i].t; n++; i++;
+    }
+    if (n) out.push({ ts: bucketStart + gridSecs / 2, t: sum / n });
+    bucketStart = bucketEnd;
+  }
+  return out;
+}
+
+// Stateful Schmitt-trigger classifier: enter heating at slope ≥ enterThresh,
+// stay heating until slope < exitThresh; enter cooling at slope ≤ -enterThresh,
+// stay cooling until slope > -exitThresh. exitThresh should be a small
+// positive number (e.g. 40% of enterThresh) so a brief stall in the slope
+// doesn't end the cycle. State transitions always pass through idle, so a
+// hot→cold flip becomes heating-cycle-end / idle / cooling-cycle-start.
+function _classifyWithHysteresis(slopes, enterThresh, exitThresh) {
+  const out = new Array(slopes.length);
+  let state = 'idle';
+  for (let i = 0; i < slopes.length; i++) {
+    const s = slopes[i];
+    if (state === 'idle') {
+      if (s >=  enterThresh) state = 'heating';
+      else if (s <= -enterThresh) state = 'cooling';
+    } else if (state === 'heating') {
+      if (s <  exitThresh) state = 'idle';
+    } else { // cooling
+      if (s > -exitThresh) state = 'idle';
+    }
+    out[i] = state;
+  }
+  return out;
 }
 
 // Walk the classified series and emit one cycle per contiguous run of the
@@ -154,15 +228,15 @@ function _classify(slope, thresh) {
 // end ts is the next sample after the run (or the last sample if the run
 // reaches the end of the series). meanSlope is the average slope over the
 // run, used by callers to confirm the sign matches `kind`.
-function _segmentCycles(smoothed, slopes, thresh) {
+function _segmentCycles(points, slopes, states) {
   const cycles = [];
   let runStart = -1, runKind = null;
   let slopeSum = 0, slopeN = 0;
 
   const flush = (endIdx) => {
     if (runStart < 0 || runKind === 'idle') return;
-    const startTs = smoothed[runStart].ts;
-    const endTs   = smoothed[Math.min(endIdx, smoothed.length - 1)].ts;
+    const startTs = points[runStart].ts;
+    const endTs   = points[Math.min(endIdx, points.length - 1)].ts;
     cycles.push({
       kind:         runKind,
       startTs,
@@ -172,8 +246,8 @@ function _segmentCycles(smoothed, slopes, thresh) {
     });
   };
 
-  for (let i = 0; i < smoothed.length; i++) {
-    const k = _classify(slopes[i], thresh);
+  for (let i = 0; i < points.length; i++) {
+    const k = states[i];
     if (k === runKind) {
       slopeSum += slopes[i]; slopeN++;
       continue;
@@ -184,7 +258,7 @@ function _segmentCycles(smoothed, slopes, thresh) {
     slopeSum  = slopes[i];
     slopeN    = 1;
   }
-  flush(smoothed.length - 1);
+  flush(points.length - 1);
   return cycles.filter(c => c.durationSecs > 0);
 }
 
@@ -234,14 +308,24 @@ export function detectCycles(readings, opts = {}) {
     return { ok: false, reason: 'insufficient-data', validSamples: valid.length, opts: o };
   }
 
-  const smoothed = _rollingMean(valid, Math.floor(o.smoothWindowSecs / 2));
-  const slopes   = _slopes(smoothed);
-  const rawCycles = _segmentCycles(smoothed, slopes, o.slopeThresholdF);
+  const smoothed  = _rollingMean(valid, Math.floor(o.smoothWindowSecs / 2));
+  const decimated = _decimate(smoothed, o.decimateSecs);
+  // detectCycles guarantees `valid.length >= minSamples`, but extreme
+  // decimation ratios on short traces could produce <2 buckets — bail out
+  // the same way as insufficient-data so downstream slope/segment can rely
+  // on a usable series.
+  if (decimated.length < 2) {
+    return { ok: false, reason: 'insufficient-data', validSamples: valid.length, opts: o };
+  }
+  const slopes    = _slopes(decimated);
+  const exitThresh = o.slopeThresholdF * o.slopeHysteresisRatio;
+  const states    = _classifyWithHysteresis(slopes, o.slopeThresholdF, exitThresh);
+  const rawCycles = _segmentCycles(decimated, slopes, states);
   const { filtered: cycles, gated } = _applyOutdoorGate(
-    rawCycles, smoothed, opts.outdoorSamples, o.outdoorMarginF,
+    rawCycles, decimated, opts.outdoorSamples, o.outdoorMarginF,
   );
 
-  const totalSecs = smoothed[smoothed.length - 1].ts - smoothed[0].ts;
+  const totalSecs = decimated[decimated.length - 1].ts - decimated[0].ts;
   let heatingRuntimeSecs = 0, coolingRuntimeSecs = 0;
   for (const c of cycles) {
     if (c.kind === 'heating') heatingRuntimeSecs += c.durationSecs;
