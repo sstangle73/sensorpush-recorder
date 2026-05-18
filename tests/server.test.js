@@ -783,16 +783,17 @@ describe('GET /hvac', () => {
     expect(r.status).toBe(400);
   });
 
-  it('returns empty referenceIds + empty sensors when no thermostat is configured and no data exists', async () => {
+  it('returns empty zones when no thermostat is configured and no data exists', async () => {
     const { status, body } = await hvacGet('/hvac?range=24h');
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
     expect(body.referenceIds).toEqual([]);
-    expect(body.sensors).toEqual({});
+    expect(body.heatingZones).toEqual({});
+    expect(body.coolingZones).toEqual({});
     expect(body.config.shortCycleMinutes).toBe(5);
   });
 
-  it('uses an explicitly flagged thermostat sensor', async () => {
+  it('uses an explicitly flagged thermostat sensor — sensor name becomes the default zone', async () => {
     upsertSensors(hvacDb, [
       { id: 'living-room', name: 'Living Room',   type: 'HT1', active: true, batteryVoltage: null },
       { id: 'attic',       name: 'Attic',         type: 'HT1', active: true, batteryVoltage: null },
@@ -809,7 +810,7 @@ describe('GET /hvac', () => {
     }
     insertReadings(hvacDb, 'living-room', samples);
 
-    // Flag living-room as the thermostat reference.
+    // Flag living-room as the thermostat reference (no zones set).
     await fetch(hvacUrl + '/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -821,13 +822,69 @@ describe('GET /hvac', () => {
 
     const { body } = await hvacGet('/hvac?range=24h');
     expect(body.referenceIds).toContain('living-room');
-    expect(body.sensors['living-room']).toBeDefined();
-    expect(body.sensors['living-room'].isThermostat).toBe(true);
-    expect(body.sensors['living-room'].isAutoSelected).toBe(false);
-    expect(body.sensors['living-room'].analysis.ok).toBe(true);
-    expect(body.sensors['living-room'].analysis.heatingRuntimePct).toBeGreaterThan(0);
-    expect(Array.isArray(body.sensors['living-room'].dailyRuntime)).toBe(true);
-    expect(body.sensors['living-room'].dailyRuntime).toHaveLength(7);
+    // Both zone dimensions default to the sensor's own name when unset.
+    const heat = body.heatingZones['Living Room'];
+    const cool = body.coolingZones['Living Room'];
+    expect(heat).toBeDefined();
+    expect(cool).toBeDefined();
+    expect(heat.memberCount).toBe(1);
+    expect(heat.members[0]).toEqual({ id: 'living-room', name: 'Living Room' });
+    expect(heat.analysis.ok).toBe(true);
+    expect(heat.analysis.heatingRuntimePct).toBeGreaterThan(0);
+    expect(Array.isArray(heat.dailyRuntime)).toBe(true);
+    expect(heat.dailyRuntime).toHaveLength(7);
+  });
+
+  it('groups multiple sensors that share a heating zone', async () => {
+    const db2 = openDb(':memory:');
+    let srv2, url2;
+    await new Promise(r => {
+      srv2 = http.createServer(createApp(db2));
+      srv2.listen(0, '127.0.0.1', () => { url2 = `http://127.0.0.1:${srv2.address().port}`; r(); });
+    });
+
+    upsertSensors(db2, [
+      { id: 'living', name: 'Living Room',     type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'master', name: 'Primary Bedroom', type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    // Both sensors warm together — simulates a furnace heating the shared zone.
+    const now   = Math.floor(Date.now() / 1000);
+    const start = now - 3 * 3600;
+    for (const id of ['living', 'master']) {
+      const samples = [];
+      for (let i = 0; i <= 36; i++) {
+        const t = start + i * 600;
+        const temp = (id === 'living' ? 68 : 70) + (i / 36) * 3;
+        samples.push({ observed: new Date(t * 1000).toISOString(), temperature: temp, humidity: 45, barometric_pressure: null, battery_voltage: null });
+      }
+      insertReadings(db2, id, samples);
+    }
+
+    await fetch(url2 + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ranges: ['1h', '24h'],
+        hvac: { sensors: {
+          'living': { thermostat: true, zone: 'Furnace', coolingZone: 'Living' },
+          'master': { thermostat: true, zone: 'Furnace', coolingZone: 'Master' },
+        } },
+      }),
+    });
+
+    const r = await fetch(url2 + '/hvac?range=24h');
+    const body = await r.json();
+    expect(body.ok).toBe(true);
+    // One heating zone (Furnace) with 2 members, two cooling zones (Living, Master) with 1 each.
+    expect(Object.keys(body.heatingZones)).toEqual(['Furnace']);
+    expect(body.heatingZones['Furnace'].memberCount).toBe(2);
+    expect(body.heatingZones['Furnace'].analysis.ok).toBe(true);
+    expect(body.heatingZones['Furnace'].analysis.heatingCycleCount).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(body.coolingZones).sort()).toEqual(['Living', 'Master']);
+    expect(body.coolingZones['Living'].memberCount).toBe(1);
+    expect(body.coolingZones['Master'].memberCount).toBe(1);
+
+    await new Promise(r => srv2.close(r));
   });
 
   it('auto-selects the most-stable indoor sensor when no flags exist', async () => {
@@ -862,8 +919,9 @@ describe('GET /hvac', () => {
     expect(body.ok).toBe(true);
     expect(body.autoDefaultId).toBe('stable');     // lowest var of the two indoor sensors
     expect(body.referenceIds).toEqual(['stable']);
-    expect(body.sensors['stable'].isAutoSelected).toBe(true);
-    expect(body.sensors['stable'].isThermostat).toBe(false);
+    // Auto-selected sensor lands in a zone named after itself.
+    expect(body.heatingZones['Living Room']).toBeDefined();
+    expect(body.heatingZones['Living Room'].members[0].id).toBe('stable');
 
     await new Promise(r => srv2.close(r));
   });

@@ -1085,6 +1085,7 @@ header .spacer { flex: 1; }
   <div class="set-section">
     <h2>HVAC</h2>
     <p class="set-hint" style="margin-bottom:10px">Flag the sensor(s) closest to your thermostat — they drive duty-cycle inference on the Stats tab. If nothing is flagged, the most-stable indoor sensor (lowest 24 h variance) is used automatically.</p>
+    <p class="set-hint" style="margin-bottom:10px"><b>Heating zone</b> groups sensors driven by the same heating system (e.g. all rooms on a shared furnace). Cycles are averaged across the zone for a higher-confidence signal. <b>Cooling zone</b> is independent — typically one zone per window-AC unit; leave blank if cooling is per-room.</p>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
       <label style="font-size:12px;color:var(--text2)">Short-cycle threshold (min):
         <input type="number" id="hvac-shortcycle" class="set-text-input" min="1" max="120" step="1" style="width:80px;margin-left:6px" value="5">
@@ -1095,7 +1096,7 @@ header .spacer { flex: 1; }
     </div>
     <div class="set-subheader">Thermostat-reference sensors</div>
     <table class="comfort-table"><thead>
-      <tr><th>Sensor</th><th style="width:90px">Thermostat</th><th>Zone label (optional)</th></tr>
+      <tr><th>Sensor</th><th style="width:90px">Thermostat</th><th>Heating zone</th><th>Cooling zone</th></tr>
     </thead><tbody id="hvac-sensors-body"></tbody></table>
     <div style="display:flex;gap:8px;margin-top:12px">
       <button class="set-btn" onclick="saveHvacSettings()">Save</button>
@@ -2103,7 +2104,7 @@ function resolveComfort(sensorId) {
 let _statsRange   = '7d';
 let _statsHistory = {};        // id → samples[]
 let _batteryForecasts = {};    // id → { slopeVPerDay, currentV, daysTo27, daysTo25, daysTo24, sampleDays } | null
-let _hvacInfo     = null;      // /hvac response: { ok, range, config, referenceIds, autoDefaultId, sensors }
+let _hvacInfo     = null;      // /hvac response: { ok, range, config, outdoorSource, heatingZones, coolingZones }
 let _statsLoading = false;
 // YoY overlay state — toggle persisted in localStorage; samples parallel to
 // _statsHistory but anchored at endTs = now - 1 calendar year.
@@ -3622,75 +3623,128 @@ function _hvacShortCycleList(shorts, shortCycleSecs) {
   </table></div>`;
 }
 
+// Single-direction runtime bar: just the active-direction fill + idle remainder.
+function _hvacRuntimeBarSingle(pct, color) {
+  const p = Math.max(0, Math.min(1, pct || 0));
+  return `<div class="hvac-bar" title="${_fmtPct(p)} active · ${_fmtPct(1 - p)} idle">
+    <div class="hvac-bar-seg" style="width:${(p * 100).toFixed(1)}%;background:${color}"></div>
+    <div class="hvac-bar-seg" style="width:${((1 - p) * 100).toFixed(1)}%;background:${HVAC_COLOR_IDLE}"></div>
+  </div>`;
+}
+
+// 7-day breakdown rendered for a single direction only.
+function _hvacDailyBarsDir(daily, direction) {
+  if (!Array.isArray(daily) || !daily.length) return '';
+  const color = direction === 'heating' ? HVAC_COLOR_HEAT : HVAC_COLOR_COOL;
+  const cells = daily.map((d, i) => {
+    const dt    = new Date(d.date + 'T12:00:00Z');
+    const label = dt.toLocaleDateString(undefined, { weekday: 'short' }).slice(0, 1)
+                + dt.getUTCDate();
+    const pct   = direction === 'heating' ? d.heatingRuntimePct : d.coolingRuntimePct;
+    if (pct == null) {
+      return `<div class="hvac-day"><div class="hvac-day-bar hvac-day-empty"></div><div class="hvac-day-label">${label}</div></div>`;
+    }
+    const p = Math.max(0, Math.min(1, pct));
+    return `<div class="hvac-day" title="${d.date} · ${_fmtPct(p)}">
+      <div class="hvac-day-bar">
+        <div class="hvac-day-seg" style="height:${(p * 100).toFixed(1)}%;background:${color}"></div>
+      </div>
+      <div class="hvac-day-label">${label}<div class="hvac-day-pct">${_fmtPct(p)}</div></div>
+    </div>`;
+  }).join('');
+  return `<div class="hvac-days">${cells}</div>`;
+}
+
+// Render one zone row for a given direction ('heating' or 'cooling'). The
+// underlying detectCycles analysis is shared across directions per zone, but
+// we surface only this direction's cycle list and runtime numbers.
+function _renderHvacZoneRow(zoneName, zone, direction, shortThresholdSecs) {
+  const a       = zone.analysis;
+  const isHeat  = direction === 'heating';
+  const color   = isHeat ? HVAC_COLOR_HEAT : HVAC_COLOR_COOL;
+  const glyph   = isHeat ? '▲' : '▼';
+  const verb    = isHeat ? 'Heating' : 'Cooling';
+  const memberTag = zone.memberCount > 1
+    ? `<span class="hvac-tag" title="${zone.members.map(m => esc(m.name)).join(', ')}">${zone.memberCount} sensors</span>`
+    : `<span class="hvac-tag">${esc(zone.members?.[0]?.name ?? zoneName)}</span>`;
+  const gatedTag = a?.gated
+    ? `<span class="hvac-tag" title="Cycles whose direction doesn't match the indoor-outdoor delta are excluded.">outdoor-gated</span>`
+    : '';
+
+  if (!a?.ok) {
+    return `<div class="hvac-zone">
+      <div class="hvac-zone-head"><span class="hvac-zone-name">${esc(zoneName)}</span> ${memberTag}</div>
+      <div class="stats-footnote">Not enough recent data to analyze (need at least ${a?.opts?.minSamples ?? 12} valid samples).</div>
+    </div>`;
+  }
+
+  const pct        = isHeat ? a.heatingRuntimePct      : a.coolingRuntimePct;
+  const cycleCount = isHeat ? a.heatingCycleCount      : a.coolingCycleCount;
+  const meanCycle  = isHeat ? a.meanHeatingCycleSecs   : a.meanCoolingCycleSecs;
+  const shortDir   = (a.shortCycles || []).filter(c => c.kind === direction);
+
+  return `<div class="hvac-zone">
+    <div class="hvac-zone-head">
+      <span class="hvac-zone-name">${esc(zoneName)}</span> ${memberTag} ${gatedTag}
+      <span class="hvac-zone-summary"><span style="color:${color}">${glyph} ${verb.toLowerCase()}</span> · ${cycleCount} cycles · mean ${_fmtMinSec(meanCycle)}</span>
+    </div>
+    <div class="hvac-row">
+      <div class="hvac-col">
+        <div class="hvac-col-title">Today (24 h)</div>
+        ${_hvacRuntimeBarSingle(pct, color)}
+        <div class="hvac-stat-row">
+          <span><span style="color:${color}">${glyph}</span> ${verb} runtime <b>${_fmtPct(pct)}</b></span>
+          <span>Mean cycle <b>${_fmtMinSec(meanCycle)}</b></span>
+        </div>
+      </div>
+      <div class="hvac-col">
+        <div class="hvac-col-title">Last 7 days</div>
+        ${_hvacDailyBarsDir(zone.dailyRuntime, direction)}
+      </div>
+    </div>
+    <div class="hvac-col-title" style="margin-top:10px">Short ${verb.toLowerCase()} cycles (&lt; ${_fmtMinSec(shortThresholdSecs)})</div>
+    ${_hvacShortCycleList(shortDir, shortThresholdSecs)}
+  </div>`;
+}
+
 function renderHvacPanel() {
   const info = _hvacInfo;
   if (!info) return '';
-  const ids = info.referenceIds || [];
-  if (!ids.length) {
+  const heating = info.heatingZones || {};
+  const cooling = info.coolingZones || {};
+  const heatNames = Object.keys(heating).sort();
+  const coolNames = Object.keys(cooling).sort();
+
+  if (!heatNames.length && !coolNames.length) {
     return `<div class="an-section"><h2>HVAC zone analysis</h2>
       <div class="stats-footnote">No thermostat-reference sensor configured yet, and no indoor sensor has 24 h of data to auto-select. Set one in Settings → HVAC, or wait for the next poll.</div>
     </div>`;
   }
+
   const shortThresholdSecs = (info.config?.shortCycleMinutes ?? 5) * 60;
-  const blocks = ids.map(id => {
-    const s = info.sensors?.[id]; if (!s) return '';
-    const a = s.analysis;
-    const sourceTag = s.isAutoSelected
-      ? `<span class="hvac-tag" title="Auto-selected (most-stable indoor sensor over 24 h)">auto</span>`
-      : `<span class="hvac-tag">thermostat</span>`;
-    const zoneTag = s.zone ? `<span class="hvac-tag">zone: ${esc(s.zone)}</span>` : '';
-    const gatedTag = a?.gated
-      ? `<span class="hvac-tag" title="Cycles whose direction doesn't match the indoor-outdoor delta (e.g. AC off-recovery looking like heating) are excluded.">outdoor-gated</span>`
-      : '';
 
-    if (!a?.ok) {
-      return `<div class="hvac-zone">
-        <div class="hvac-zone-head"><span class="hvac-zone-name">${esc(s.name)}</span> ${sourceTag} ${zoneTag}</div>
-        <div class="stats-footnote">Not enough recent data to analyze (need at least ${a?.opts?.minSamples ?? 12} valid samples).</div>
-      </div>`;
-    }
+  const heatingBlocks = heatNames.length
+    ? heatNames.map(name => _renderHvacZoneRow(name, heating[name], 'heating', shortThresholdSecs)).join('')
+    : `<div class="stats-footnote">No heating zones — flag thermostat sensors and assign a heating zone in Settings.</div>`;
+  const coolingBlocks = coolNames.length
+    ? coolNames.map(name => _renderHvacZoneRow(name, cooling[name], 'cooling', shortThresholdSecs)).join('')
+    : `<div class="stats-footnote">No cooling zones configured.</div>`;
 
-    const dominantGlyph = a.dominantKind === 'heating' ? `<span style="color:${HVAC_COLOR_HEAT}">▲ heating</span>`
-                       : a.dominantKind === 'cooling' ? `<span style="color:${HVAC_COLOR_COOL}">▼ cooling</span>`
-                       :                                `<span style="color:var(--text3)">● idle</span>`;
-    return `<div class="hvac-zone">
-      <div class="hvac-zone-head">
-        <span class="hvac-zone-name">${esc(s.name)}</span> ${sourceTag} ${zoneTag} ${gatedTag}
-        <span class="hvac-zone-summary">${dominantGlyph} · ${a.cycleCount} cycles · mean ${_fmtMinSec(a.meanCycleSecs)}</span>
-      </div>
-      <div class="hvac-row">
-        <div class="hvac-col">
-          <div class="hvac-col-title">Today (24 h)</div>
-          ${_hvacRuntimeBar(a.heatingRuntimePct, a.coolingRuntimePct)}
-          <div class="hvac-stat-row">
-            <span><span style="color:${HVAC_COLOR_HEAT}">▲</span> Heating <b>${_fmtPct(a.heatingRuntimePct)}</b></span>
-            <span><span style="color:${HVAC_COLOR_COOL}">▼</span> Cooling <b>${_fmtPct(a.coolingRuntimePct)}</b></span>
-          </div>
-          <div class="hvac-stat-row hvac-stat-row-dim">
-            <span>Mean heat cycle <b>${_fmtMinSec(a.meanHeatingCycleSecs)}</b></span>
-            <span>Mean cool cycle <b>${_fmtMinSec(a.meanCoolingCycleSecs)}</b></span>
-          </div>
-        </div>
-        <div class="hvac-col">
-          <div class="hvac-col-title">Last 7 days</div>
-          ${_hvacDailyBars(s.dailyRuntime)}
-        </div>
-      </div>
-      <div class="hvac-col-title" style="margin-top:10px">Short cycles (&lt; ${_fmtMinSec(shortThresholdSecs)})</div>
-      ${_hvacShortCycleList(a.shortCycles, shortThresholdSecs)}
-    </div>`;
-  }).join('');
-
-  const anyGated = ids.some(id => info.sensors?.[id]?.analysis?.gated);
+  const anyGated = [...Object.values(heating), ...Object.values(cooling)]
+    .some(z => z.analysis?.gated);
   const sourceLabel = info.outdoorSource === 'outside-sensor' ? 'an outside-tagged sensor'
                     : info.outdoorSource === 'open-meteo'     ? 'Open-Meteo'
                     :                                           'outdoor data';
   const gateNote = anyGated
     ? ` Cycles are <b>gated by direction</b> using ${sourceLabel}: a heating cycle requires outdoor temp at least ${info.config?.outdoorMarginF ?? 2}°F below indoor (and vice versa for cooling), so "AC just shut off and the room warmed back up" no longer registers as a heating cycle.`
     : ` Outdoor gating is currently inactive — tag a sensor with "outside" / "outdoor" / "yard" / "patio" / "deck" in its name, or configure <code>weather.lat/lon</code>, to suppress off-recovery mislabeling.`;
+
   return `<div class="an-section"><h2>HVAC zone analysis</h2>
-    ${blocks}
-    <div class="stats-footnote">Runtime is the fraction of the window where the room's smoothed temperature was changing faster than ${info.config?.slopeThresholdF ?? 0.5}°F/hr — positive slope = heating, negative = cooling. Cycle boundaries come from slope sign changes after a 15-min smoothing pass.${gateNote} Short cycles (compressor or burner runs that end before the threshold) often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Flag additional thermostat-reference sensors in Settings → HVAC if you have multiple zones.</div>
+    <div class="hvac-col-title" style="font-size:13px;margin-top:4px"><span style="color:${HVAC_COLOR_HEAT}">▲</span> Heating zones</div>
+    ${heatingBlocks}
+    <div class="hvac-col-title" style="font-size:13px;margin-top:16px"><span style="color:${HVAC_COLOR_COOL}">▼</span> Cooling zones</div>
+    ${coolingBlocks}
+    <div class="stats-footnote">Each zone's analysis runs on the <b>mean temperature</b> across its member sensors at 5-min resolution — multi-sensor zones boost signal-to-noise (a furnace cycle that warms 3 of 4 rooms together is more visible in the average than in any single room). Cycle detection uses a Schmitt trigger at ${info.config?.slopeThresholdF ?? 0.5}°F/hr (enter) with a 40% exit threshold to suppress flicker.${gateNote} Short cycles often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Configure heating/cooling zones in Settings → HVAC.</div>
   </div>`;
 }
 
@@ -4727,6 +4781,7 @@ function renderHvacSettings() {
     const e        = flags[x.id] || {};
     const checked  = e.thermostat ? 'checked' : '';
     const zone     = e.zone ?? '';
+    const cZone    = e.coolingZone ?? '';
     const color    = _colorMap[x.id] || '#888';
     const grpLabel = _COMFORT_GROUP_LABEL[x.group.group] || x.group.group;
     return `<tr>
@@ -4738,7 +4793,10 @@ function renderHvacSettings() {
         <input type="checkbox" class="hvac-thermostat-input" data-sensor="${esc(x.id)}" ${checked}>
       </td>
       <td>
-        <input type="text" class="comfort-input hvac-zone-input" data-sensor="${esc(x.id)}" value="${esc(zone)}" placeholder="e.g. upstairs">
+        <input type="text" class="comfort-input hvac-zone-input" data-sensor="${esc(x.id)}" value="${esc(zone)}" placeholder="e.g. Furnace">
+      </td>
+      <td>
+        <input type="text" class="comfort-input hvac-cooling-zone-input" data-sensor="${esc(x.id)}" value="${esc(cZone)}" placeholder="(blank = own)">
       </td>
     </tr>`;
   }).join('');
@@ -4759,6 +4817,11 @@ function _collectHvacFromInputs() {
     const id = inp.dataset.sensor;
     const z  = inp.value.trim();
     if (z) (out.sensors[id] = out.sensors[id] || {}).zone = z;
+  });
+  document.querySelectorAll('.hvac-cooling-zone-input').forEach(inp => {
+    const id = inp.dataset.sensor;
+    const z  = inp.value.trim();
+    if (z) (out.sensors[id] = out.sensors[id] || {}).coolingZone = z;
   });
   // Drop sensors with no useful flags so the stored blob stays minimal.
   for (const k of Object.keys(out.sensors)) {

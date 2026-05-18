@@ -363,6 +363,57 @@ export function detectCycles(readings, opts = {}) {
   };
 }
 
+// Combine multiple sensors' readings into a single time-aligned series for
+// zone-level analysis. Each sensor is bucketed onto a `gridSecs` grid (one
+// value per non-empty bucket = the sensor's per-bucket mean), then across
+// sensors we take the mean of whichever members reported in each bucket. A
+// bucket with no member data is dropped (no zero-fill).
+//
+// Bucketing per-sensor first (rather than just unioning raw samples) keeps
+// fast-cadence sensors from drowning out slower ones in the average — every
+// member contributes at most one value per bucket regardless of source rate.
+//
+// Returns a `{ ts, temperature }[]` sorted by ts, the same shape detectCycles
+// consumes.
+export function combineZoneSeries(samplesPerSensor, gridSecs = 5 * 60) {
+  if (!samplesPerSensor?.length) return [];
+  const perBucket = new Map(); // bucketTs → [t, t, ...]
+  for (const samples of samplesPerSensor) {
+    if (!samples?.length) continue;
+    const local = _bucketizeSensor(samples, gridSecs);
+    for (const [ts, t] of local) {
+      let arr = perBucket.get(ts);
+      if (!arr) { arr = []; perBucket.set(ts, arr); }
+      arr.push(t);
+    }
+  }
+  const out = [];
+  for (const [ts, arr] of perBucket) {
+    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+    out.push({ ts, temperature: mean });
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
+function _bucketizeSensor(samples, gridSecs) {
+  // Per-sensor: one mean per non-empty bucket, keyed by bucket center ts.
+  const out = new Map();
+  if (!samples.length) return out;
+  let bucketStart = Math.floor(samples[0].ts / gridSecs) * gridSecs;
+  let sum = 0, n = 0;
+  for (const s of samples) {
+    if (s.temperature == null || !isFinite(s.temperature)) continue;
+    while (s.ts >= bucketStart + gridSecs) {
+      if (n) out.set(bucketStart + gridSecs / 2, sum / n);
+      bucketStart += gridSecs; sum = 0; n = 0;
+    }
+    sum += s.temperature; n++;
+  }
+  if (n) out.set(bucketStart + gridSecs / 2, sum / n);
+  return out;
+}
+
 // Pick a default thermostat-reference sensor when the user hasn't flagged
 // one. The most-stable indoor sensor (lowest temperature variance over the
 // supplied window) is the best proxy for a thermostat — appliances cycle
