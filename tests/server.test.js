@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
-import { createApp } from '../server.js';
+import { createApp, _renderMetrics } from '../server.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings } from '../db.js';
 import { vi } from 'vitest';
 
@@ -1421,5 +1421,160 @@ describe('POST /weather/poll', () => {
     const body = await res.json();
     expect(body.ok).toBe(false);
     expect(body.error).toMatch(/not configured/i);
+  });
+});
+
+describe('GET /metrics (Prometheus exposition)', () => {
+  function freshDb() {
+    return openDb(':memory:');
+  }
+
+  function seed(db) {
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [
+      { id: 'abc.123', name: 'Crawlspace', type: 'HT1', active: true,  batteryVoltage: 2.91, rssi: -67 },
+      { id: 'def.456', name: 'Attic',      type: 'HTP', active: true,  batteryVoltage: null, rssi: null },
+      { id: 'old.789', name: 'Retired',    type: 'HT1', active: false, batteryVoltage: 2.50, rssi: -90 },
+    ]);
+    insertReadings(db, 'abc.123', [{
+      observed:            new Date((now - 120) * 1000).toISOString(),
+      temperature:         71.2, humidity: 48.5, dewpoint: 50.1, vpd: 1.05,
+      barometric_pressure: null, battery_voltage: 2.9,
+    }]);
+    // def.456 has no readings at all — verifies LEFT JOIN skip behavior.
+    upsertGateways(db, [
+      { id: 'gw1', name: 'Downstairs', lastSeen: now - 30,  lastAlert: null, version: '1.0', paired: true,  message: null },
+      { id: 'gw2', name: 'Unpaired',   lastSeen: null,      lastAlert: null, version: '1.0', paired: false, message: null },
+    ]);
+    return now;
+  }
+
+  it('emits HELP+TYPE headers and gauge values for active sensors with readings', () => {
+    const db = freshDb();
+    seed(db);
+    const body = _renderMetrics(db);
+
+    expect(body).toMatch(/^# HELP sensorpush_temperature_fahrenheit /m);
+    expect(body).toMatch(/^# TYPE sensorpush_temperature_fahrenheit gauge$/m);
+    expect(body).toMatch(/^sensorpush_temperature_fahrenheit\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} 71\.2$/m);
+    expect(body).toMatch(/^sensorpush_humidity_percent\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} 48\.5$/m);
+    expect(body).toMatch(/^sensorpush_dewpoint_fahrenheit\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} 50\.1$/m);
+    expect(body).toMatch(/^sensorpush_vapor_pressure_deficit_kpa\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} 1\.05$/m);
+    expect(body).toMatch(/^sensorpush_battery_volts\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} 2\.91$/m);
+    expect(body).toMatch(/^sensorpush_rssi_dbm\{sensor_id="abc\.123",sensor_name="Crawlspace",sensor_type="HT1"\} -67$/m);
+    expect(body).toMatch(/^sensorpush_last_reading_timestamp_seconds\{sensor_id="abc\.123"/m);
+    expect(body.endsWith('\n')).toBe(true);
+  });
+
+  it('skips inactive sensors entirely', () => {
+    const db = freshDb();
+    seed(db);
+    const body = _renderMetrics(db);
+    expect(body).not.toMatch(/sensor_id="old\.789"/);
+  });
+
+  it('skips per-metric lines when the value is null (no NaN emitted)', () => {
+    const db = freshDb();
+    seed(db);
+    const body = _renderMetrics(db);
+    // def.456 is active but has no reading row — should not appear in any
+    // reading-derived gauge line, and battery_volts/rssi (null on sensor row)
+    // should also be omitted for it.
+    expect(body).not.toMatch(/sensorpush_temperature_fahrenheit\{[^}]*def\.456/);
+    expect(body).not.toMatch(/sensorpush_battery_volts\{[^}]*def\.456/);
+    expect(body).not.toMatch(/sensorpush_rssi_dbm\{[^}]*def\.456/);
+    // Sanity: the active def.456 sensor is still counted in sensors_active.
+    expect(body).toMatch(/^sensorpush_sensors_active 2$/m);
+    expect(body).toMatch(/^sensorpush_sensors_total 3$/m);
+  });
+
+  it('emits gateway last_seen, skipping rows with null last_seen', () => {
+    const db = freshDb();
+    const now = seed(db);
+    const body = _renderMetrics(db);
+    expect(body).toMatch(/^# TYPE sensorpush_gateway_last_seen_timestamp_seconds gauge$/m);
+    expect(body).toMatch(new RegExp(`^sensorpush_gateway_last_seen_timestamp_seconds\\{gateway_id="gw1",gateway_name="Downstairs"\\} ${now - 30}$`, 'm'));
+    expect(body).not.toMatch(/gateway_id="gw2"/);
+  });
+
+  it('reports poll-health gauges: -1 before any poll, 1 on success, 0 on error', async () => {
+    const db = freshDb();
+    seed(db);
+    const poller = await import('../poller.js');
+    poller._resetPollerState();
+
+    // No poll yet
+    let body = _renderMetrics(db);
+    expect(body).toMatch(/^sensorpush_last_poll_success -1$/m);
+    expect(body).not.toMatch(/^sensorpush_last_poll_timestamp_seconds /m);
+  });
+
+  it('escapes backslash + double-quote + newline in label values', () => {
+    const db = freshDb();
+    upsertSensors(db, [{
+      id: 'evil',
+      name: 'has "quote" and \\ and\nnewline',
+      type: 'HT1',
+      active: true,
+      batteryVoltage: 2.9,
+    }]);
+    insertReadings(db, 'evil', [{
+      observed: new Date().toISOString(), temperature: 70, humidity: 50,
+      barometric_pressure: null, battery_voltage: 2.9,
+    }]);
+    const body = _renderMetrics(db);
+    expect(body).toMatch(/sensor_name="has \\"quote\\" and \\\\ and\\nnewline"/);
+  });
+
+  it('HTTP GET /metrics returns text/plain exposition format, no bearer needed', async () => {
+    const db = freshDb();
+    seed(db);
+    const app = createApp(db);
+    const srv = http.createServer(app);
+    await new Promise(r => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      const r = await fetch(url + '/metrics');
+      expect(r.status).toBe(200);
+      expect(r.headers.get('content-type')).toMatch(/^text\/plain/);
+      const text = await r.text();
+      expect(text).toMatch(/^# HELP sensorpush_temperature_fahrenheit /m);
+      expect(text).toMatch(/^sensorpush_temperature_fahrenheit\{[^}]+\} 71\.2$/m);
+    } finally {
+      await new Promise(r => srv.close(r));
+    }
+  });
+
+  it('GET /metrics bypasses bearer middleware when a token is configured', async () => {
+    const prev = process.env.RECORDER_TOKEN;
+    process.env.RECORDER_TOKEN = 'metrics-bypass-test-token-abcdef1234';
+    try {
+      const db = freshDb();
+      seed(db);
+      const srv = http.createServer(createApp(db));
+      await new Promise(r => srv.listen(0, '127.0.0.1', r));
+      const url = `http://127.0.0.1:${srv.address().port}`;
+      try {
+        // /metrics: no Authorization header, still 200
+        const r = await fetch(url + '/metrics');
+        expect(r.status).toBe(200);
+        // Sanity: a non-bypassed route requires the bearer
+        const r2 = await fetch(url + '/gateways');
+        expect(r2.status).toBe(401);
+      } finally {
+        await new Promise(r => srv.close(r));
+      }
+    } finally {
+      if (prev === undefined) delete process.env.RECORDER_TOKEN;
+      else process.env.RECORDER_TOKEN = prev;
+    }
+  });
+
+  it('emits an empty-but-valid body when there are no sensors or gateways', () => {
+    const body = _renderMetrics(freshDb());
+    expect(body).toMatch(/^sensorpush_sensors_total 0$/m);
+    expect(body).toMatch(/^sensorpush_sensors_active 0$/m);
+    expect(body).toMatch(/^sensorpush_last_poll_success /m);
+    expect(body.endsWith('\n')).toBe(true);
   });
 });

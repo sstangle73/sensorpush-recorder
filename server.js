@@ -147,6 +147,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 // (so a fresh recorder can mint its first token without a chicken-and-egg).
 const PUBLIC_PATHS = new Set([
   '/health',
+  '/metrics',
   '/ui',
   '/icon.svg', '/icon-192.png', '/icon-512.png',
   '/sw.js', '/manifest.json', '/favicon.ico',
@@ -296,6 +297,74 @@ function _classifySensorGroup(name) {
   return 'other';
 }
 
+// Escape a Prometheus label value per the text exposition spec: backslash,
+// double-quote, and newline are the only required escapes.
+function _escapeLabel(v) {
+  return String(v ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+// Render the /metrics body as Prometheus text exposition format. Pulled out
+// of the route so server.test.js can assert content without an HTTP roundtrip.
+export function _renderMetrics(db) {
+  const lines = [];
+  const sensors  = getSensors(db);
+  const gateways = getGateways(db);
+  const { lastPollTime, lastPollError } = getPollStatus();
+
+  // Per-sensor gauges. Skip inactive sensors and per-metric nulls so the
+  // scraper doesn't see NaN. Labels carry enough context (id+name+type) for
+  // dashboard queries without forcing the user to JOIN against a sidecar.
+  const SENSOR_METRICS = [
+    { name: 'sensorpush_temperature_fahrenheit',          help: 'Latest reading temperature in degrees Fahrenheit.',                   key: 'temperature' },
+    { name: 'sensorpush_humidity_percent',                help: 'Latest reading relative humidity (0-100).',                           key: 'humidity' },
+    { name: 'sensorpush_dewpoint_fahrenheit',             help: 'Latest reading dewpoint in degrees Fahrenheit.',                      key: 'dewpoint' },
+    { name: 'sensorpush_vapor_pressure_deficit_kpa',      help: 'Latest reading vapor pressure deficit in kilopascals.',               key: 'vpd' },
+    { name: 'sensorpush_battery_volts',                   help: 'Most-recent reported battery voltage from the sensor record.',        key: 'battery_voltage' },
+    { name: 'sensorpush_rssi_dbm',                        help: 'Most-recent reported RSSI to the gateway in dBm.',                    key: 'rssi' },
+    { name: 'sensorpush_last_reading_timestamp_seconds',  help: 'Unix epoch (seconds) of the most recent non-excluded reading.',       key: 'last_ts' },
+  ];
+  const activeSensors = sensors.filter(s => s.active);
+  for (const m of SENSOR_METRICS) {
+    lines.push(`# HELP ${m.name} ${m.help}`);
+    lines.push(`# TYPE ${m.name} gauge`);
+    for (const s of activeSensors) {
+      const v = s[m.key];
+      if (v == null) continue;
+      const labels = `sensor_id="${_escapeLabel(s.id)}",sensor_name="${_escapeLabel(s.name)}",sensor_type="${_escapeLabel(s.type)}"`;
+      lines.push(`${m.name}{${labels}} ${v}`);
+    }
+  }
+
+  // Per-gateway last-seen, for "did the gateway go offline?" alerting.
+  lines.push(`# HELP sensorpush_gateway_last_seen_timestamp_seconds Unix epoch (seconds) when the gateway last reported in.`);
+  lines.push(`# TYPE sensorpush_gateway_last_seen_timestamp_seconds gauge`);
+  for (const g of gateways) {
+    if (g.last_seen == null) continue;
+    lines.push(`sensorpush_gateway_last_seen_timestamp_seconds{gateway_id="${_escapeLabel(g.id)}",gateway_name="${_escapeLabel(g.name)}"} ${g.last_seen}`);
+  }
+
+  // Poll-health gauges. _success is -1 when no poll has run yet, 0 on error,
+  // 1 on success — VM/alerts can `== 0` or `< 0` distinctly.
+  const successVal = lastPollTime == null ? -1 : (lastPollError ? 0 : 1);
+  lines.push(`# HELP sensorpush_last_poll_timestamp_seconds Unix epoch (seconds) of the last poll attempt.`);
+  lines.push(`# TYPE sensorpush_last_poll_timestamp_seconds gauge`);
+  if (lastPollTime != null) lines.push(`sensorpush_last_poll_timestamp_seconds ${Math.floor(lastPollTime / 1000)}`);
+
+  lines.push(`# HELP sensorpush_last_poll_success 1 if the last poll succeeded, 0 if it errored, -1 if no poll has run yet.`);
+  lines.push(`# TYPE sensorpush_last_poll_success gauge`);
+  lines.push(`sensorpush_last_poll_success ${successVal}`);
+
+  lines.push(`# HELP sensorpush_sensors_total Number of registered sensors.`);
+  lines.push(`# TYPE sensorpush_sensors_total gauge`);
+  lines.push(`sensorpush_sensors_total ${sensors.length}`);
+
+  lines.push(`# HELP sensorpush_sensors_active Number of sensors marked active.`);
+  lines.push(`# TYPE sensorpush_sensors_active gauge`);
+  lines.push(`sensorpush_sensors_active ${activeSensors.length}`);
+
+  return lines.join('\n') + '\n';
+}
+
 
 // The `db` parameter is intentionally mutable inside this function — the
 // /backups/:filename/restore route reassigns it to the freshly-reopened
@@ -355,6 +424,17 @@ export function createApp(db, config = null, onSwap = null) {
       pollError:   lastPollError,
       sensorCount: row.n,
     });
+  });
+
+  // GET /metrics — Prometheus text exposition for VictoriaMetrics scrape.
+  // One gauge per (sensor, metric); skipped per-line when a value is null
+  // so we don't emit NaN. Inactive sensors are excluded. Labels are escaped
+  // per the exposition spec (backslash, double-quote, newline).
+  // Bypasses the bearer middleware via PUBLIC_PATHS — LAN scrape pattern
+  // matches the rest of the home-lab stack (node_exporter, dhcp_reservations_exporter).
+  app.get('/metrics', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(_renderMetrics(db));
   });
 
   // GET / → sensors list (JSON) for fetch() callers, ui.html for browsers.

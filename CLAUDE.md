@@ -49,7 +49,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `backups`, `server
 
 - `/config/config.local.js` — bind-mounted file containing `window.DASHBOARD_CONFIG = { sensorpush: { email, password }, weather: { lat, lon } }`. The `window.` prefix is a quirk inherited from a frontend-config sharing pattern. Only `sensorpush.{email,password}` and (optionally) `weather.{lat,lon}` are read. Weather can also come from `WEATHER_LAT` / `WEATHER_LON` env vars (env overrides file independently of sensorpush creds).
 - `CORS_ORIGINS` env var — comma-separated allowlist. The middleware echoes the request `Origin` only when it matches an entry; never sends `*`.
-- `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. Set in `docker-compose.yml` env if you want config-as-code; otherwise leave unset and use the Settings → Security UI (see below) to generate + persist a token to `/data/recorder-token`. Resolution order: env > file > null (no auth). Bearer required on all routes except `/health`, icon/manifest/sw assets, HTML `GET /`, and same-origin requests (`Sec-Fetch-Site: same-origin`).
+- `RECORDER_TOKEN` env var — optional shared bearer for HTTP auth. Set in `docker-compose.yml` env if you want config-as-code; otherwise leave unset and use the Settings → Security UI (see below) to generate + persist a token to `/data/recorder-token`. Resolution order: env > file > null (no auth). Bearer required on all routes except `/health`, `/metrics`, icon/manifest/sw assets, HTML `GET /`, and same-origin requests (`Sec-Fetch-Site: same-origin`).
 - `DB_PATH` (default `/data/sensorpush.db`)
 - `PORT` (default `3003`)
 
@@ -69,6 +69,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `backups`, `server
 - **Export**: `GET /:id/history.csv?range=7d`
 - **Sensor pairs / drift**: `GET /sensor-pairs`, `POST /sensor-pairs`, `DELETE /sensor-pairs/:id`, `GET /sensor-pairs/:id/drift?range=30d`
 - **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
+- **Metrics**: `GET /metrics` — Prometheus text exposition (sensorpush_{temperature,humidity,dewpoint,vpd,battery,rssi,last_reading_timestamp}, gateway last_seen, poll-health). LAN-scrape pattern — in `PUBLIC_PATHS`, bypasses bearer auth.
 
 `GET /` content-negotiates: `Accept: text/html` → Explorer UI; otherwise JSON sensor list. This lets the root URL serve both API callers and browsers landing at the same hostname.
 
