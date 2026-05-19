@@ -19,8 +19,10 @@ afterAll(() => new Promise(resolve => server.close(resolve)));
 
 // Tests hit Express routes directly (no nginx), so paths match what nginx
 // sends AFTER stripping /api/sensors/ prefix: / → sensors list, /:id/history, /health.
+// Accept: application/json mirrors what the UI's fetch() calls send so the
+// HTML-default '/' route still returns JSON for these assertions.
 async function get(path) {
-  const res  = await fetch(baseUrl + path);
+  const res  = await fetch(baseUrl + path, { headers: { Accept: 'application/json' } });
   const body = await res.json();
   return { status: res.status, body };
 }
@@ -46,6 +48,32 @@ describe('GET / (sensors list)', () => {
     const { body } = await get('/');
     expect(body).toHaveProperty('oldestReadingTs');
     expect(body.oldestReadingTs).toBeNull();
+  });
+
+  it('serves HTML at / when Accept omits application/json (browser nav, stripped Accept)', async () => {
+    // Default Accept (*/*), no application/json → HTML. Covers the case where
+    // a reverse proxy strips/replaces the Accept header.
+    const res = await fetch(baseUrl + '/');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
+    const text = await res.text();
+    expect(text).toContain('<!DOCTYPE html>');
+  });
+
+  it('serves HTML at / for a typical browser Accept header', async () => {
+    const res = await fetch(baseUrl + '/', {
+      headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
+  });
+
+  it('serves JSON at / when Accept includes application/json', async () => {
+    const res = await fetch(baseUrl + '/', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toMatch(/application\/json/);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
   });
 
   it('returns sensor data after upsert + readings', async () => {

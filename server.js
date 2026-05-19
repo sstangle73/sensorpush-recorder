@@ -109,11 +109,11 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v18';
-// Pre-cache the root with an explicit Accept: text/html so the server's
-// content negotiation returns the UI HTML, not the JSON sensor list.
-// Without this, the install fetch goes out as Accept: */*, the cached entry
-// at '/' is JSON, and the next navigation gets served JSON from cache.
+const CACHE='sensorpush-v19';
+// Pre-cache the root so the UI is offline-available on first nav.
+// Server now defaults '/' to HTML (only returns JSON when Accept includes
+// application/json), so we no longer need to set Accept: text/html here —
+// but doing so costs nothing and keeps intent obvious.
 self.addEventListener('install',e=>{
   e.waitUntil(caches.open(CACHE).then(c=>c.add(new Request(self.registration.scope,{cache:'reload',headers:{'Accept':'text/html'}}))).catch(()=>{}));
   self.skipWaiting();
@@ -404,7 +404,7 @@ export function createApp(db, config = null, onSwap = null) {
     const token = getToken();
     if (!token) return next();
     if (PUBLIC_PATHS.has(req.path)) return next();
-    if (req.path === '/' && (req.headers.accept || '').includes('text/html')) return next();
+    if (req.path === '/' && !(req.headers.accept || '').includes('application/json')) return next();
     if (req.headers['sec-fetch-site'] === 'same-origin') return next();
     const auth = req.headers.authorization || '';
     const m = /^Bearer\s+(.+)$/i.exec(auth);
@@ -437,11 +437,14 @@ export function createApp(db, config = null, onSwap = null) {
     res.send(_renderMetrics(db));
   });
 
-  // GET / → sensors list (JSON) for fetch() callers, ui.html for browsers.
-  // The Accept-header check lets a single hostname serve both the Explorer UI
-  // (for human visitors) and the API (for fetch() callers) at the root URL.
+  // GET / → ui.html by default; JSON sensors list only when the caller
+  // explicitly opts in via Accept: application/json. Defaulting to HTML
+  // means a reverse proxy that strips/replaces Accept (or any new visitor
+  // before the SW caches the HTML) still lands on the Explorer UI instead
+  // of a raw JSON dump. The UI's own fetch() calls set Accept: application/json
+  // so they continue to receive the sensor list.
   app.get('/', (req, res) => {
-    if ((req.headers.accept || '').includes('text/html')) {
+    if (!(req.headers.accept || '').includes('application/json')) {
       return res.setHeader('Content-Type', 'text/html').send(UI_HTML);
     }
     const rows    = getSensors(db);

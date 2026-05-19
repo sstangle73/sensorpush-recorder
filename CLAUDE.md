@@ -71,7 +71,7 @@ Import graph is acyclic: `config` → `db`, `auth`, `poller`, `backups`, `server
 - **Health / PWA**: `GET /health`, `GET /ui`, `GET /icon.svg`, `GET /icon-{192,512}.png`, `GET /sw.js`, `GET /manifest.json`
 - **Metrics**: `GET /metrics` — Prometheus text exposition (sensorpush_{temperature,humidity,dewpoint,vpd,battery,rssi,last_reading_timestamp}, gateway last_seen, poll-health). LAN-scrape pattern — in `PUBLIC_PATHS`, bypasses bearer auth.
 
-`GET /` content-negotiates: `Accept: text/html` → Explorer UI; otherwise JSON sensor list. This lets the root URL serve both API callers and browsers landing at the same hostname.
+`GET /` content-negotiates HTML-first: returns the Explorer UI **unless** the request's `Accept` header includes `application/json`, in which case it returns the JSON sensor list. Defaulting to HTML means browser navigations (and reverse proxies that strip/replace `Accept`) land on the UI instead of a raw JSON dump. The UI's own `fetch('/')` calls explicitly send `Accept: application/json` to opt into the JSON shape; the auth middleware bypass mirrors this — no bearer needed for the HTML response, bearer required (or same-origin) for the JSON response.
 
 ## Schema (key invariants)
 

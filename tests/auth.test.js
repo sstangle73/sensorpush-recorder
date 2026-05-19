@@ -156,11 +156,11 @@ describe('Bearer middleware', () => {
     // /health is public — bypass.
     const health = await api('GET', '/health');
     expect(health.status).toBe(200);
-    // / with HTML accept is public — UI nav works.
+    // / without application/json is public — UI nav works (HTML default).
     const html = await fetch(baseUrl + '/', { headers: { Accept: 'text/html' } });
     expect(html.status).toBe(200);
     // Cross-origin JSON read needs the bearer.
-    const json = await api('GET', '/');
+    const json = await api('GET', '/', { headers: { Accept: 'application/json' } });
     expect(json.status).toBe(401);
   });
 
@@ -179,7 +179,9 @@ describe('Bearer middleware', () => {
 
   it('still gates Sec-Fetch-Site: cross-site / none', async () => {
     writeFileSync(TOKEN_FILE, '11111111111111111111111111111111');
-    const res = await fetch(baseUrl + '/', { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    const res = await fetch(baseUrl + '/', {
+      headers: { 'Sec-Fetch-Site': 'cross-site', Accept: 'application/json' },
+    });
     expect(res.status).toBe(401);
   });
 

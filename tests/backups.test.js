@@ -194,7 +194,7 @@ describe('POST /backups/:filename/restore — full restore flow', () => {
       // App's db handle was reassigned and now serves the restored data —
       // hit / via the running server to prove the route closures see the new
       // handle without restart.
-      const sensorsRes  = await fetch(`${url}/`);
+      const sensorsRes  = await fetch(`${url}/`, { headers: { Accept: 'application/json' } });
       const sensorsBody = await sensorsRes.json();
       expect(sensorsBody.ok).toBe(true);
       expect(sensorsBody.sensors.after).toBeDefined();
