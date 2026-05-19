@@ -1676,7 +1676,7 @@ async function loadRealtime() {
   _realtimeLoading = true;
   try {
     // Pull fresh sensor list so values reflect the latest poll
-    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    const sr = await fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } }).then(r => r.json());
     if (sr?.ok) _sensors = sr.sensors;
     // Color map for any newly-discovered sensors
     Object.keys(_sensors).forEach((id, i) => {
@@ -2264,7 +2264,7 @@ async function loadStats() {
     renderStatsRangeBtns();
     updateYoYToggleUI();
     _restoreStatsTabUI();
-    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    const sr = await fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } }).then(r => r.json());
     if (sr?.ok) {
       _sensors = sr.sensors;
       _statsOldestTs = sr.oldestReadingTs ?? null;
@@ -3990,7 +3990,7 @@ async function autoRefreshTick() {
   if (_autoRefreshInFlight) return;
   _autoRefreshInFlight = true;
   try {
-    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    const sr = await fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } }).then(r => r.json());
     if (!sr.ok) return;
     _sensors = sr.sensors;
 
@@ -4036,7 +4036,7 @@ async function init() {
   renderRangeBtns();
   document.getElementById('poll-status').textContent = 'Loading…';
   try {
-    const sr = await fetch(`${API_BASE}/`).then(r => r.json());
+    const sr = await fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } }).then(r => r.json());
     if (!sr.ok) throw new Error('API error');
     _sensors = sr.sensors;
 
