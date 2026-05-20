@@ -106,7 +106,10 @@ export function openDb(path) {
       active             INTEGER NOT NULL DEFAULT 0,
       last_notified_at   INTEGER,
       last_transition_at INTEGER,
-      last_payload       TEXT
+      last_payload       TEXT,
+      -- When a dwell-gated condition (e.g. anomaly) first goes active but
+      -- hasn't yet stayed active long enough to fire. NULL when not pending.
+      pending_since      INTEGER
     );
 
     -- Outdoor weather samples from Open-Meteo. Single-location series (we only
@@ -147,6 +150,11 @@ export function openDb(path) {
     const cols = db.prepare(`PRAGMA table_info(hourly_agg)`).all().map(r => r.name);
     if (!cols.includes('dewpoint_avg')) db.exec(`ALTER TABLE hourly_agg ADD COLUMN dewpoint_avg REAL`);
     if (!cols.includes('vpd_avg'))      db.exec(`ALTER TABLE hourly_agg ADD COLUMN vpd_avg      REAL`);
+  }
+  // Migrate: pending_since on notification_state (added with anomaly dwell-time gating).
+  {
+    const cols = db.prepare(`PRAGMA table_info(notification_state)`).all().map(r => r.name);
+    if (!cols.includes('pending_since')) db.exec(`ALTER TABLE notification_state ADD COLUMN pending_since INTEGER`);
   }
   return db;
 }
@@ -853,7 +861,7 @@ export function deleteEvent(db, id) {
 // transition→recovered after a crash or container redeploy.
 export function getNotifState(db, key) {
   const row = db.prepare(`
-    SELECT key, active, last_notified_at, last_transition_at, last_payload
+    SELECT key, active, last_notified_at, last_transition_at, last_payload, pending_since
     FROM notification_state WHERE key = ?
   `).get(key);
   if (!row) return null;
@@ -863,29 +871,32 @@ export function getNotifState(db, key) {
     lastNotifiedAt:   row.last_notified_at,
     lastTransitionAt: row.last_transition_at,
     lastPayload:      row.last_payload ? JSON.parse(row.last_payload) : null,
+    pendingSince:     row.pending_since ?? null,
   };
 }
 
-export function setNotifState(db, key, { active, lastNotifiedAt, lastTransitionAt, lastPayload }) {
+export function setNotifState(db, key, { active, lastNotifiedAt, lastTransitionAt, lastPayload, pendingSince }) {
   db.prepare(`
-    INSERT INTO notification_state (key, active, last_notified_at, last_transition_at, last_payload)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO notification_state (key, active, last_notified_at, last_transition_at, last_payload, pending_since)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET
       active             = excluded.active,
       last_notified_at   = excluded.last_notified_at,
       last_transition_at = excluded.last_transition_at,
-      last_payload       = excluded.last_payload
+      last_payload       = excluded.last_payload,
+      pending_since      = excluded.pending_since
   `).run(
     key,
     active ? 1 : 0,
     lastNotifiedAt   ?? null,
     lastTransitionAt ?? null,
     lastPayload ? JSON.stringify(lastPayload) : null,
+    pendingSince     ?? null,
   );
 }
 
 export function listNotifStates(db) {
-  return db.prepare(`SELECT key, active, last_notified_at, last_transition_at FROM notification_state`).all();
+  return db.prepare(`SELECT key, active, last_notified_at, last_transition_at, pending_since FROM notification_state`).all();
 }
 
 // 14-day per-hour-of-day baseline (mean + sample SD) for temperature and
