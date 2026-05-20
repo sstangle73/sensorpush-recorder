@@ -424,6 +424,91 @@ describe('evaluateAnomaly', () => {
     const r = evaluateAnomaly(db, { id: 'sd', temperature: 70, humidity: 90 });
     expect(r.some(s => /humid/.test(s))).toBe(true);
   });
+
+  it('sigma scales the trip threshold', () => {
+    const db = makeDb();
+    const hourOfDay = new Date().getHours();
+    seedBaseline(db, 'sig', hourOfDay, 70, 50);  // flat baseline → SD floored to 0.4°F
+    // dev = 1.0°F. 2σ band = 0.8°F (trips); 3σ band = 1.2°F (does not).
+    expect(evaluateAnomaly(db, { id: 'sig', temperature: 71, humidity: 50 }, { sigma: 2 })
+      .some(s => /warm/.test(s))).toBe(true);
+    expect(evaluateAnomaly(db, { id: 'sig', temperature: 71, humidity: 50 }, { sigma: 3 }))
+      .toEqual([]);
+  });
+
+  it('defaults to 3σ when sigma is not supplied', () => {
+    const db = makeDb();
+    const hourOfDay = new Date().getHours();
+    seedBaseline(db, 'def', hourOfDay, 70, 50);
+    // dev = 1.0°F is inside the default 3σ band (1.2°F) → no trip.
+    expect(evaluateAnomaly(db, { id: 'def', temperature: 71, humidity: 50 })).toEqual([]);
+  });
+});
+
+// ── dwell-time gating ────────────────────────────────────────────────────────
+
+describe('evaluateAndNotify dwell gating', () => {
+  const cfg   = { enabled: true, webhook: { enabled: true, url: 'https://x' } };
+  const build = (t) => ({ title: `t ${t}`, message: 'm' });
+
+  it('does not fire until the condition has been active for dwellSecs', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db = makeDb();
+    const t0 = 1_000_000;
+
+    const r1 = await evaluateAndNotify(db, 'anomaly:s1', true, build, cfg, { dwellSecs: 1800, nowMs: t0 * 1000 });
+    expect(r1.transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
+
+    const r2 = await evaluateAndNotify(db, 'anomaly:s1', true, build, cfg, { dwellSecs: 1800, nowMs: (t0 + 900) * 1000 });
+    expect(r2.transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
+
+    const r3 = await evaluateAndNotify(db, 'anomaly:s1', true, build, cfg, { dwellSecs: 1800, nowMs: (t0 + 1860) * 1000 });
+    expect(r3.transition).toBe('fire');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('disarms pending on a transient and restarts the window on the next spike', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db = makeDb();
+    const t0 = 2_000_000;
+
+    await evaluateAndNotify(db, 'anomaly:s2', true,  build, cfg, { dwellSecs: 1800, nowMs: t0 * 1000 });          // pending (armed at t0)
+    const off = await evaluateAndNotify(db, 'anomaly:s2', false, build, cfg, { dwellSecs: 1800, nowMs: (t0 + 300) * 1000 }); // transient → disarm
+    expect(off.transition).toBe('skip');
+    expect(getNotifState(db, 'anomaly:s2').pendingSince).toBe(null);
+    expect(fetch).not.toHaveBeenCalled();
+
+    await evaluateAndNotify(db, 'anomaly:s2', true, build, cfg, { dwellSecs: 1800, nowMs: (t0 + 600) * 1000 });    // re-arm at t0+600
+    // 1800s after the ORIGINAL t0 but only 1200s into the new window → still pending, not fired.
+    const r = await evaluateAndNotify(db, 'anomaly:s2', true, build, cfg, { dwellSecs: 1800, nowMs: (t0 + 1800) * 1000 });
+    expect(r.transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('fires once then recovers after the condition clears', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db = makeDb();
+    const t0 = 3_000_000;
+
+    await evaluateAndNotify(db, 'anomaly:s3', true, build, cfg, { dwellSecs: 600, nowMs: t0 * 1000 });             // pending
+    const rf = await evaluateAndNotify(db, 'anomaly:s3', true, build, cfg, { dwellSecs: 600, nowMs: (t0 + 600) * 1000 }); // fire
+    expect(rf.transition).toBe('fire');
+    expect(getNotifState(db, 'anomaly:s3').pendingSince).toBe(null);  // cleared on fire
+
+    fetch.mockClear();
+    const rr = await evaluateAndNotify(db, 'anomaly:s3', false, build, cfg, { dwellSecs: 600, nowMs: (t0 + 900) * 1000 }); // recover
+    expect(rr.transition).toBe('recover');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('dwellSecs=0 fires immediately (unchanged behavior for non-dwell conditions)', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db = makeDb();
+    const r = await evaluateAndNotify(db, 'threshold:s4', true, build, cfg, { dwellSecs: 0, nowMs: 4_000_000_000 });
+    expect(r.transition).toBe('fire');
+  });
 });
 
 // ── validation ─────────────────────────────────────────────────────────────
@@ -480,6 +565,26 @@ describe('validateNotifConfig', () => {
     expect(validateNotifConfig({
       conditions: { coffeeMakerOnFire: { enabled: true } },
     })).toBe(false);
+  });
+
+  it('accepts anomaly sigma, dwellSecs, and excludeSensors', () => {
+    expect(validateNotifConfig({
+      conditions: { anomaly: { enabled: true, sigma: 3, dwellSecs: 1800, excludeSensors: ['a', 'b'] } },
+    })).toBe(true);
+    // dwellSecs 0 = fire immediately, allowed.
+    expect(validateNotifConfig({
+      conditions: { anomaly: { enabled: true, dwellSecs: 0 } },
+    })).toBe(true);
+  });
+
+  it('rejects bad anomaly field types', () => {
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, sigma: 0 } } })).toBe(false);
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, sigma: -1 } } })).toBe(false);
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, dwellSecs: -5 } } })).toBe(false);
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, excludeSensors: 'nope' } } })).toBe(false);
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, excludeSensors: [1, 2] } } })).toBe(false);
+    // anomaly does not accept thresholdSecs (that's an offline-condition field).
+    expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, thresholdSecs: 10 } } })).toBe(false);
   });
 });
 
@@ -588,5 +693,53 @@ describe('runNotifications', () => {
     expect(r.find(x => x.kind === 'threshold').transition).toBe('fire');
     expect(r.find(x => x.kind === 'sensor-offline')).toBeUndefined();
     expect(r.find(x => x.kind === 'gateway-offline')).toBeUndefined();
+  });
+
+  // Seed a flat 14-day hour-of-day baseline so the anomaly evaluator has data.
+  function seedFlatBaseline(db, id, temp, hum) {
+    const now = Math.floor(Date.now() / 1000);
+    const hourOfDay = new Date().getHours();
+    upsertSensors(db, [{ id, name: id, type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+    for (let d = 0; d < 14; d++) {
+      const hourTs    = Math.floor((now - d * 86400) / 3600) * 3600;
+      const offsetHrs = ((hourTs / 3600) % 24) - hourOfDay;
+      const aligned   = hourTs - offsetHrs * 3600;
+      db.prepare(`INSERT OR REPLACE INTO hourly_agg
+        (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, sample_count, excluded)
+        VALUES (?,?,?,?,?,?,?,?,NULL,12,0)`).run(id, aligned, temp, temp - 0.1, temp + 0.1, hum, hum - 0.5, hum + 0.5);
+    }
+  }
+
+  it('skips anomaly for excluded sensors', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    seedFlatBaseline(db, 'ex1', 70, 50);
+    const cfg = {
+      enabled: true, webhook: { enabled: true, url: 'https://x' },
+      conditions: { anomaly: { enabled: true, sigma: 3, dwellSecs: 0, excludeSensors: ['ex1'] } },
+    };
+    const r = await runNotifications(db, {
+      sensors:  [{ id: 'ex1', name: 'Excluded', temperature: 95, humidity: 50, alerts: null, lastTs: now }],
+      gateways: [], notifConfig: cfg,
+    });
+    expect(r.find(x => x.kind === 'anomaly')).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('fires anomaly through runNotifications when not excluded (dwellSecs=0)', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    seedFlatBaseline(db, 'in1', 70, 50);
+    const cfg = {
+      enabled: true, webhook: { enabled: true, url: 'https://x' },
+      conditions: { anomaly: { enabled: true, sigma: 3, dwellSecs: 0, excludeSensors: [] } },
+    };
+    const r = await runNotifications(db, {
+      sensors:  [{ id: 'in1', name: 'Included', temperature: 95, humidity: 50, alerts: null, lastTs: now }],
+      gateways: [], notifConfig: cfg,
+    });
+    expect(r.find(x => x.kind === 'anomaly')?.transition).toBe('fire');
   });
 });

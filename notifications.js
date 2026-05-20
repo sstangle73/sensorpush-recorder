@@ -12,7 +12,9 @@
 //
 // Conditions evaluated each poll cycle:
 //   - threshold:{sensorId}     — SensorPush alert thresholds (.alerts.{temperature,humidity})
-//   - anomaly:{sensorId}       — hour-of-day baseline ±2σ
+//   - anomaly:{sensorId}       — hour-of-day baseline ±Nσ (N configurable, default 3),
+//                                dwell-gated (must stay anomalous for dwellSecs before firing),
+//                                and skippable per sensor via excludeSensors
 //   - sensor-offline:{sensorId} — last reading older than thresholdSecs
 //   - gateway-offline:{gwId}   — last_seen older than thresholdSecs
 //
@@ -29,6 +31,14 @@ import { getNotifState, setNotifState, getHourlyBaseline } from './db.js';
 // than typical short-term noise for each metric.
 export const ANOMALY_TEMP_SD_FLOOR = 0.4;
 export const ANOMALY_HUM_SD_FLOOR  = 1.0;
+
+// Anomaly trip is |deviation| >= sigma * sd. 2σ flags ~5% of normal samples,
+// which is far too noisy across 10 sensors × 2 metrics × 12 polls/hour; 3σ
+// (~0.27%) is the default. Dwell-time then requires the trip to persist
+// continuously before we actually notify, filtering transient spikes
+// (cooking, a door opening, sun on a window).
+export const DEFAULT_ANOMALY_SIGMA      = 3;
+export const DEFAULT_ANOMALY_DWELL_SECS = 30 * 60;
 
 export const DEFAULT_SENSOR_OFFLINE_SECS  = 30 * 60;
 export const DEFAULT_GATEWAY_OFFLINE_SECS = 15 * 60;
@@ -118,25 +128,60 @@ export function decideTransition(prev, isActive) {
 // closure that produces { title, message, detail } based on whether we're
 // firing or recovering — keeps the threshold/anomaly/offline event shapes
 // flexible without bloating this function's signature.
-export async function evaluateAndNotify(db, key, isActive, buildEvent, notifConfig) {
-  const prev       = getNotifState(db, key);
+export async function evaluateAndNotify(db, key, isActive, buildEvent, notifConfig, { dwellSecs = 0, nowMs = Date.now() } = {}) {
+  const prev    = getNotifState(db, key);
+  const nowSecs = Math.floor(nowMs / 1000);
+
+  // Dwell gating (dwellSecs > 0): a fresh inactive→active edge does not fire
+  // immediately. We arm pending_since on first detection and only let the
+  // condition fire once it has stayed active continuously for dwellSecs. A
+  // single inactive sample disarms the timer, so transient spikes never fire.
+  if (dwellSecs > 0) {
+    const wasActive = !!(prev && prev.active);
+    if (isActive && !wasActive) {
+      const pendingSince = prev?.pendingSince ?? nowSecs;
+      if (nowSecs - pendingSince < dwellSecs) {
+        setNotifState(db, key, {
+          active:           false,
+          lastNotifiedAt:   prev?.lastNotifiedAt   ?? null,
+          lastTransitionAt: prev?.lastTransitionAt ?? null,
+          lastPayload:      prev?.lastPayload      ?? null,
+          pendingSince,
+        });
+        return { transition: 'pending', dispatched: null, payload: null, pendingSince };
+      }
+      // Dwell satisfied → fall through; decideTransition(prev=inactive, true) fires.
+    } else if (!isActive && !wasActive && prev?.pendingSince != null) {
+      // Armed pending never matured (transient) → disarm so a later spike
+      // starts a fresh dwell window instead of inheriting a stale timer.
+      setNotifState(db, key, {
+        active:           false,
+        lastNotifiedAt:   prev?.lastNotifiedAt   ?? null,
+        lastTransitionAt: prev?.lastTransitionAt ?? null,
+        lastPayload:      prev?.lastPayload      ?? null,
+        pendingSince:     null,
+      });
+    }
+  }
+
   const transition = decideTransition(prev, isActive);
   if (transition === 'skip') {
     return { transition, dispatched: null, payload: null };
   }
   const event = buildEvent(transition);
   const payload = {
-    timestamp:   new Date().toISOString(),
+    timestamp:   new Date(nowMs).toISOString(),
     key,
     transition,
     ...event,
   };
   const dispatched = await dispatchAll(payload, notifConfig);
-  const now = Math.floor(Date.now() / 1000);
+  // pendingSince omitted → setNotifState clears it: a fired or recovered
+  // condition is no longer "pending".
   setNotifState(db, key, {
     active:           isActive,
-    lastNotifiedAt:   now,
-    lastTransitionAt: now,
+    lastNotifiedAt:   nowSecs,
+    lastTransitionAt: nowSecs,
     lastPayload:      payload,
   });
   return { transition, dispatched, payload };
@@ -172,9 +217,9 @@ export function evaluateThreshold(sensor) {
 
 // Mirrors the UI's anomaliesForSensor(). Compares the latest reading
 // against the 14-day per-hour-of-day baseline; flags any metric whose
-// deviation exceeds 2σ (with an absolute SD floor to avoid spurious
-// firings on naturally-quiet sensors).
-export function evaluateAnomaly(db, sensor, { nowMs = Date.now() } = {}) {
+// deviation exceeds sigma·σ (with an absolute SD floor to avoid spurious
+// firings on naturally-quiet sensors). sigma defaults to DEFAULT_ANOMALY_SIGMA.
+export function evaluateAnomaly(db, sensor, { nowMs = Date.now(), sigma = DEFAULT_ANOMALY_SIGMA } = {}) {
   if (sensor.temperature == null && sensor.humidity == null) return [];
   const hour = new Date(nowMs).getHours();
   const b = getHourlyBaseline(db, sensor.id, hour, 14);
@@ -182,7 +227,7 @@ export function evaluateAnomaly(db, sensor, { nowMs = Date.now() } = {}) {
   if (sensor.temperature != null && b.tempMean != null && b.tempSd != null && b.nT >= 5) {
     const sd  = Math.max(b.tempSd, ANOMALY_TEMP_SD_FLOOR);
     const dev = sensor.temperature - b.tempMean;
-    if (Math.abs(dev) >= 2 * sd) {
+    if (Math.abs(dev) >= sigma * sd) {
       const dir = dev > 0 ? 'warm' : 'cool';
       out.push(`T ${sensor.temperature.toFixed(1)}°F unusually ${dir} for ${hour}:00 (baseline ${b.tempMean.toFixed(1)}°F ±${b.tempSd.toFixed(1)}, n=${b.nT})`);
     }
@@ -190,7 +235,7 @@ export function evaluateAnomaly(db, sensor, { nowMs = Date.now() } = {}) {
   if (sensor.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
     const sd  = Math.max(b.humSd, ANOMALY_HUM_SD_FLOOR);
     const dev = sensor.humidity - b.humMean;
-    if (Math.abs(dev) >= 2 * sd) {
+    if (Math.abs(dev) >= sigma * sd) {
       const dir = dev > 0 ? 'humid' : 'dry';
       out.push(`RH ${Math.round(sensor.humidity)}% unusually ${dir} for ${hour}:00 (baseline ${Math.round(b.humMean)}% ±${b.humSd.toFixed(1)}, n=${b.nH})`);
     }
@@ -241,10 +286,13 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
       } catch (e) { console.error('[notif] threshold error', s.id, e?.message); }
     }
 
-    // Anomaly (hour-of-day baseline)
-    if (conditions.anomaly?.enabled) {
+    // Anomaly (hour-of-day baseline) — σ-scaled, dwell-gated, per-sensor skippable
+    const anomalyCfg = conditions.anomaly;
+    if (anomalyCfg?.enabled && !(anomalyCfg.excludeSensors || []).includes(s.id)) {
       try {
-        const anomalies = evaluateAnomaly(db, s, { nowMs });
+        const sigma     = anomalyCfg.sigma     ?? DEFAULT_ANOMALY_SIGMA;
+        const dwellSecs = anomalyCfg.dwellSecs ?? DEFAULT_ANOMALY_DWELL_SECS;
+        const anomalies = evaluateAnomaly(db, s, { nowMs, sigma });
         const active    = anomalies.length > 0;
         const r = await evaluateAndNotify(
           db,
@@ -258,6 +306,7 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
                 message: `${s.name} is back within its typical pattern.`,
                 detail: { sensorId: s.id, sensorName: s.name } },
           notifConfig,
+          { dwellSecs, nowMs },
         );
         results.push({ kind: 'anomaly', sensorId: s.id, ...r });
       } catch (e) { console.error('[notif] anomaly error', s.id, e?.message); }
@@ -322,7 +371,7 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
 //     ntfy:    { enabled: bool, url: string, token?: string },
 //     conditions: {
 //       threshold:       { enabled: bool },
-//       anomaly:         { enabled: bool },
+//       anomaly:         { enabled: bool, sigma?: number>0, dwellSecs?: number>=0, excludeSensors?: string[] },
 //       sensorOffline:   { enabled: bool, thresholdSecs: number },
 //       gatewayOffline:  { enabled: bool, thresholdSecs: number },
 //     },
@@ -331,6 +380,8 @@ function _isPlainObject(v) { return v != null && typeof v === 'object' && !Array
 function _isBool(v)        { return v == null || typeof v === 'boolean'; }
 function _isStr(v)         { return v == null || typeof v === 'string'; }
 function _isPosNum(v)      { return v == null || (typeof v === 'number' && isFinite(v) && v > 0); }
+function _isNonNegNum(v)   { return v == null || (typeof v === 'number' && isFinite(v) && v >= 0); }
+function _isStrArray(v)    { return v == null || (Array.isArray(v) && v.every(x => typeof x === 'string')); }
 
 export function validateNotifConfig(c) {
   if (c == null) return true;
@@ -358,11 +409,20 @@ export function validateNotifConfig(c) {
       const v = c.conditions[k];
       if (v == null) continue;
       if (!_isPlainObject(v)) return false;
+      const allowed = k === 'anomaly'
+        ? ['enabled', 'sigma', 'dwellSecs', 'excludeSensors']
+        : ['enabled', 'thresholdSecs'];
       for (const k2 of Object.keys(v)) {
-        if (!['enabled', 'thresholdSecs'].includes(k2)) return false;
+        if (!allowed.includes(k2)) return false;
       }
       if (!_isBool(v.enabled)) return false;
-      if (!_isPosNum(v.thresholdSecs)) return false;
+      if (k === 'anomaly') {
+        if (!_isPosNum(v.sigma))             return false; // null = default; else > 0
+        if (!_isNonNegNum(v.dwellSecs))      return false; // null = default; 0 = fire immediately
+        if (!_isStrArray(v.excludeSensors))  return false;
+      } else if (!_isPosNum(v.thresholdSecs)) {
+        return false;
+      }
     }
   }
   return true;

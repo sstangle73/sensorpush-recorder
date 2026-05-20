@@ -1149,9 +1149,18 @@ header .spacer { flex: 1; }
       <label style="display:flex;align-items:center;gap:8px;font-size:13px">
         <input type="checkbox" id="notif-cond-threshold"> Threshold breach <span style="color:var(--text3);font-size:11px">— SensorPush min/max alerts cross</span>
       </label>
-      <label style="display:flex;align-items:center;gap:8px;font-size:13px">
-        <input type="checkbox" id="notif-cond-anomaly"> Anomaly <span style="color:var(--text3);font-size:11px">— deviates &gt;2σ from 14-day hour-of-day baseline</span>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
+        <input type="checkbox" id="notif-cond-anomaly"> Anomaly
+        <span style="color:var(--text3);font-size:11px">— deviates &gt;</span>
+        <input type="number" id="notif-cond-anomaly-sigma" min="1" max="6" step="0.5" value="3" style="width:54px" class="set-text-input">
+        <span style="color:var(--text3);font-size:11px">σ from 14-day hour-of-day baseline, sustained for</span>
+        <input type="number" id="notif-cond-anomaly-dwell-mins" min="0" step="5" value="30" style="width:60px" class="set-text-input">
+        <span style="color:var(--text3);font-size:11px">min</span>
       </label>
+      <div style="margin:-2px 0 4px 26px;font-size:12px;color:var(--text3)">
+        <span>Exclude from anomaly:</span>
+        <div id="notif-anomaly-exclude" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:4px"></div>
+      </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
         <input type="checkbox" id="notif-cond-sensor-offline"> Sensor offline
         <span style="color:var(--text3);font-size:11px">— no reading in</span>
@@ -1750,6 +1759,11 @@ async function loadLiveBaselines() {
 // or no baseline is available yet.
 function anomaliesForSensor(s, seenCls) {
   if (seenCls === 'stale') return null;
+  // Skip sensors the operator excluded from anomaly notifications, and use the
+  // same σ the notifier fires on, so the Live badge can't disagree with ntfy.
+  const aCfg = _settings.notifications?.conditions?.anomaly || {};
+  if ((aCfg.excludeSensors || []).includes(s.id)) return null;
+  const sigma = aCfg.sigma ?? 3;
   const baseline = _liveBaselines[s.id];
   if (!baseline) return null;
   const hour = new Date().getHours();
@@ -1761,7 +1775,7 @@ function anomaliesForSensor(s, seenCls) {
   if (s.temperature != null && b.tempMean != null && b.tempSd != null && b.nT >= 5) {
     const sd  = Math.max(b.tempSd, ANOMALY_TEMP_SD_FLOOR);
     const dev = s.temperature - b.tempMean;
-    if (Math.abs(dev) >= 2 * sd) {
+    if (Math.abs(dev) >= sigma * sd) {
       const sign = dev > 0 ? 'warm' : 'cool';
       notes.push({
         kind:  'temp',
@@ -1773,7 +1787,7 @@ function anomaliesForSensor(s, seenCls) {
   if (s.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
     const sd  = Math.max(b.humSd, ANOMALY_HUM_SD_FLOOR);
     const dev = s.humidity - b.humMean;
-    if (Math.abs(dev) >= 2 * sd) {
+    if (Math.abs(dev) >= sigma * sd) {
       const sign = dev > 0 ? 'humid' : 'dry';
       notes.push({
         kind:  'hum',
@@ -4577,11 +4591,24 @@ function renderNotifications() {
   document.getElementById('notif-cond-gateway-offline').checked  = !!c.gatewayOffline?.enabled;
   if (c.sensorOffline?.thresholdSecs)  document.getElementById('notif-cond-sensor-offline-mins').value  = Math.round(c.sensorOffline.thresholdSecs / 60);
   if (c.gatewayOffline?.thresholdSecs) document.getElementById('notif-cond-gateway-offline-mins').value = Math.round(c.gatewayOffline.thresholdSecs / 60);
+  document.getElementById('notif-cond-anomaly-sigma').value = c.anomaly?.sigma ?? 3;
+  if (c.anomaly?.dwellSecs != null) document.getElementById('notif-cond-anomaly-dwell-mins').value = Math.round(c.anomaly.dwellSecs / 60);
+  // Build the exclude-from-anomaly checkbox list from the known sensors.
+  const excl = new Set(c.anomaly?.excludeSensors || []);
+  const wrap = document.getElementById('notif-anomaly-exclude');
+  const sensors = Object.values(_sensors || {}).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  wrap.innerHTML = sensors.length
+    ? sensors.map(s => `<label style="display:flex;align-items:center;gap:4px;color:var(--text2)"><input type="checkbox" class="notif-anomaly-excl" value="${esc(s.id)}" ${excl.has(s.id) ? 'checked' : ''}> ${esc(s.name || s.id)}</label>`).join('')
+    : '<span>no sensors yet</span>';
 }
 
 function _collectNotifications() {
   const sensorMins  = parseInt(document.getElementById('notif-cond-sensor-offline-mins').value,  10) || 30;
   const gatewayMins = parseInt(document.getElementById('notif-cond-gateway-offline-mins').value, 10) || 15;
+  const anomalySigma = parseFloat(document.getElementById('notif-cond-anomaly-sigma').value) || 3;
+  const anomalyDwellMins = parseInt(document.getElementById('notif-cond-anomaly-dwell-mins').value, 10);
+  const excludeSensors = Array.from(document.querySelectorAll('.notif-anomaly-excl'))
+    .filter(cb => cb.checked).map(cb => cb.value);
   return {
     enabled: document.getElementById('notif-master-enabled').checked,
     webhook: {
@@ -4595,7 +4622,12 @@ function _collectNotifications() {
     },
     conditions: {
       threshold:      { enabled: document.getElementById('notif-cond-threshold').checked },
-      anomaly:        { enabled: document.getElementById('notif-cond-anomaly').checked },
+      anomaly:        {
+        enabled:        document.getElementById('notif-cond-anomaly').checked,
+        sigma:          anomalySigma,
+        dwellSecs:      (Number.isFinite(anomalyDwellMins) ? anomalyDwellMins : 30) * 60,
+        excludeSensors,
+      },
       sensorOffline:  { enabled: document.getElementById('notif-cond-sensor-offline').checked,  thresholdSecs: sensorMins  * 60 },
       gatewayOffline: { enabled: document.getElementById('notif-cond-gateway-offline').checked, thresholdSecs: gatewayMins * 60 },
     },
