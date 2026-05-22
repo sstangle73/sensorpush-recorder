@@ -4045,36 +4045,55 @@ function stopAutoRefresh() {
 }
 
 async function init() {
-  await loadSettings();
+  document.getElementById('poll-status').textContent = 'Loading…';
+
+  // Independent first round-trips in parallel: app settings + sensor list.
+  // loadSettings swallows its own errors and falls back to defaults; the
+  // sensor list is the only critical fetch, so capture it explicitly.
+  let sr = null;
+  await Promise.all([
+    loadSettings(),
+    fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } })
+      .then(r => r.json()).then(j => { sr = j; }).catch(() => {}),
+  ]);
+
   if (!_settings.ranges.includes(_range)) _range = _settings.ranges[0] || '24h';
   renderRangeBtns();
-  document.getElementById('poll-status').textContent = 'Loading…';
-  try {
-    const sr = await fetch(`${API_BASE}/`, { headers: { Accept: 'application/json' } }).then(r => r.json());
-    if (!sr.ok) throw new Error('API error');
-    _sensors = sr.sensors;
 
-    Object.keys(_sensors).forEach((id, i) => { _colorMap[id] = COLORS[i % COLORS.length]; });
-
-    // First load: auto-select all
-    if (_selected.size === 0) {
-      Object.keys(_sensors).forEach(id => {
-        _selected.add(id);
-        _series[id] = new Set(['temp', 'humidity', 'pressure']);
-      });
-    }
-
-    renderSidebar();
-    await loadEvents();
-    await _bootstrapOutdoor();
-    await refreshChart();
-    await loadRealtime();
-    updateLastUpdatedLabel();
-    startAutoRefresh();
-  } catch (e) {
+  if (!sr || !sr.ok) {
     document.getElementById('poll-status').textContent = 'Error loading sensors';
-    console.error(e);
+    console.error('init: sensor list fetch failed');
+    return;
   }
+  _sensors = sr.sensors;
+
+  Object.keys(_sensors).forEach((id, i) => { _colorMap[id] = COLORS[i % COLORS.length]; });
+
+  // First load: auto-select all
+  if (_selected.size === 0) {
+    Object.keys(_sensors).forEach(id => {
+      _selected.add(id);
+      _series[id] = new Set(['temp', 'humidity', 'pressure']);
+    });
+  }
+
+  renderSidebar();
+
+  // Paint the visible tab (Live) first. loadRealtime fetches its own events
+  // + per-sensor 24h history; the outdoor-flag fetch is cheap and runs
+  // alongside it rather than gating behind it.
+  try {
+    await Promise.all([loadRealtime(), _bootstrapOutdoor()]);
+  } catch (e) {
+    console.error('init: realtime load failed', e);
+  }
+  updateLastUpdatedLabel();
+  startAutoRefresh();
+
+  // The Explorer chart lives on a hidden tab, so populate it in the
+  // background — first paint of Live shouldn't block on N history fetches.
+  // The 60s auto-refresh tick force-refreshes the chart thereafter.
+  refreshChart().catch(e => console.error('init: chart load failed', e));
 }
 
 // ── Outdoor (Open-Meteo) overlay ───────────────────────────────────────────
