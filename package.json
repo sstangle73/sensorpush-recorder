@@ -11,6 +11,7 @@
     "test:ci": "vitest run --reporter=default --reporter=junit --outputFile.junit=./test-results/junit.xml"
   },
   "dependencies": {
+    "compression": "^1.8.1",
     "express": "^4.19.0",
     "mqtt": "^5.15.0",
     "node-fetch": "^3.3.2"

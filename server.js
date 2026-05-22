@@ -1,4 +1,5 @@
 import express from 'express';
+import compression from 'compression';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -109,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v19';
+const CACHE='sensorpush-v20';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -374,6 +375,10 @@ export function _renderMetrics(db) {
 // propagate the new handle to the poller (which captured its own `db`).
 export function createApp(db, config = null, onSwap = null) {
   const app = express();
+  // gzip/deflate all eligible responses (text/html, application/json, …).
+  // Negotiates Accept-Encoding, skips already-compressed types (PNG icons),
+  // and below-threshold bodies. Registered first so it wraps every route.
+  app.use(compression());
   app.use(express.json());
 
   app.use((req, res, next) => {
