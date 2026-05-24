@@ -1405,6 +1405,10 @@ function switchView(name) {
   if (name === 'settings')  renderSettings();
   if (name === 'realtime')  loadRealtime();
   if (name === 'stats')     loadStats();
+  // Explorer chart is lazy-loaded: fetches its histories on first open (cache
+  // is empty), renders instantly from cache on return. The 60s tick keeps it
+  // current while it stays visible.
+  if (name === 'explorer')  refreshChart();
 }
 
 function setAnalyticsRange(r) {
@@ -4020,7 +4024,11 @@ async function autoRefreshTick() {
       if (seen) { seen.textContent = timeAgo(s.lastSeen); seen.className = 'sensor-seen ' + seenClass(s.lastSeen); }
     });
 
-    await refreshChart({ force: true });
+    // The chart rebuilds its entire SVG from every sample — the app's heaviest
+    // per-tick allocation. Only refresh it when Explorer is actually on screen;
+    // redrawing a hidden chart every 60s is pure churn (and inflates the
+    // renderer's committed memory that Chrome's Memory Saver later reports).
+    if (_currentView === 'explorer')  await refreshChart({ force: true });
     if (_currentView === 'analytics') await loadAnalytics();
     if (_currentView === 'realtime')  await loadRealtime();
     if (_currentView === 'stats')     await loadStats();
@@ -4043,6 +4051,20 @@ function stopAutoRefresh() {
     _autoRefreshTimer = null;
   }
 }
+
+// Pause the refresh loop while the tab is backgrounded — fetching + rendering
+// for nobody is wasted work, and the resulting allocation churn is exactly
+// what inflates the renderer's committed memory that Chrome's Memory Saver
+// reclaims (and reports) when it sleeps the tab. On return, re-arm the timer
+// and run one immediate tick so the user sees current data right away.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopAutoRefresh();
+  } else {
+    startAutoRefresh();
+    autoRefreshTick();
+  }
+});
 
 async function init() {
   document.getElementById('poll-status').textContent = 'Loading…';
@@ -4090,10 +4112,11 @@ async function init() {
   updateLastUpdatedLabel();
   startAutoRefresh();
 
-  // The Explorer chart lives on a hidden tab, so populate it in the
-  // background — first paint of Live shouldn't block on N history fetches.
-  // The 60s auto-refresh tick force-refreshes the chart thereafter.
-  refreshChart().catch(e => console.error('init: chart load failed', e));
+  // The Explorer chart is lazy: its per-sensor histories are fetched on the
+  // first switch to that tab (see switchView) and refreshed by the 60s tick
+  // only while it's the visible view. Rebuilding the full SVG is the app's
+  // heaviest allocator, so we don't do it on load or in the background — that
+  // keeps the initial load light and avoids churn when the user stays on Live.
 }
 
 // ── Outdoor (Open-Meteo) overlay ───────────────────────────────────────────
