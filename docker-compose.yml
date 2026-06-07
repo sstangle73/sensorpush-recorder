@@ -36,9 +36,18 @@ services:
       - ./data:/data
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3003/health || exit 1
-      start_period: 30s
+      # Tolerant of transient event-loop stalls. /health is served on the same
+      # event loop that heavy *synchronous* node:sqlite work blocks — a large
+      # catch-up poll, recomputeHourlyAgg over a wide range, or the 03:30 VACUUM.
+      # While blocked, wget can't get a reply and the check fails. With the
+      # autoheal=true label below, too-tight settings turn a transient stall into
+      # a restart loop (and a bad restart can wedge the container). These values
+      # require ~5 min continuously unhealthy before autoheal acts (5 × 1m), give
+      # each probe 10s, and grant a long startup grace for the initial backfill
+      # after downtime. A genuinely dead app still gets restarted, just ~2 min later.
+      start_period: 180s
       interval: 1m
-      timeout: 5s
-      retries: 3
+      timeout: 10s
+      retries: 5
     labels:
       - autoheal=true
