@@ -40,6 +40,15 @@ export const ANOMALY_HUM_SD_FLOOR  = 1.0;
 export const DEFAULT_ANOMALY_SIGMA      = 3;
 export const DEFAULT_ANOMALY_DWELL_SECS = 30 * 60;
 
+// Threshold (out-of-bounds) dwell. Without gating, a sensor whose reading
+// oscillates across a configured bound fires a fire/recover pair on every
+// crossing — a fridge cycling its compressor or a briefly-opened door
+// generated hundreds of alerts. Requiring the breach to persist continuously
+// for dwellSecs before firing collapses that flapping to a single alert while
+// a genuine sustained excursion (a failing fridge) still fires after the dwell.
+// Recovery is unchanged: the moment the reading returns in-bounds we clear.
+export const DEFAULT_THRESHOLD_DWELL_SECS = 15 * 60;
+
 export const DEFAULT_SENSOR_OFFLINE_SECS  = 30 * 60;
 export const DEFAULT_GATEWAY_OFFLINE_SECS = 15 * 60;
 
@@ -69,11 +78,17 @@ export async function dispatchWebhook(url, payload, { timeoutMs = 8000 } = {}) {
 export async function dispatchNtfy(url, payload, { token, timeoutMs = 8000 } = {}) {
   if (!url) return { ok: false, error: 'no ntfy url' };
   // ntfy reads the body as the message text; metadata rides in headers.
-  // Priority: 4 (high) when firing, 3 (default) on recovery.
+  // Priority: 4 (high, makes sound) when firing, 2 (low, silent) on recovery
+  // — a "back to normal" message should land quietly in the tray, not buzz.
+  // NOTE: the canonical transition value emitted by evaluateAndNotify is
+  // 'fire' (see decideTransition), not 'firing'; the old 'firing' comparison
+  // never matched, so every notification — including real breaches — went out
+  // at the recovery priority. Match 'fire' so firings are actually elevated.
+  const firing  = payload.transition === 'fire';
   const headers = {
     'Title':    payload.title || 'SensorPush',
-    'Priority': payload.transition === 'firing' ? '4' : '3',
-    'Tags':     payload.transition === 'firing' ? 'warning' : 'white_check_mark',
+    'Priority': firing ? '4' : '2',
+    'Tags':     firing ? 'warning' : 'white_check_mark',
   };
   if (token) headers['Authorization'] = `Bearer ${token}`;
   try {
@@ -267,6 +282,7 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
     // Threshold breach
     if (conditions.threshold?.enabled) {
       try {
+        const dwellSecs = conditions.threshold.dwellSecs ?? DEFAULT_THRESHOLD_DWELL_SECS;
         const breaches = evaluateThreshold(s);
         const active   = breaches.length > 0;
         const r = await evaluateAndNotify(
@@ -281,6 +297,7 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
                 message: `${s.name} is back within configured thresholds.`,
                 detail: { sensorId: s.id, sensorName: s.name } },
           notifConfig,
+          { dwellSecs, nowMs },
         );
         results.push({ kind: 'threshold', sensorId: s.id, ...r });
       } catch (e) { console.error('[notif] threshold error', s.id, e?.message); }
@@ -409,9 +426,10 @@ export function validateNotifConfig(c) {
       const v = c.conditions[k];
       if (v == null) continue;
       if (!_isPlainObject(v)) return false;
-      const allowed = k === 'anomaly'
-        ? ['enabled', 'sigma', 'dwellSecs', 'excludeSensors']
-        : ['enabled', 'thresholdSecs'];
+      const allowed =
+        k === 'anomaly'   ? ['enabled', 'sigma', 'dwellSecs', 'excludeSensors'] :
+        k === 'threshold' ? ['enabled', 'dwellSecs'] :
+                            ['enabled', 'thresholdSecs'];
       for (const k2 of Object.keys(v)) {
         if (!allowed.includes(k2)) return false;
       }
@@ -420,6 +438,8 @@ export function validateNotifConfig(c) {
         if (!_isPosNum(v.sigma))             return false; // null = default; else > 0
         if (!_isNonNegNum(v.dwellSecs))      return false; // null = default; 0 = fire immediately
         if (!_isStrArray(v.excludeSensors))  return false;
+      } else if (k === 'threshold') {
+        if (!_isNonNegNum(v.dwellSecs))      return false; // null = default; 0 = fire immediately
       } else if (!_isPosNum(v.thresholdSecs)) {
         return false;
       }
