@@ -73,8 +73,11 @@ describe('dispatchWebhook', () => {
 });
 
 describe('dispatchNtfy', () => {
-  const firing  = { title: 'T', message: 'M', transition: 'firing' };
-  const recover = { title: 'T', message: 'M', transition: 'recovered' };
+  // Canonical transition values are 'fire'/'recover' (see decideTransition).
+  // A prior version of these fixtures used 'firing'/'recovered', which never
+  // matched the dispatcher's comparison and hid a priority-routing bug.
+  const firing  = { title: 'T', message: 'M', transition: 'fire' };
+  const recover = { title: 'T', message: 'M', transition: 'recover' };
 
   it('sends Title/Priority/Tags headers and the message as the body', async () => {
     fetch.mockResolvedValueOnce(jsonResp({}, 200));
@@ -88,11 +91,11 @@ describe('dispatchNtfy', () => {
     expect(opts.body).toBe('M');
   });
 
-  it('uses lower priority + checkmark tag for recovery events', async () => {
+  it('uses silent (low) priority + checkmark tag for recovery events', async () => {
     fetch.mockResolvedValueOnce(jsonResp({}, 200));
     await dispatchNtfy('https://ntfy.sh/topic', recover);
     const opts = fetch.mock.calls[0][1];
-    expect(opts.headers['Priority']).toBe('3');
+    expect(opts.headers['Priority']).toBe('2');
     expect(opts.headers['Tags']).toMatch(/check_mark|white_check_mark/);
   });
 
@@ -586,6 +589,15 @@ describe('validateNotifConfig', () => {
     // anomaly does not accept thresholdSecs (that's an offline-condition field).
     expect(validateNotifConfig({ conditions: { anomaly: { enabled: true, thresholdSecs: 10 } } })).toBe(false);
   });
+
+  it('accepts threshold dwellSecs (>=0) and rejects bad values', () => {
+    expect(validateNotifConfig({ conditions: { threshold: { enabled: true, dwellSecs: 900 } } })).toBe(true);
+    // 0 = fire immediately, allowed.
+    expect(validateNotifConfig({ conditions: { threshold: { enabled: true, dwellSecs: 0 } } })).toBe(true);
+    expect(validateNotifConfig({ conditions: { threshold: { enabled: true, dwellSecs: -1 } } })).toBe(false);
+    // threshold does not accept thresholdSecs (that's an offline-condition field).
+    expect(validateNotifConfig({ conditions: { threshold: { enabled: true, thresholdSecs: 10 } } })).toBe(false);
+  });
 });
 
 // ── runNotifications (top-level fanout) ───────────────────────────────────
@@ -595,7 +607,10 @@ describe('runNotifications', () => {
     enabled: true,
     webhook: { enabled: true, url: 'https://x/y' },
     conditions: {
-      threshold:      { enabled: true },
+      // dwellSecs: 0 → threshold fires on the first out-of-bounds observation,
+      // preserving these tests' single-poll "fires immediately" assertions.
+      // Production defaults to DEFAULT_THRESHOLD_DWELL_SECS (see dwell tests).
+      threshold:      { enabled: true, dwellSecs: 0 },
       anomaly:        { enabled: false },
       sensorOffline:  { enabled: true, thresholdSecs: 600 },
       gatewayOffline: { enabled: true, thresholdSecs: 600 },
@@ -684,7 +699,7 @@ describe('runNotifications', () => {
         enabled: true,
         webhook: { enabled: true, url: 'https://x' },
         conditions: {
-          threshold:      { enabled: true },
+          threshold:      { enabled: true, dwellSecs: 0 },
           sensorOffline:  { enabled: false, thresholdSecs: 600 },
           gatewayOffline: { enabled: false, thresholdSecs: 600 },
         },
@@ -741,5 +756,55 @@ describe('runNotifications', () => {
       gateways: [], notifConfig: cfg,
     });
     expect(r.find(x => x.kind === 'anomaly')?.transition).toBe('fire');
+  });
+
+  it('threshold dwell-gates: a transient excursion never fires; a sustained one fires after the dwell', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db  = makeDb();
+    const t0  = 4_000_000_000; // fixed epoch (secs) so dwell math is deterministic
+    const hot  = { id: 'fridge', name: 'Refrigerator', temperature: 100, humidity: 50,
+                   alerts: { temperature: { enabled: true, max: 80 } }, lastTs: t0 };
+    const cool = { ...hot, temperature: 40 }; // back in bounds
+    const cfg  = {
+      enabled: true, webhook: { enabled: true, url: 'https://x' },
+      conditions: { threshold: { enabled: true, dwellSecs: 900 } }, // 15 min
+    };
+
+    // t0: first breach observation arms the dwell timer → pending, no dispatch.
+    const r1 = await runNotifications(db, { sensors: [hot], gateways: [], notifConfig: cfg, nowMs: t0 * 1000 });
+    expect(r1.find(x => x.kind === 'threshold').transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
+
+    // +5 min back in bounds → transient; disarms the timer, still nothing sent.
+    const r2 = await runNotifications(db, { sensors: [cool], gateways: [], notifConfig: cfg, nowMs: (t0 + 300) * 1000 });
+    expect(r2.find(x => x.kind === 'threshold').transition).toBe('skip');
+    expect(fetch).not.toHaveBeenCalled();
+
+    // +10 min breach re-arms a fresh timer → pending again (transient reset the clock).
+    const r3 = await runNotifications(db, { sensors: [hot], gateways: [], notifConfig: cfg, nowMs: (t0 + 600) * 1000 });
+    expect(r3.find(x => x.kind === 'threshold').transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
+
+    // Sustained past the dwell (re-armed at +600, matures at +1500) → fire.
+    const r4 = await runNotifications(db, { sensors: [hot], gateways: [], notifConfig: cfg, nowMs: (t0 + 1500) * 1000 });
+    expect(r4.find(x => x.kind === 'threshold').transition).toBe('fire');
+    expect(fetch).toHaveBeenCalled();
+  });
+
+  it('threshold uses the default dwell when dwellSecs is omitted (first poll does not fire)', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    const cfg = {
+      enabled: true, webhook: { enabled: true, url: 'https://x' },
+      conditions: { threshold: { enabled: true } }, // no dwellSecs → DEFAULT_THRESHOLD_DWELL_SECS
+    };
+    const r = await runNotifications(db, {
+      sensors: [{ id: 's9', name: 'Hot', temperature: 100, humidity: 50,
+                  alerts: { temperature: { enabled: true, max: 80 } }, lastTs: now }],
+      gateways: [], notifConfig: cfg,
+    });
+    expect(r.find(x => x.kind === 'threshold').transition).toBe('pending');
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
