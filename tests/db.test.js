@@ -5,7 +5,7 @@ import {
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
-  getBatteryHistory, computeBatteryForecast, getOldestReadingTs,
+  getBatteryHistory, computeBatteryForecast, getOldestReadingTs, pruneReadingsOlderThan,
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
   insertOutdoorReadings, getLatestOutdoorTs, getOutdoorHistory, getLatestOutdoorReading,
@@ -322,11 +322,77 @@ describe('getOldestReadingTs', () => {
       { observed: new Date(base * 1000).toISOString(),          temperature: 60, humidity: 40, barometric_pressure: null, battery_voltage: null },
       { observed: new Date((base + 500) * 1000).toISOString(),  temperature: 61, humidity: 41, barometric_pressure: null, battery_voltage: null },
     ]);
+    // No hourly aggregates built yet → oldest is the raw minimum.
     expect(getOldestReadingTs(db)).toBe(base);
 
-    // Excluding the oldest moves the answer forward.
+    // setReadingExcluded recomputes the affected hour, which still holds the
+    // non-excluded base+500 reading, so an hourly_agg row now exists at the
+    // hour floor. getOldestReadingTs also considers hourly_agg (so the Stats
+    // YoY "≥1 year" check survives raw-readings retention pruning), and that
+    // aggregate — for an hour we still have data in — anchors the result.
     setReadingExcluded(db, 'b', base, true);
-    expect(getOldestReadingTs(db)).toBe(base + 500);
+    expect(getOldestReadingTs(db)).toBe(base - (base % 3600));
+  });
+
+  it('falls back to hourly_agg when raw readings have been pruned', async () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [{ id: 'o1', name: 'O', type: 'HT1', active: true }]);
+
+    const oldTs = now - 400 * 86400;   // beyond a 365-day raw retention window
+    const newTs = now - 3600;
+    insertReadings(db, 'o1', [
+      { observed: new Date(oldTs * 1000).toISOString(), temperature: 60, humidity: 40 },
+      { observed: new Date(newTs * 1000).toISOString(), temperature: 70, humidity: 50 },
+    ]);
+    const oldHour = oldTs - (oldTs % 3600);
+    recomputeHourlyAgg(db, 'o1', oldHour);
+    recomputeHourlyAgg(db, 'o1', newTs - (newTs % 3600));
+
+    // Prune the old raw row; its hourly aggregate remains.
+    await pruneReadingsOlderThan(db, now - 365 * 86400);
+
+    // Oldest *raw* reading is now newTs, but hourly_agg still reaches back to
+    // the old hour — getOldestReadingTs must report the older aggregate ts so
+    // the YoY overlay still sees ≥1 year of history.
+    expect(getOldestReadingTs(db)).toBe(oldHour);
+  });
+});
+
+describe('pruneReadingsOlderThan', () => {
+  it('deletes rows older than cutoff in batches and leaves hourly_agg intact', async () => {
+    const db = makeDb();
+    const base = 1_600_000_000;
+    upsertSensors(db, [{ id: 'p', name: 'P', type: 'HT1', active: true }]);
+    // 25 readings 1h apart; cutoff falls in the middle.
+    insertReadings(db, 'p', makeSamples('p', 25, base, 3600));
+    // Build hourly aggregates for all touched hours.
+    const hours = new Set();
+    for (let i = 0; i < 25; i++) { const t = base + i * 3600; hours.add(t - (t % 3600)); }
+    for (const h of hours) recomputeHourlyAgg(db, 'p', h);
+    const aggBefore = db.prepare('SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id = ?').get('p').n;
+
+    const cutoff = base + 10 * 3600;
+    // batchSize:4 forces multiple batches; count the yields.
+    let yields = 0;
+    const deleted = await pruneReadingsOlderThan(db, cutoff, { batchSize: 4, yieldFn: () => { yields++; } });
+
+    expect(deleted).toBe(10);                                   // rows with ts < cutoff
+    expect(yields).toBeGreaterThan(0);                          // ran in >1 batch, yielding
+    const remaining = db.prepare('SELECT MIN(ts) AS mn, COUNT(*) AS n FROM readings WHERE sensor_id = ?').get('p');
+    expect(remaining.n).toBe(15);
+    expect(remaining.mn).toBe(cutoff);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id = ?').get('p').n).toBe(aggBefore);
+  });
+
+  it('deletes nothing when no rows precede the cutoff', async () => {
+    const db = makeDb();
+    const base = 1_600_000_000;
+    upsertSensors(db, [{ id: 'q', name: 'Q', type: 'HT1', active: true }]);
+    insertReadings(db, 'q', makeSamples('q', 5, base, 3600));
+    const deleted = await pruneReadingsOlderThan(db, base - 1);
+    expect(deleted).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM readings WHERE sensor_id = ?').get('q').n).toBe(5);
   });
 });
 

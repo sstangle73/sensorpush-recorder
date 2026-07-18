@@ -1,25 +1,34 @@
+import { backup } from 'node:sqlite';
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from './weather.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs } from './db.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs, pruneReadingsOlderThan } from './db.js';
 import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
 import { runNotifications } from './notifications.js';
 
 let _lastPollError     = null;
 let _lastPollTime      = null;
+let _lastSensorCount   = null;
 let _backfillState     = { status: 'idle', progress: null, error: null };
 let _lastDiscoveryAt   = 0;
 const DISCOVERY_INTERVAL_MS = 3600 * 1000;
 let _lastWeatherPollTime = null;
 let _lastWeatherError    = null;
 
+// Raw-readings retention. Older rows are pruned daily (in yielding batches);
+// hourly aggregates survive forever, so long-term history is preserved. Bounds
+// DB growth so fsync-heavy ops (snapshot, catch-up insert, WAL recovery) stay
+// fast over time. Override via env; set 0 to disable pruning entirely.
+const READINGS_RETENTION_DAYS = Number(process.env.READINGS_RETENTION_DAYS ?? 365);
+
 // Run one poll immediately, then every 5 minutes. Errors are intentionally
 // swallowed here so a transient cloud outage doesn't stop the interval — the
 // failure surfaces via /health (lastPollError) and the next tick retries.
 //
-// Also schedules two daily clock-aligned jobs:
+// Also schedules three daily clock-aligned jobs:
 //   03:00 — auto gap-backfill over the last 7 days (self-healing data)
 //   03:30 — SQLite snapshot to /data/backups/sensorpush-YYYY-MM-DD.db
 //           with retention pruning beyond 7 daily snapshots
+//   04:00 — raw-readings retention prune (keeps hourly aggregates forever)
 //
 // `db` is a let-mutable param so `registerSwap` (called by server.js on
 // /backups/:filename/restore) can swap in the post-restore handle. The
@@ -61,6 +70,7 @@ export function startPoller(db, config, registerSwap = null) {
 
   scheduleDaily(3,  0, () => _autoGapBackfill(db, config));
   scheduleDaily(3, 30, () => _snapshotDb(db));
+  scheduleDaily(4,  0, () => _pruneReadings(db));
 }
 
 // scheduleDaily(hour, minute, fn) — runs `fn` once per day at the next
@@ -93,10 +103,14 @@ async function _autoGapBackfill(db, config) {
   await triggerGapBackfill(db, config, { range: '7d' });
 }
 
-// Daily snapshot via SQLite's `VACUUM INTO`, which produces a clean
-// single-file copy without locking the live DB for long. Snapshots land
-// in /data/backups/ alongside the live DB; the most recent 7 are kept.
-// Exported for tests.
+// Daily snapshot via node:sqlite's async online-backup API. Unlike the
+// previous synchronous `VACUUM INTO` — which rewrote the entire multi-hundred-
+// MB DB in one uninterruptible, fsync-bound call and FROZE the event loop
+// (and /health) for its whole duration, ultimately wedging the container —
+// backup() copies in small page batches and yields the event loop between
+// them, so /health, MQTT, and the poll loop stay responsive throughout.
+// Snapshots land in /data/backups/ alongside the live DB; the most recent 7
+// are kept. Exported for tests.
 export async function _snapshotDb(db) {
   const { mkdirSync, readdirSync, statSync, unlinkSync } = await import('node:fs');
   const { join, dirname } = await import('node:path');
@@ -106,8 +120,11 @@ export async function _snapshotDb(db) {
 
   const datestamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   const dest      = join(dir, `sensorpush-${datestamp}.db`);
-  // Quoting: VACUUM INTO accepts a string-literal path. We control it.
-  db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+  // rate=100 pages per batch keeps each synchronous step small (~sub-100ms)
+  // so the loop breathes between batches. backup() takes the path directly,
+  // so no SQL string-escaping is needed and it overwrites an existing
+  // same-day snapshot cleanly (VACUUM INTO would have errored on that).
+  await backup(db, dest, { rate: 100 });
   console.log(`[poller] snapshot written: ${dest}`);
 
   // Retention: keep the 7 newest sensorpush-*.db files, delete the rest.
@@ -120,6 +137,18 @@ export async function _snapshotDb(db) {
   }
 }
 
+// Daily raw-readings retention. Deletes readings older than
+// READINGS_RETENTION_DAYS in bounded, yielding batches (db.pruneReadingsOlderThan)
+// so the prune itself never becomes a long synchronous fsync block. Hourly
+// aggregates are untouched — long-term history survives at hourly resolution.
+// Exported for tests.
+export async function _pruneReadings(db) {
+  if (!(READINGS_RETENTION_DAYS > 0)) return;
+  const cutoff  = Math.floor(Date.now() / 1000) - READINGS_RETENTION_DAYS * 86400;
+  const deleted = await pruneReadingsOlderThan(db, cutoff, { batchSize: 5000 });
+  if (deleted) console.log(`[poller] retention: pruned ${deleted} raw readings older than ${READINGS_RETENTION_DAYS}d`);
+}
+
 async function _poll(db, config) {
   const sp = config?.sensorpush;
   if (!sp?.email || sp.email.includes('YOUR_')) return;
@@ -129,6 +158,7 @@ async function _poll(db, config) {
 
   const sensors = await fetchSensors(token);
   if (!sensors.length) return;
+  _lastSensorCount = sensors.length;
 
   upsertSensors(db, sensors);
 
@@ -147,34 +177,32 @@ async function _poll(db, config) {
 
   for (const sensor of sensors) {
     const latestTs = getLatestTs(db, sensor.id);
-    let allSamples = [];
+    const now      = Math.floor(Date.now() / 1000);
 
-    if (!latestTs) {
-      // First run: backfill 30 days in 2-day chunks. The SensorPush /samples
-      // API caps at 10000 rows per response; at ~1 reading/min that's ~7 days
-      // for an HT1, but HTP sensors emit more series so we stay well under
-      // with 2-day windows.
-      const now     = Math.floor(Date.now() / 1000);
-      const oldest  = now - 30 * 86400;
-      const chunk   = 2 * 86400;
-      for (let end = now; end > oldest; end -= chunk) {
-        const start   = Math.max(end - chunk, oldest);
-        const samples = await fetchSamples(token, { sensorId: sensor.id, startTs: start, stopTs: end });
-        allSamples = allSamples.concat(samples);
-      }
-    } else {
-      // Always look back 24h from the latest reading to catch late-published data
-      // and gaps caused by excluded readings. INSERT OR IGNORE makes duplicates free.
-      const lookbackTs = latestTs - 24 * 3600;
-      allSamples = await fetchSamples(token, { sensorId: sensor.id, startTs: lookbackTs });
-    }
+    // Window to (re)fetch:
+    //   first run (no data) → 30 days back
+    //   incremental         → 24h back from latest (catches late-published
+    //                         data and gaps left by excluded readings)
+    // Either way, fetch in bounded ≤2-day windows and insert+recompute PER
+    // window, awaiting the network fetch between windows. This keeps every
+    // synchronous DB burst small so a long catch-up after downtime can never
+    // become one giant non-yielding insert+recompute that freezes the event
+    // loop and /health (the failure that wedged the recorder). The 2-day cap
+    // also stays under the SensorPush /samples 10000-row response limit.
+    // INSERT OR IGNORE makes the inevitable window overlap free.
+    const startTs = latestTs ? latestTs - 24 * 3600 : now - 30 * 86400;
+    const chunk   = 2 * 86400;
 
-    if (!allSamples.length) continue;
-    const inserted = insertReadings(db, sensor.id, allSamples);
-    if (inserted.length) {
-      const affectedHours = [...new Set(inserted.map(r => r.ts - (r.ts % 3600)))];
-      for (const hourTs of affectedHours) {
-        recomputeHourlyAgg(db, sensor.id, hourTs);
+    for (let start = startTs; start < now; start += chunk) {
+      const stop    = Math.min(start + chunk, now);
+      const samples = await fetchSamples(token, { sensorId: sensor.id, startTs: start, stopTs: stop });
+      if (!samples.length) continue;
+      const inserted = insertReadings(db, sensor.id, samples);
+      if (inserted.length) {
+        const affectedHours = [...new Set(inserted.map(r => r.ts - (r.ts % 3600)))];
+        for (const hourTs of affectedHours) {
+          recomputeHourlyAgg(db, sensor.id, hourTs);
+        }
       }
     }
   }
@@ -249,6 +277,7 @@ export function getPollStatus() {
   return {
     lastPollTime:        _lastPollTime,
     lastPollError:       _lastPollError,
+    lastSensorCount:     _lastSensorCount,
     lastWeatherPollTime: _lastWeatherPollTime,
     lastWeatherError:    _lastWeatherError,
   };
@@ -257,6 +286,7 @@ export function getPollStatus() {
 export function _resetPollerState() {
   _lastPollError       = null;
   _lastPollTime        = null;
+  _lastSensorCount     = null;
   _lastDiscoveryAt     = 0;
   _lastWeatherPollTime = null;
   _lastWeatherError    = null;

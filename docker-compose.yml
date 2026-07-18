@@ -2,8 +2,14 @@ services:
   sensorpush-recorder:
     build: .
     container_name: sensorpush-recorder
-    restart: unless-stopped
+    # `always` (not `unless-stopped`) so the weekly host reboot brings the
+    # container back even if a prior run had ended in an Exited state — the
+    # failure mode that once left the recorder down for days across a reboot.
+    restart: always
     init: true
+    # Give the graceful-shutdown handler (server.js) time to close the HTTP
+    # server + DB handle on `docker stop` / redeploy before SIGKILL.
+    stop_grace_period: 30s
     ports:
       - "3003:3003"
     environment:
@@ -36,15 +42,14 @@ services:
       - ./data:/data
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3003/health || exit 1
-      # Tolerant of transient event-loop stalls. /health is served on the same
-      # event loop that heavy *synchronous* node:sqlite work blocks — a large
-      # catch-up poll, recomputeHourlyAgg over a wide range, or the 03:30 VACUUM.
-      # While blocked, wget can't get a reply and the check fails. With the
-      # autoheal=true label below, too-tight settings turn a transient stall into
-      # a restart loop (and a bad restart can wedge the container). These values
-      # require ~5 min continuously unhealthy before autoheal acts (5 × 1m), give
-      # each probe 10s, and grant a long startup grace for the initial backfill
-      # after downtime. A genuinely dead app still gets restarted, just ~2 min later.
+      # /health is now a pure in-memory liveness check (no DB query), and the
+      # heavy fsync-bound sqlite work that used to freeze the event loop —
+      # the daily snapshot (now the async online-backup API), the catch-up
+      # poll (now chunked with yields), and unbounded readings growth (now
+      # pruned to a retention window) — no longer blocks it. So a failing
+      # healthcheck should mean the process is genuinely dead, not just busy.
+      # These tolerant values (≈5 min continuously unhealthy before autoheal
+      # acts, plus a long startup grace) remain as defence in depth.
       start_period: 180s
       interval: 1m
       timeout: 10s
