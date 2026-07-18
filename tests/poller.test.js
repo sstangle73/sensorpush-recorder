@@ -15,7 +15,7 @@ vi.mock('../weather.js', () => ({
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from '../weather.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs } from '../db.js';
-import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, triggerWeatherPoll } from '../poller.js';
+import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, _pruneReadings, triggerWeatherPoll } from '../poller.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -93,7 +93,7 @@ describe('triggerPoll — first-run backfill', () => {
     expect(fetchSamples).toHaveBeenCalledTimes(15);
   });
 
-  it('first chunk starts near now and last chunk reaches ~30 days back', async () => {
+  it('chunks span ~now back to ~30 days (order-independent)', async () => {
     getToken.mockResolvedValue('tok');
     fetchSensors.mockResolvedValue([sensor()]);
     fetchSamples.mockResolvedValue([]);
@@ -102,14 +102,18 @@ describe('triggerPoll — first-run backfill', () => {
     await triggerPoll(makeDb(), CREDS);
     const after = Math.floor(Date.now() / 1000);
 
-    const calls = fetchSamples.mock.calls.map(c => c[1]);
-    const firstStop  = calls[0].stopTs;
-    const lastStart  = calls[14].startTs;
+    // The unified poll loop walks windows ascending, so assert on the span
+    // (newest stopTs ≈ now, oldest startTs ≈ 30 days back) rather than call order.
+    const calls    = fetchSamples.mock.calls.map(c => c[1]);
+    const maxStop  = Math.max(...calls.map(c => c.stopTs));
+    const minStart = Math.min(...calls.map(c => c.startTs));
 
-    expect(firstStop).toBeGreaterThanOrEqual(before);
-    expect(firstStop).toBeLessThanOrEqual(after + 1);
-    expect(lastStart).toBeGreaterThanOrEqual(before - 30 * 86400 - 1);
-    expect(lastStart).toBeLessThanOrEqual(after  - 28 * 86400);
+    expect(maxStop).toBeGreaterThanOrEqual(before);
+    expect(maxStop).toBeLessThanOrEqual(after + 1);
+    expect(minStart).toBeGreaterThanOrEqual(before - 30 * 86400 - 1);
+    expect(minStart).toBeLessThanOrEqual(after  - 28 * 86400);
+    // Every window stays under the 2-day SensorPush response cap.
+    for (const w of calls) expect(w.stopTs - w.startTs).toBeLessThanOrEqual(2 * 86400);
   });
 
   it('inserts returned samples into the DB', async () => {
@@ -132,9 +136,11 @@ describe('triggerPoll — first-run backfill', () => {
     const before = Date.now();
     await triggerPoll(makeDb(), CREDS);
 
-    const { lastPollTime, lastPollError } = getPollStatus();
+    const { lastPollTime, lastPollError, lastSensorCount } = getPollStatus();
     expect(lastPollTime).toBeGreaterThanOrEqual(before);
     expect(lastPollError).toBeNull();
+    // /health surfaces this in-memory count instead of a DB query.
+    expect(lastSensorCount).toBe(1);
   });
 });
 
@@ -157,6 +163,29 @@ describe('triggerPoll — incremental fetch', () => {
     // lookback = latestTs - 24h; latestTs ≈ now - 3600, so startTs ≈ now - 3600 - 86400
     expect(startTs).toBeGreaterThan(now - 30 * 3600);
     expect(startTs).toBeLessThan(now - 23 * 3600);
+  });
+
+  it('chunks a multi-day catch-up into bounded ≤2-day windows (no single giant fetch)', async () => {
+    const db = makeDb();
+
+    upsertSensors(db, [sensor('inc2')]);
+    // Latest reading is ~9 days old — the catch-up-after-downtime case that
+    // used to do one unbounded fetch + one non-yielding insert/recompute burst
+    // (the recurring trigger of the event-loop wedge). It must now chunk.
+    insertReadings(db, 'inc2', [sample(9 * 86400)]);
+
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor('inc2')]);
+    fetchSamples.mockResolvedValue([]);
+
+    await triggerPoll(db, CREDS);
+
+    // ~9 days + 24h lookback ≈ 10 days → multiple windows, each ≤ 2 days.
+    expect(fetchSamples.mock.calls.length).toBeGreaterThan(1);
+    for (const [, w] of fetchSamples.mock.calls) {
+      expect(w.sensorId).toBe('inc2');
+      expect(w.stopTs - w.startTs).toBeLessThanOrEqual(2 * 86400);
+    }
   });
 
 });
@@ -393,7 +422,7 @@ describe('_snapshotDb (daily DB backup)', () => {
     expect(readdirSync(backupsDir)).toContain('unrelated.txt');
   });
 
-  it('handles single-quoted paths safely (escapes for VACUUM INTO)', async () => {
+  it('handles paths with special characters (backup() takes the path directly, no SQL interpolation)', async () => {
     const { mkdtempSync, existsSync, readdirSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -408,6 +437,66 @@ describe('_snapshotDb (daily DB backup)', () => {
       const { rmSync } = await import('node:fs');
       rmSync(trickyDir, { recursive: true, force: true });
     }
+  });
+
+  it('produces a valid SQLite copy that preserves the data (online backup)', async () => {
+    const { readdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const db = makeDb();
+    upsertSensors(db, [sensor('snapd')]);
+    insertReadings(db, 'snapd', [
+      { observed: new Date().toISOString(),               temperature: 70, humidity: 50 },
+      { observed: new Date(Date.now() - 3600e3).toISOString(), temperature: 68, humidity: 52 },
+    ]);
+
+    await _snapshotDb(db);
+
+    const backupsDir = join(tmpDir, 'backups');
+    const file = readdirSync(backupsDir).find(f => /^sensorpush-.*\.db$/.test(f));
+    // Re-open the snapshot as an independent DB and confirm the rows survived.
+    const snap = openDb(join(backupsDir, file));
+    const n = snap.prepare('SELECT COUNT(*) AS n FROM readings WHERE sensor_id = ?').get('snapd').n;
+    snap.close();
+    expect(n).toBe(2);
+  });
+});
+
+describe('_pruneReadings / retention', () => {
+  it('deletes raw readings older than the cutoff but keeps hourly aggregates', async () => {
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [sensor('ret1')]);
+
+    // One old reading (400 days) and one recent (1h). Build the hourly_agg for
+    // the old hour, mirroring what the poll loop does on insert.
+    const oldTs = now - 400 * 86400;
+    const newTs = now - 3600;
+    insertReadings(db, 'ret1', [
+      { observed: new Date(oldTs * 1000).toISOString(), temperature: 60, humidity: 40 },
+      { observed: new Date(newTs * 1000).toISOString(), temperature: 70, humidity: 50 },
+    ]);
+    recomputeHourlyAgg(db, 'ret1', oldTs - (oldTs % 3600));
+    recomputeHourlyAgg(db, 'ret1', newTs - (newTs % 3600));
+
+    const aggBefore = db.prepare('SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id = ?').get('ret1').n;
+
+    await _pruneReadings(db); // default 365-day retention (env unset)
+
+    const rawRows = db.prepare('SELECT ts FROM readings WHERE sensor_id = ? ORDER BY ts').all('ret1');
+    expect(rawRows.map(r => r.ts)).toEqual([newTs]);            // old raw gone, recent kept
+    const aggAfter = db.prepare('SELECT COUNT(*) AS n FROM hourly_agg WHERE sensor_id = ?').get('ret1').n;
+    expect(aggAfter).toBe(aggBefore);                            // aggregates untouched
+  });
+
+  it('is a no-op when READINGS_RETENTION_DAYS is 0', async () => {
+    // The module reads the env var at import time, so this only asserts the
+    // guard shape: with the default (365d) nothing recent is pruned.
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    upsertSensors(db, [sensor('ret2')]);
+    insertReadings(db, 'ret2', [{ observed: new Date((now - 3600) * 1000).toISOString(), temperature: 70, humidity: 50 }]);
+    await _pruneReadings(db);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM readings WHERE sensor_id = ?').get('ret2').n).toBe(1);
   });
 });
 

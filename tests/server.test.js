@@ -28,11 +28,13 @@ async function get(path) {
 }
 
 describe('GET /health', () => {
-  it('returns ok:true with sensorCount', async () => {
+  it('returns ok:true and does no DB work (sensorCount from in-memory poll state)', async () => {
     const { status, body } = await get('/health');
     expect(status).toBe(200);
     expect(body.ok).toBe(true);
-    expect(typeof body.sensorCount).toBe('number');
+    // sensorCount comes from the last poll's in-memory value now, not a DB
+    // query — it's null until a poll has run (no poller in this test harness).
+    expect(body.sensorCount === null || typeof body.sensorCount === 'number').toBe(true);
   });
 });
 

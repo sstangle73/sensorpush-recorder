@@ -5,6 +5,16 @@ import { DatabaseSync } from 'node:sqlite';
 export function openDb(path) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL');
+  // synchronous=NORMAL is the SQLite-recommended pairing with WAL: still
+  // crash-safe for the application (only a full OS/power loss can lose the
+  // last few committed transactions), but it fsyncs far less than the default
+  // FULL — which matters because every commit runs synchronously on the one
+  // event-loop thread, and piled-up fsyncs are what stalled it into D-state.
+  db.exec('PRAGMA synchronous = NORMAL');
+  // Wait (up to 5s) on lock contention instead of erroring immediately with
+  // SQLITE_BUSY. Relevant now that the daily snapshot uses the async online
+  // backup API, which reads the DB concurrently with the poll writer.
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS sensors (
       id              TEXT PRIMARY KEY,
@@ -420,6 +430,33 @@ export function recomputeHourlyAgg(db, sensorId, hourTs) {
   `).run(sensorId, hourTs, excluded, sensorId, hourTs, hourTs + 3600);
 }
 
+// Retention: delete raw readings older than cutoffTs in bounded, yielding
+// batches. A single unbounded `DELETE FROM readings WHERE ts < cutoff` would
+// be one large synchronous, fsync-heavy transaction on the one event-loop
+// thread — exactly the kind of main-thread block that froze /health and
+// wedged the recorder. Deleting in small batches and awaiting a yield between
+// them keeps /health and the poll loop responsive throughout.
+//
+// hourly_agg is deliberately NOT touched: long-term history survives as
+// hourly aggregates (kept forever, maintained by recomputeHourlyAgg on every
+// insert). We must not recomputeHourlyAgg for the pruned hours either — with
+// zero raw rows left it would DELETE the very aggregates we're preserving.
+//
+// Returns the number of raw rows deleted.
+export async function pruneReadingsOlderThan(db, cutoffTs, { batchSize = 5000, yieldFn } = {}) {
+  const stmt = db.prepare(
+    `DELETE FROM readings WHERE rowid IN (SELECT rowid FROM readings WHERE ts < ? LIMIT ?)`,
+  );
+  let total = 0;
+  for (;;) {
+    const { changes } = stmt.run(cutoffTs, batchSize);
+    total += changes;
+    if (changes < batchSize) break;                 // last (partial) batch
+    await (yieldFn ? yieldFn() : new Promise(res => setImmediate(res)));
+  }
+  return total;
+}
+
 export function getSensors(db) {
   return db.prepare(`
     SELECT s.id, s.name, s.type, s.active, s.battery_voltage, s.alerts,
@@ -591,7 +628,18 @@ export function getHistory(db, sensorId, range, endTs = null) {
 // empty. The Stats YoY overlay uses this to decide whether the recorder has
 // enough history (≥ 1 year) before offering the comparison.
 export function getOldestReadingTs(db) {
-  const row = db.prepare(`SELECT MIN(ts) AS ts FROM readings WHERE excluded = 0`).get();
+  // Consider hourly_agg as well as readings: once raw-readings retention
+  // (pruneReadingsOlderThan) ages out old rows, the oldest *raw* reading is
+  // only ~retention-window old, but long-term history still exists as hourly
+  // aggregates. The Stats YoY overlay keys off this value to decide whether
+  // ≥1 year of history exists, so report the oldest ts across both tables.
+  const row = db.prepare(`
+    SELECT MIN(ts) AS ts FROM (
+      SELECT MIN(ts)      AS ts FROM readings   WHERE excluded = 0
+      UNION ALL
+      SELECT MIN(hour_ts) AS ts FROM hourly_agg WHERE excluded = 0
+    )
+  `).get();
   return row?.ts ?? null;
 }
 

@@ -421,13 +421,18 @@ export function createApp(db, config = null, onSwap = null) {
   });
 
   app.get('/health', (_req, res) => {
-    const { lastPollTime, lastPollError } = getPollStatus();
-    const row = db.prepare('SELECT COUNT(*) AS n FROM sensors').get();
+    // Liveness only — deliberately does NO database work. This is the Docker
+    // healthcheck target; it once ran `SELECT COUNT(*) FROM sensors`, which
+    // coupled liveness to DB responsiveness, so any heavy fsync-bound sqlite
+    // op that froze the event loop ALSO failed the healthcheck and escalated a
+    // transient stall into an autoheal restart loop. sensorCount now comes
+    // from the last poll's in-memory value (null until the first poll runs).
+    const { lastPollTime, lastPollError, lastSensorCount } = getPollStatus();
     res.json({
       ok:          true,
       lastPoll:    lastPollTime ? new Date(lastPollTime).toISOString() : null,
       pollError:   lastPollError,
-      sensorCount: row.n,
+      sensorCount: lastSensorCount ?? null,
     });
   });
 
@@ -1301,7 +1306,7 @@ if (process.env.NODE_ENV !== 'test') {
     for (const cb of swapCallbacks) cb(newDb);
   });
   startPoller(db, config, (cb) => swapCallbacks.push(cb));
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`[sensorpush-recorder] listening on :${PORT}`);
     // One-shot warning when no auth is configured. A LAN-only deploy can
     // ignore it; a public-internet recorder should generate a token via
@@ -1319,4 +1324,21 @@ if (process.env.NODE_ENV !== 'test') {
       console.log(`[sensorpush-recorder] auth enabled (source: ${src})`);
     }
   });
+
+  // Graceful shutdown on redeploy / `docker stop`. Close the HTTP server and
+  // DB handle cleanly instead of relying on SIGKILL after the stop grace
+  // period. NB: this cannot help if the process is ever wedged inside an
+  // uninterruptible fsync (D-state) — the handler never gets to run — which is
+  // exactly why the real fixes keep heavy fsync work off the event loop.
+  let _shuttingDown = false;
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      if (_shuttingDown) return;
+      _shuttingDown = true;
+      console.log(`[sensorpush-recorder] ${sig} received — shutting down`);
+      server.close(() => { try { db.close(); } catch (_) {} process.exit(0); });
+      // Failsafe: exit even if an in-flight connection keeps server.close hanging.
+      setTimeout(() => process.exit(0), 8000).unref();
+    });
+  }
 }
