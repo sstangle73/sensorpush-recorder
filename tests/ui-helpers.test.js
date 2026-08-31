@@ -656,3 +656,195 @@ describe('computeOutdoorDelta', () => {
     expect(d.dewpoint.outdoor).toBe(0);
   });
 });
+
+// ── Chart layout / tooltip helpers (copies of ui.html) ─────────────────────
+
+function panelFractions({ temp, hum, baro, vpd }) {
+  const extras = (baro ? 1 : 0) + (vpd ? 1 : 0);
+  const fracs = [];
+  if (temp) fracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : hum ? 0.58 : 1.0);
+  if (hum)  fracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
+  if (baro) fracs.push(vpd ? 0.15 : 0.18);
+  if (vpd)  fracs.push(baro ? 0.15 : 0.18);
+  const total = fracs.reduce((a, b) => a + b, 0);
+  return total > 0 ? fracs.map(f => f / total) : fracs;
+}
+
+function tooltipSortValue(sample, panelType, series) {
+  if (!sample) return null;
+  const has = s => !series || series.has(s);
+  switch (panelType) {
+    case 'hum':  return has('humidity') ? (sample.humidity     ?? null) : null;
+    case 'baro': return has('pressure') ? (sample.baroPressure ?? null) : null;
+    case 'vpd':  return has('vpd')      ? (sample.vpd          ?? null) : null;
+    default:
+      if (has('temp')     && sample.temperature != null) return sample.temperature;
+      if (has('dewpoint') && sample.dewpoint    != null) return sample.dewpoint;
+      return null;
+  }
+}
+
+function sortTooltipRows(rows) {
+  return rows.slice().sort((a, b) => {
+    if (a.sortVal == null && b.sortVal == null) return 0;
+    if (a.sortVal == null) return 1;
+    if (b.sortVal == null) return -1;
+    return b.sortVal - a.sortVal;
+  });
+}
+
+function sensorGroupFilters(sensors, classify, groups) {
+  const present = new Set(Object.values(sensors || {}).map(s => classify(s.name).group));
+  if (present.size < 2) return [];
+  return groups.filter(g => present.has(g.key)).map(g => ({ key: g.key, label: g.label }));
+}
+
+const sumOf = a => a.reduce((x, y) => x + y, 0);
+
+describe('panelFractions', () => {
+  it('gives a lone humidity panel the whole canvas', () => {
+    expect(panelFractions({ temp: false, hum: true, baro: false, vpd: false })).toEqual([1]);
+  });
+
+  it('gives a lone temperature panel the whole canvas', () => {
+    expect(panelFractions({ temp: true, hum: false, baro: false, vpd: false })).toEqual([1]);
+  });
+
+  it('always sums to 1 for every panel combination', () => {
+    for (const temp of [true, false])
+      for (const hum of [true, false])
+        for (const baro of [true, false])
+          for (const vpd of [true, false]) {
+            const f = panelFractions({ temp, hum, baro, vpd });
+            if (!f.length) continue;
+            expect(sumOf(f)).toBeCloseTo(1, 10);
+          }
+  });
+
+  it('returns one fraction per active panel', () => {
+    expect(panelFractions({ temp: true, hum: true, baro: true, vpd: true })).toHaveLength(4);
+    expect(panelFractions({ temp: false, hum: true, baro: true, vpd: false })).toHaveLength(2);
+  });
+
+  it('returns [] when nothing is shown', () => {
+    expect(panelFractions({ temp: false, hum: false, baro: false, vpd: false })).toEqual([]);
+  });
+
+  it('keeps temp taller than humidity in the classic two-panel layout', () => {
+    const [t, h] = panelFractions({ temp: true, hum: true, baro: false, vpd: false });
+    expect(t).toBeGreaterThan(h);
+  });
+
+  it('normalizes a humidity + pressure chart to fill the canvas', () => {
+    // Pre-normalization these were 0.32 + 0.18 — half the canvas, rest dead space.
+    const f = panelFractions({ temp: false, hum: true, baro: true, vpd: false });
+    expect(sumOf(f)).toBeCloseTo(1, 10);
+    expect(f[0]).toBeGreaterThan(f[1]);
+  });
+});
+
+describe('tooltipSortValue', () => {
+  const all = new Set(['temp', 'humidity', 'pressure', 'dewpoint', 'vpd']);
+
+  it('reads the metric matching the panel', () => {
+    const s = { temperature: 70, humidity: 55, baroPressure: 29.9, vpd: 0.8 };
+    expect(tooltipSortValue(s, 'temp', all)).toBe(70);
+    expect(tooltipSortValue(s, 'hum',  all)).toBe(55);
+    expect(tooltipSortValue(s, 'baro', all)).toBe(29.9);
+    expect(tooltipSortValue(s, 'vpd',  all)).toBe(0.8);
+  });
+
+  it('returns null when the sensor does not plot the ranking metric', () => {
+    expect(tooltipSortValue({ temperature: 70, humidity: 55 }, 'hum', new Set(['temp']))).toBeNull();
+  });
+
+  it('falls back to dewpoint on the temp panel when temp is not plotted', () => {
+    expect(tooltipSortValue({ temperature: 70, dewpoint: 50 }, 'temp', new Set(['dewpoint']))).toBe(50);
+  });
+
+  it('treats a missing series set as plotting everything', () => {
+    expect(tooltipSortValue({ humidity: 88 }, 'hum', null)).toBe(88);
+  });
+
+  it('returns null for a missing value or missing sample', () => {
+    expect(tooltipSortValue({ temperature: null }, 'temp', all)).toBeNull();
+    expect(tooltipSortValue(null, 'hum', all)).toBeNull();
+  });
+
+  it('keeps a zero reading rather than nulling it', () => {
+    expect(tooltipSortValue({ humidity: 0 }, 'hum', all)).toBe(0);
+  });
+});
+
+describe('sortTooltipRows', () => {
+  it('orders rows highest value first', () => {
+    const rows = [
+      { sortVal: 58, html: 'living' },
+      { sortVal: 88, html: 'outside' },
+      { sortVal: 72, html: 'primary' },
+    ];
+    expect(sortTooltipRows(rows).map(r => r.html)).toEqual(['outside', 'primary', 'living']);
+  });
+
+  it('sinks rows with no comparable value to the bottom', () => {
+    const rows = [
+      { sortVal: null, html: 'unplotted' },
+      { sortVal: 40,   html: 'low' },
+      { sortVal: 90,   html: 'high' },
+    ];
+    expect(sortTooltipRows(rows).map(r => r.html)).toEqual(['high', 'low', 'unplotted']);
+  });
+
+  it('is stable for ties and does not mutate the input', () => {
+    const rows = [
+      { sortVal: 50, html: 'a' },
+      { sortVal: 50, html: 'b' },
+      { sortVal: 50, html: 'c' },
+    ];
+    expect(sortTooltipRows(rows).map(r => r.html)).toEqual(['a', 'b', 'c']);
+    expect(rows.map(r => r.html)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('handles an empty list', () => {
+    expect(sortTooltipRows([])).toEqual([]);
+  });
+});
+
+describe('sensorGroupFilters', () => {
+  const GROUPS = [
+    { key: 'house',     label: 'House' },
+    { key: 'outside',   label: 'Outside' },
+    { key: 'appliance', label: 'Appliances' },
+    { key: 'other',     label: 'Other' },
+  ];
+  // Mirrors classifySensor()'s group keys without duplicating its regexes.
+  const classify = s => ({
+    'Living Room':   { group: 'house' },
+    'Attic':         { group: 'house' },
+    'Outside':       { group: 'outside' },
+    'Garage Fridge': { group: 'appliance' },
+  }[s] || { group: 'other' });
+
+  it('offers only the groups that have sensors, in canonical order', () => {
+    const sensors = {
+      a: { name: 'Outside' },
+      b: { name: 'Living Room' },
+      c: { name: 'Garage Fridge' },
+    };
+    expect(sensorGroupFilters(sensors, classify, GROUPS)).toEqual([
+      { key: 'house',     label: 'House' },
+      { key: 'outside',   label: 'Outside' },
+      { key: 'appliance', label: 'Appliances' },
+    ]);
+  });
+
+  it('offers nothing when every sensor is in one group', () => {
+    const sensors = { a: { name: 'Living Room' }, b: { name: 'Attic' } };
+    expect(sensorGroupFilters(sensors, classify, GROUPS)).toEqual([]);
+  });
+
+  it('offers nothing for an empty or missing sensor map', () => {
+    expect(sensorGroupFilters({}, classify, GROUPS)).toEqual([]);
+    expect(sensorGroupFilters(null, classify, GROUPS)).toEqual([]);
+  });
+});

@@ -89,6 +89,18 @@ header .spacer { flex: 1; }
   color: var(--text3); cursor: pointer; font-size: 11px; padding: 0;
 }
 #sidebar-hdr button:hover { color: var(--text2); }
+#sidebar-groups {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 0 12px 8px; flex-shrink: 0;
+}
+#sidebar-groups:empty { display: none; }
+.group-btn {
+  padding: 3px 8px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--bg3);
+  color: var(--text2); cursor: pointer; font-size: 11px;
+  white-space: nowrap; transition: border-color .15s, color .15s;
+}
+.group-btn:hover { border-color: var(--accent); color: var(--accent); }
 #sensor-list { flex: 1; overflow-y: auto; padding: 4px 6px 8px; }
 
 .sensor-row {
@@ -156,7 +168,9 @@ header .spacer { flex: 1; }
 /* ── Chart wrap ── */
 #chart-wrap { flex: 1; position: relative; min-height: 0; }
 #chart-svg-wrap { width: 100%; height: 100%; }
-#chart-svg-wrap svg { width: 100%; height: 100%; display: block; }
+/* pan-y reserves horizontal drags for the tooltip scrub (see touchmove in
+   renderChart) while leaving vertical page scrolling to the browser. */
+#chart-svg-wrap svg { width: 100%; height: 100%; display: block; touch-action: pan-y; }
 
 /* ── Tooltip ── */
 #tooltip {
@@ -943,12 +957,13 @@ header .spacer { flex: 1; }
   <div id="sidebar">
     <div id="sidebar-hdr">
       Sensors
-      <span>
+      <span id="sidebar-select-btns">
         <button onclick="selectAll()">All</button>
         &nbsp;
         <button onclick="selectNone()">None</button>
       </span>
     </div>
+    <div id="sidebar-groups"></div>
     <div id="sensor-list"></div>
   </div>
 
@@ -4305,7 +4320,18 @@ function renderSidebar() {
       </div>${serRows}`;
     }).join('');
   renderSensorChips();
+  renderSensorGroups();
   renderSeriesToggles();
+}
+
+// Desktop counterpart to the mobile chip-row group filter.
+function renderSensorGroups() {
+  const el = document.getElementById('sidebar-groups');
+  if (!el) return;
+  const groups = sensorGroupFilters(_sensors, classifySensor, RT_GROUPS);
+  el.innerHTML = groups
+    .map(g => `<button class="group-btn" onclick="selectGroup('${esc(g.key)}')">${esc(g.label)}</button>`)
+    .join('');
 }
 
 function renderSensorChips() {
@@ -4317,9 +4343,13 @@ function renderSensorChips() {
     const style  = active ? `border-color:${color};color:${color}` : '';
     return `<button class="sensor-chip${active ? ' active' : ''}" style="${style}" data-id="${esc(s.id)}" onclick="toggleSensor('${esc(s.id)}')">${esc(s.name)}</button>`;
   }).join('');
+  const groupBtns = sensorGroupFilters(_sensors, classifySensor, RT_GROUPS)
+    .map(g => `<button class="chip-ctrl" onclick="selectGroup('${esc(g.key)}')">${esc(g.label)}</button>`)
+    .join('');
   el.innerHTML =
     `<button class="chip-ctrl" onclick="selectAll()">All</button>` +
     `<button class="chip-ctrl" onclick="selectNone()">None</button>` +
+    (groupBtns ? `<div class="chip-divider"></div>` + groupBtns : '') +
     `<div class="chip-divider"></div>` +
     chips;
 }
@@ -4438,6 +4468,18 @@ function toggleThresholds(cb) {
 
 function selectAll()  { Object.keys(_sensors).forEach(id => { _selected.add(id); if(!_series[id]) _series[id]=new Set(['temp','humidity','pressure']); }); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
 function selectNone() { _selected.clear(); refreshChart(); if (_currentView === 'analytics') loadAnalytics(); }
+// Select exactly one RT_GROUPS bucket (House / Outside / Appliances / Other).
+// Replaces the selection rather than adding to it, matching how All/None read.
+function selectGroup(groupKey) {
+  _selected.clear();
+  Object.values(_sensors).forEach(s => {
+    if (classifySensor(s.name).group !== groupKey) return;
+    _selected.add(s.id);
+    if (!_series[s.id]) _series[s.id] = new Set(['temp','humidity','pressure']);
+  });
+  refreshChart();
+  if (_currentView === 'analytics') loadAnalytics();
+}
 
 // ── Range & zoom controls ──────────────────────────────────────────────────
 
@@ -5367,6 +5409,61 @@ function toggleEditMode() {
   renderChart();
 }
 
+// ── Chart layout / tooltip helpers (pure) ──────────────────────
+
+// Relative heights of the stacked chart panels. The literals are authored
+// against the common temp+humidity layout; normalizing at the end means any
+// other subset (humidity alone, humidity+VPD, …) still fills the whole
+// canvas instead of drawing at 42% height with dead space underneath.
+function panelFractions({ temp, hum, baro, vpd }) {
+  const extras = (baro ? 1 : 0) + (vpd ? 1 : 0);
+  const fracs = [];
+  if (temp) fracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : hum ? 0.58 : 1.0);
+  if (hum)  fracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
+  if (baro) fracs.push(vpd ? 0.15 : 0.18);
+  if (vpd)  fracs.push(baro ? 0.15 : 0.18);
+  const sum = fracs.reduce((a, b) => a + b, 0);
+  return sum > 0 ? fracs.map(f => f / sum) : fracs;
+}
+
+// Value a tooltip row is ranked by: the metric plotted on the topmost panel,
+// and only when that sensor actually draws it. A sensor that isn't showing
+// the ranking metric sorts last rather than borrowing an unplotted value.
+function tooltipSortValue(sample, panelType, series) {
+  if (!sample) return null;
+  const has = s => !series || series.has(s);
+  switch (panelType) {
+    case 'hum':  return has('humidity') ? (sample.humidity     ?? null) : null;
+    case 'baro': return has('pressure') ? (sample.baroPressure ?? null) : null;
+    case 'vpd':  return has('vpd')      ? (sample.vpd          ?? null) : null;
+    default:
+      if (has('temp')     && sample.temperature != null) return sample.temperature;
+      if (has('dewpoint') && sample.dewpoint    != null) return sample.dewpoint;
+      return null;
+  }
+}
+
+// Highest value first so the reading you're hunting for is at the top of the
+// tooltip. Rows with no comparable value sink to the bottom; ties keep their
+// original (sensor-list) order because Array#sort is stable.
+function sortTooltipRows(rows) {
+  return rows.slice().sort((a, b) => {
+    if (a.sortVal == null && b.sortVal == null) return 0;
+    if (a.sortVal == null) return 1;
+    if (b.sortVal == null) return -1;
+    return b.sortVal - a.sortVal;
+  });
+}
+
+// Which of RT_GROUPS actually have sensors, so the group filter only offers
+// buttons that would select something. Returns [] when every sensor lands in
+// one group — a lone "House" button next to All/None is pure noise.
+function sensorGroupFilters(sensors, classify, groups) {
+  const present = new Set(Object.values(sensors || {}).map(s => classify(s.name).group));
+  if (present.size < 2) return [];
+  return groups.filter(g => present.has(g.key)).map(g => ({ key: g.key, label: g.label }));
+}
+
 // ── Chart rendering ────────────────────────────────────────────────────────
 
 function renderChart() {
@@ -5400,14 +5497,11 @@ function renderChart() {
   // showTempPanel = anything that lives on the temp axis (including dewpoint/HI overlays)
   const showTempPanel = showTemp || showDew || showHI;
 
-  // Count active panels to divide height
-  const extras = (showBaro ? 1 : 0) + (showVPD ? 1 : 0);
-  const panels = [showTempPanel, showHum, showBaro, showVPD].filter(Boolean).length || 1;
-  const panelFracs = [];
-  if (showTempPanel) panelFracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : showHum ? 0.58 : 1.0);
-  if (showHum)       panelFracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
-  if (showBaro)      panelFracs.push(showVPD ? 0.15 : 0.18);
-  if (showVPD)       panelFracs.push(showBaro ? 0.15 : 0.18);
+  // Active panels and their (normalized) share of the canvas height
+  const panelFracs = panelFractions({
+    temp: showTempPanel, hum: showHum, baro: showBaro, vpd: showVPD,
+  });
+  const panels = panelFracs.length || 1;
 
   // X range — zoom overrides data range
   const dataMin = Math.min(...allSamples.map(s => s.ts)) * 1000;
@@ -5853,9 +5947,13 @@ function renderChart() {
     };
   }
 
+  // Rows are ranked by the metric on the topmost panel (see sortTooltipRows),
+  // so a humidity-only chart reads 88% → 56% top to bottom.
+  const sortPanel = panelTypes[0] || 'temp';
+
   function showTooltip(svgX, clientX, clientY) {
     const hoverMs = xMin + (svgX - PL) / cW * (xMax - xMin);
-    let html = `<div class="tt-time">${fmtTs(hoverMs)}</div>`;
+    const rows = [];
 
     for (const [id, { name, color, samples }] of entries) {
       const ser = _series[id] || new Set(['temp','humidity','pressure']);
@@ -5879,11 +5977,14 @@ function renderChart() {
         ser.has('heatindex') && hi,
         ser.has('vpd')       && vpd,
       ].filter(Boolean).join(' · ') || '—';
-      html += `<div class="tt-row">
+      rows.push({
+        sortVal: tooltipSortValue(near, sortPanel, ser),
+        html: `<div class="tt-row">
         <div class="tt-dot" style="background:${color}"></div>
         <span class="tt-name">${esc(name)}${exTag}</span>
         <span class="tt-vals">${vals}</span>
-      </div>`;
+      </div>`,
+      });
     }
 
     if (outdoorOn && outdoorInView.length) {
@@ -5893,14 +5994,20 @@ function renderChart() {
       const h  = near.humidity != null ? Math.round(near.humidity) + '%' : null;
       const d  = near.dewpoint != null ? 'dp ' + near.dewpoint.toFixed(1) + '°' : null;
       const vals = [t, h, d].filter(Boolean).join(' · ') || '—';
-      html += `<div class="tt-row">
+      // Outdoor's sample uses `temp`, not `temperature` — shim it so the
+      // outdoor row ranks alongside the sensors instead of sinking to the end.
+      rows.push({
+        sortVal: tooltipSortValue({ ...near, temperature: near.temp }, sortPanel, null),
+        html: `<div class="tt-row">
         <div class="tt-dot" style="background:${OUTDOOR_COLOR}"></div>
         <span class="tt-name">Outdoor</span>
         <span class="tt-vals">${vals}</span>
-      </div>`;
+      </div>`,
+      });
     }
 
-    tooltip.innerHTML = html;
+    tooltip.innerHTML = `<div class="tt-time">${fmtTs(hoverMs)}</div>` +
+      sortTooltipRows(rows).map(r => r.html).join('');
     tooltip.style.display = 'block';
     const wr = wrapEl.getBoundingClientRect();
     let left = clientX - wr.left + 14;
@@ -6025,29 +6132,72 @@ function renderChart() {
     if (e.target.closest('.ev-marker-hit')) tooltip.style.display = 'none';
   });
 
-  // Touch: tap to show tooltip, auto-hide after 3 s
-  let _touchAnchorX = null;
-  hitEl.addEventListener('touchstart', e => {
-    if (e.touches.length !== 1) return;
-    const t = e.touches[0];
-    _touchAnchorX = toSvg({ clientX: t.clientX, clientY: t.clientY }).svgX;
-  }, { passive: true });
+  // Touch: tap to show tooltip, or drag horizontally to scrub the crosshair
+  // across the chart. Both auto-hide 3 s after the finger lifts.
+  let _touchAnchorX  = null;   // svg-space x at touchstart (tap-vs-drag test)
+  let _touchStartCli = null;   // client-space start, for the axis-lock test
+  let _touchScrub    = false;  // gesture has committed to scrubbing
 
-  hitEl.addEventListener('touchend', e => {
-    if (_touchAnchorX === null) return;
-    const t = e.changedTouches[0];
-    const { svgX, clientX, clientY } = toSvg({ clientX: t.clientX, clientY: t.clientY });
-    const moved = Math.abs(svgX - _touchAnchorX);
-    _touchAnchorX = null;
-    if (moved > 15 || svgX < PL || svgX > PL + cW) return;
-    chLine.setAttribute('x1', svgX); chLine.setAttribute('x2', svgX);
+  function scrubTo(svgX, clientX, clientY) {
+    const cx = Math.min(Math.max(svgX, PL), PL + cW);
+    chLine.setAttribute('x1', cx); chLine.setAttribute('x2', cx);
     chLine.removeAttribute('display');
-    showTooltip(svgX, clientX, clientY);
+    showTooltip(cx, clientX, clientY);
+  }
+
+  function armTouchHide() {
     clearTimeout(_touchHideTimer);
     _touchHideTimer = setTimeout(() => {
       chLine.setAttribute('display', 'none');
       tooltip.style.display = 'none';
     }, 3000);
+  }
+
+  hitEl.addEventListener('touchstart', e => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    _touchAnchorX  = toSvg({ clientX: t.clientX, clientY: t.clientY }).svgX;
+    _touchStartCli = { x: t.clientX, y: t.clientY };
+    _touchScrub    = false;
+  }, { passive: true });
+
+  // Non-passive: once the gesture is horizontal we preventDefault so the page
+  // doesn't scroll out from under the finger mid-scrub. A vertical drag is
+  // never claimed, so the page still scrolls normally from on top of the chart.
+  hitEl.addEventListener('touchmove', e => {
+    if (_touchAnchorX === null || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    if (!_touchScrub) {
+      const dx = Math.abs(t.clientX - _touchStartCli.x);
+      const dy = Math.abs(t.clientY - _touchStartCli.y);
+      if (dx < 8 || dx <= dy) return;
+      _touchScrub = true;
+    }
+    e.preventDefault();
+    clearTimeout(_touchHideTimer);
+    const { svgX, clientX, clientY } = toSvg({ clientX: t.clientX, clientY: t.clientY });
+    scrubTo(svgX, clientX, clientY);
+  }, { passive: false });
+
+  hitEl.addEventListener('touchend', e => {
+    if (_touchAnchorX === null) return;
+    const t = e.changedTouches[0];
+    const { svgX, clientX, clientY } = toSvg({ clientX: t.clientX, clientY: t.clientY });
+    const moved   = Math.abs(svgX - _touchAnchorX);
+    const scrubbed = _touchScrub;
+    _touchAnchorX = null;
+    _touchScrub   = false;
+    if (!scrubbed) {
+      if (moved > 15 || svgX < PL || svgX > PL + cW) return;
+      scrubTo(svgX, clientX, clientY);
+    }
+    armTouchHide();
+  }, { passive: true });
+
+  hitEl.addEventListener('touchcancel', () => {
+    _touchAnchorX = null;
+    _touchScrub   = false;
+    armTouchHide();
   }, { passive: true });
 }
 
