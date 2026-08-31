@@ -110,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v21';
+const CACHE='sensorpush-v22';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
