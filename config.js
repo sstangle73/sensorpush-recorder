@@ -59,9 +59,18 @@ export function loadConfig() {
   const fromEnv = envCredentials();
   let cfg = fromEnv;
   if (!cfg) {
+    // Read failures used to be swallowed into an empty config, which is a
+    // silent kill switch: with no sensorpush.email the poll loop returns
+    // immediately every 5 minutes, forever, logging nothing — the recorder
+    // looks alive and healthy while collecting no data. Config is read once at
+    // boot, so this is unrecoverable until a restart. Say so loudly.
     try {
       cfg = parseConfig(readFileSync('/config/config.local.js', 'utf8'));
-    } catch (_) {
+      if (!cfg.sensorpush?.email) {
+        console.error('[config] /config/config.local.js parsed but has no sensorpush.email — the poller will not collect anything');
+      }
+    } catch (err) {
+      console.error(`[config] cannot read /config/config.local.js (${err.code || err.message}) and no SENSORPUSH_EMAIL/SENSORPUSH_PASSWORD in env — the poller will not collect anything`);
       cfg = {};
     }
   }

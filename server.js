@@ -141,6 +141,27 @@ self.addEventListener('fetch',e=>{
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
+// How long /health tolerates a silent poll loop before reporting unhealthy.
+// Default 1800s — six missed 5-minute polls. Set 0 to disable the check
+// entirely (pure liveness, the pre-2026-09 behaviour). Only applies once a
+// first poll has succeeded — see the /health route for why. Read per request
+// rather than captured at import so it can be tuned without a rebuild.
+const DEFAULT_HEALTH_MAX_POLL_AGE_SECS = 1800;
+function healthMaxPollAgeSecs() {
+  const raw = Number(process.env.HEALTH_MAX_POLL_AGE_SECS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_HEALTH_MAX_POLL_AGE_SECS;
+}
+
+// Max age of the cached /metrics body before the next scrape triggers a
+// re-render. Default 15s — comfortably under a 30s scrape interval, so a
+// scraper normally sees data at most one interval old. Read per request so it
+// can be tuned without a rebuild.
+const DEFAULT_METRICS_MAX_AGE_MS = 15000;
+function metricsMaxAgeMs() {
+  const raw = Number(process.env.METRICS_MAX_AGE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_METRICS_MAX_AGE_MS;
+}
+
 // Bearer token resolution: env (RECORDER_TOKEN) > /data/recorder-token file
 // (managed via Settings → Security in the UI) > null (no auth). See auth.js.
 //
@@ -310,7 +331,7 @@ export function _renderMetrics(db) {
   const lines = [];
   const sensors  = getSensors(db);
   const gateways = getGateways(db);
-  const { lastPollTime, lastPollError } = getPollStatus();
+  const { lastPollTime, lastPollError, pollSkipped } = getPollStatus();
 
   // Per-sensor gauges. Skip inactive sensors and per-metric nulls so the
   // scraper doesn't see NaN. Labels carry enough context (id+name+type) for
@@ -362,6 +383,21 @@ export function _renderMetrics(db) {
   lines.push(`# HELP sensorpush_sensors_active Number of sensors marked active.`);
   lines.push(`# TYPE sensorpush_sensors_active gauge`);
   lines.push(`sensorpush_sensors_active ${activeSensors.length}`);
+
+  // Poll ticks dropped because the previous poll was still running. Non-zero
+  // means polls are outrunning their 5-minute interval — the early warning of
+  // a slow-disk window, well before the poller actually stops producing data.
+  lines.push(`# HELP sensorpush_poll_skipped_ticks Poll ticks skipped because the previous poll was still in flight.`);
+  lines.push(`# TYPE sensorpush_poll_skipped_ticks gauge`);
+  lines.push(`sensorpush_poll_skipped_ticks ${pollSkipped ?? 0}`);
+
+  // When this body was actually rendered. /metrics serves from a cache (see
+  // the route), so a scraper that wants to know the underlying data is fresh
+  // should check `time() - sensorpush_metrics_rendered_timestamp_seconds`
+  // rather than trusting the scrape timestamp.
+  lines.push(`# HELP sensorpush_metrics_rendered_timestamp_seconds Unix epoch (seconds) when this metrics body was rendered.`);
+  lines.push(`# TYPE sensorpush_metrics_rendered_timestamp_seconds gauge`);
+  lines.push(`sensorpush_metrics_rendered_timestamp_seconds ${Math.floor(Date.now() / 1000)}`);
 
   return lines.join('\n') + '\n';
 }
@@ -421,18 +457,39 @@ export function createApp(db, config = null, onSwap = null) {
   });
 
   app.get('/health', (_req, res) => {
-    // Liveness only — deliberately does NO database work. This is the Docker
-    // healthcheck target; it once ran `SELECT COUNT(*) FROM sensors`, which
-    // coupled liveness to DB responsiveness, so any heavy fsync-bound sqlite
-    // op that froze the event loop ALSO failed the healthcheck and escalated a
-    // transient stall into an autoheal restart loop. sensorCount now comes
-    // from the last poll's in-memory value (null until the first poll runs).
-    const { lastPollTime, lastPollError, lastSensorCount } = getPollStatus();
-    res.json({
-      ok:          true,
+    // Still deliberately does NO database work. This is the Docker healthcheck
+    // target; it once ran `SELECT COUNT(*) FROM sensors`, which coupled liveness
+    // to DB responsiveness, so any heavy fsync-bound sqlite op that froze the
+    // event loop ALSO failed the healthcheck and escalated a transient stall
+    // into an autoheal restart loop.
+    //
+    // But pure liveness was too blind in the other direction: it answered
+    // `ok: true` for 20 hours while the poller was doing nothing at all. So we
+    // now also assert, from in-memory state only, that the poll loop is still
+    // producing. Two deliberate constraints keep this from reintroducing the
+    // false positives the DB query caused:
+    //
+    //   1. It engages only AFTER the first successful poll. A recorder that has
+    //      never polled (fresh deploy, bad credentials) reports healthy — a
+    //      restart cannot fix either, and restart-looping a new container is
+    //      exactly the old failure. That case is caught by the poll-health
+    //      gauges on /metrics instead (last_poll_success -1), where the remedy
+    //      is an alert rather than a container kill.
+    //   2. The window is generous — 30 minutes, i.e. six consecutive missed
+    //      5-minute polls — so a single slow window never trips it.
+    const { lastPollTime, lastPollError, lastSensorCount, pollSkipped } = getPollStatus();
+    const limitSecs   = healthMaxPollAgeSecs();
+    const pollAgeMs   = lastPollTime == null ? null : Date.now() - lastPollTime;
+    const pollAgeSecs = pollAgeMs == null ? null : Math.floor(pollAgeMs / 1000);
+    const stale = limitSecs > 0 && pollAgeMs != null && pollAgeMs > limitSecs * 1000;
+    res.status(stale ? 503 : 200).json({
+      ok:          !stale,
       lastPoll:    lastPollTime ? new Date(lastPollTime).toISOString() : null,
+      pollAgeSecs,
       pollError:   lastPollError,
+      pollSkipped: pollSkipped ?? 0,
       sensorCount: lastSensorCount ?? null,
+      ...(stale ? { error: `no successful poll in ${pollAgeSecs}s (limit ${limitSecs}s)` } : {}),
     });
   });
 
@@ -442,9 +499,44 @@ export function createApp(db, config = null, onSwap = null) {
   // per the exposition spec (backslash, double-quote, newline).
   // Bypasses the bearer middleware via PUBLIC_PATHS — LAN scrape pattern
   // matches the rest of the home-lab stack (node_exporter, dhcp_reservations_exporter).
+  //
+  // Served from a cache, refreshed AFTER the response is flushed. _renderMetrics
+  // runs two node:sqlite queries, and node:sqlite is fully synchronous — so
+  // rendering on the request path put a DB read in front of every scrape. When
+  // the nightly hypervisor backup fsync-freezes this guest and disk await goes
+  // from ~2ms to ~1200ms, those reads blew straight through the 10s scrape
+  // timeout: during the 2026-09-02 incident scrape_duration_seconds pinned at
+  // exactly 10.002s, interleaved with 0.003s successes, while /health (no DB)
+  // stayed instant. Serving the last rendered body means a scrape is a string
+  // write no matter what the disk is doing; the body carries its own render
+  // timestamp so a stale one is visible rather than silently believed.
+  const metricsCache = { text: null, renderedAt: 0, refreshing: false };
+  const refreshMetrics = () => {
+    metricsCache.refreshing = true;
+    setImmediate(() => {
+      try {
+        metricsCache.text       = _renderMetrics(db);
+        metricsCache.renderedAt = Date.now();
+      } catch (err) {
+        console.error('[metrics] refresh failed:', err.message);
+      } finally {
+        metricsCache.refreshing = false;
+      }
+    });
+  };
+
   app.get('/metrics', (_req, res) => {
     res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-    res.send(_renderMetrics(db));
+    // Cold start only: nothing cached yet, so render inline.
+    if (metricsCache.text == null) {
+      metricsCache.text       = _renderMetrics(db);
+      metricsCache.renderedAt = Date.now();
+      return res.send(metricsCache.text);
+    }
+    res.send(metricsCache.text);
+    if (!metricsCache.refreshing && Date.now() - metricsCache.renderedAt >= metricsMaxAgeMs()) {
+      refreshMetrics();
+    }
   });
 
   // GET / → ui.html by default; JSON sensors list only when the caller
