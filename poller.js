@@ -1,12 +1,23 @@
 import { backup } from 'node:sqlite';
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from './weather.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs, pruneReadingsOlderThan } from './db.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs, pruneReadingsOlderThan } from './db.js';
 import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
 import { runNotifications } from './notifications.js';
 
 let _lastPollError     = null;
+// The last successful poll *since this process started*. Per-process on
+// purpose: /health reports it as lastPoll, and lastPoll and pollError both
+// start empty on every start, so the first poll (made at once) fills exactly
+// one of them. External checks read that as "did the restarted recorder sign
+// in?"; a value carried over from before the restart would answer yes.
 let _lastPollTime      = null;
+// The last successful poll as stored in meta.last_poll, read once at start,
+// so /metrics reports the true last success across a restart. Without it,
+// sensorpush_last_poll_timestamp_seconds vanished until the next good poll,
+// and a restart while every poll still failed (a changed password) read as
+// "no data" instead of as a poll that was hours old.
+let _storedLastPollTime = null;
 let _lastSensorCount   = null;
 let _backfillState     = { status: 'idle', progress: null, error: null };
 let _lastDiscoveryAt   = 0;
@@ -36,6 +47,7 @@ const READINGS_RETENTION_DAYS = Number(process.env.READINGS_RETENTION_DAYS ?? 36
 // next tick picks up the new handle automatically.
 export function startPoller(db, config, registerSwap = null) {
   if (registerSwap) registerSwap((newDb) => { db = newDb; });
+  loadStoredPollTime(db);
 
   // Bring up the optional MQTT publisher. No-op when MQTT_URL is unset.
   // Failures here must not block sample polling — wrap in try/catch.
@@ -273,9 +285,24 @@ async function _runNotifications(db) {
   });
 }
 
+// Read the stored last-success time (meta.last_poll) into memory. startPoller
+// calls it once, before the first poll; exported for tests. A failed read only
+// loses the carried-over value, so it must not stop the poller from starting.
+export function loadStoredPollTime(db) {
+  try {
+    const stored = getLastPollTime(db);
+    _storedLastPollTime = Number.isFinite(stored) ? stored : null;
+  } catch (err) {
+    console.error('[poller] reading the stored last poll time:', err.message);
+  }
+}
+
 export function getPollStatus() {
   return {
     lastPollTime:        _lastPollTime,
+    // The last successful poll ever: this process's, else the stored one from
+    // before it started. /metrics uses it; /health keeps lastPollTime.
+    lastGoodPollTime:    _lastPollTime ?? _storedLastPollTime,
     lastPollError:       _lastPollError,
     lastSensorCount:     _lastSensorCount,
     lastWeatherPollTime: _lastWeatherPollTime,
@@ -286,6 +313,7 @@ export function getPollStatus() {
 export function _resetPollerState() {
   _lastPollError       = null;
   _lastPollTime        = null;
+  _storedLastPollTime  = null;
   _lastSensorCount     = null;
   _lastDiscoveryAt     = 0;
   _lastWeatherPollTime = null;
