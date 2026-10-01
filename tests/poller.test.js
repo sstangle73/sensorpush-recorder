@@ -12,10 +12,12 @@ vi.mock('../weather.js', () => ({
   fetchHourlyWeather:  vi.fn(),
 }));
 
+import http from 'node:http';
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from '../weather.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs } from '../db.js';
-import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, _pruneReadings, triggerWeatherPoll } from '../poller.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs, setLastPollTime } from '../db.js';
+import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, _pruneReadings, triggerWeatherPoll, startPoller, loadStoredPollTime } from '../poller.js';
+import { createApp, _renderMetrics } from '../server.js';
 
 function makeDb() { return openDb(':memory:'); }
 
@@ -627,5 +629,108 @@ describe('triggerWeatherPoll', () => {
     await triggerWeatherPoll(db, WEATHER_CFG);
     expect(db.prepare('SELECT COUNT(*) AS n FROM outdoor_readings').get().n).toBe(0);
     expect(getPollStatus().lastWeatherError).toBeNull();
+  });
+});
+
+// A restart must not erase the last good poll from /metrics: the timestamp
+// used to vanish until the next good poll, so a restart while the polls still
+// failed read as "no data", not as "hours old". And it must not reach /health:
+// lastPoll and pollError start empty on every start, and the first poll fills
+// exactly one, which is how a caller proves a restarted recorder signs in.
+describe('poll status across a restart', () => {
+  const HOURS_26 = 26 * 3600 * 1000;
+
+  // A fresh process over a DB that may hold meta.last_poll, set up the way
+  // startPoller does it.
+  function restartedWith(storedMs) {
+    const db = makeDb();
+    if (storedMs != null) setLastPollTime(db, storedMs);
+    _resetPollerState();
+    loadStoredPollTime(db);
+    return db;
+  }
+
+  async function health(db) {
+    const server = http.createServer(createApp(db));
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/health`);
+      return await res.json();
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+
+  function timestampLine(ms) {
+    return new RegExp(`^sensorpush_last_poll_timestamp_seconds ${Math.floor(ms / 1000)}$`, 'm');
+  }
+
+  it('reports the stored last good poll in /metrics, not in /health', async () => {
+    const stored = Date.now() - HOURS_26;
+    const db = restartedWith(stored);
+
+    const body = _renderMetrics(db);
+    expect(body).toMatch(timestampLine(stored));
+    expect(body).toMatch(/^sensorpush_last_poll_success -1$/m);
+    expect(getPollStatus().lastGoodPollTime).toBe(stored);
+    expect(await health(db)).toMatchObject({ lastPoll: null, pollError: null });
+  });
+
+  it('reports a failed poll after a restart as 0, not -1, and keeps the stored time', async () => {
+    const stored = Date.now() - HOURS_26;
+    const db = restartedWith(stored);
+    getToken.mockResolvedValue(null);
+
+    await expect(triggerPoll(db, CREDS)).rejects.toThrow('SensorPush auth failed');
+
+    const body = _renderMetrics(db);
+    expect(body).toMatch(/^sensorpush_last_poll_success 0$/m);
+    expect(body).toMatch(timestampLine(stored));
+    const h = await health(db);
+    expect(h.lastPoll).toBeNull();
+    expect(h.pollError).toMatch('SensorPush auth failed');
+  });
+
+  it('replaces the stored time with the first good poll after a restart', async () => {
+    const stored = Date.now() - HOURS_26;
+    const db = restartedWith(stored);
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([sensor()]);
+    fetchSamples.mockResolvedValue([]);
+
+    const before = Date.now();
+    await triggerPoll(db, CREDS);
+
+    const { lastPollTime, lastGoodPollTime } = getPollStatus();
+    expect(lastPollTime).toBeGreaterThanOrEqual(before);
+    expect(lastGoodPollTime).toBe(lastPollTime);
+    const body = _renderMetrics(db);
+    expect(body).toMatch(/^sensorpush_last_poll_success 1$/m);
+    expect(body).toMatch(timestampLine(lastPollTime));
+    expect((await health(db)).lastPoll).toBe(new Date(lastPollTime).toISOString());
+  });
+
+  it('has no timestamp before the first good poll ever', () => {
+    const db = restartedWith(null);
+    expect(getPollStatus().lastGoodPollTime).toBeNull();
+    expect(_renderMetrics(db)).not.toMatch(/^sensorpush_last_poll_timestamp_seconds /m);
+  });
+
+  it('startPoller loads the stored time before its first poll', () => {
+    vi.useFakeTimers();
+    try {
+      const stored = Date.now() - HOURS_26;
+      const db = makeDb();
+      setLastPollTime(db, stored);
+      _resetPollerState();
+      // No credentials, so its immediate poll returns at once; the interval
+      // and the daily jobs are fake timers, cleared below.
+      startPoller(db, {});
+      expect(getPollStatus().lastGoodPollTime).toBe(stored);
+      expect(getPollStatus().lastPollTime).toBeNull();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });

@@ -310,7 +310,7 @@ export function _renderMetrics(db) {
   const lines = [];
   const sensors  = getSensors(db);
   const gateways = getGateways(db);
-  const { lastPollTime, lastPollError } = getPollStatus();
+  const { lastPollTime, lastGoodPollTime, lastPollError } = getPollStatus();
 
   // Per-sensor gauges. Skip inactive sensors and per-metric nulls so the
   // scraper doesn't see NaN. Labels carry enough context (id+name+type) for
@@ -344,14 +344,21 @@ export function _renderMetrics(db) {
     lines.push(`sensorpush_gateway_last_seen_timestamp_seconds{gateway_id="${_escapeLabel(g.id)}",gateway_name="${_escapeLabel(g.name)}"} ${g.last_seen}`);
   }
 
-  // Poll-health gauges. _success is -1 when no poll has run yet, 0 on error,
-  // 1 on success — VM/alerts can `== 0` or `< 0` distinctly.
-  const successVal = lastPollTime == null ? -1 : (lastPollError ? 0 : 1);
-  lines.push(`# HELP sensorpush_last_poll_timestamp_seconds Unix epoch (seconds) of the last poll attempt.`);
+  // Poll-health gauges.
+  // _timestamp_seconds is the last SUCCESSFUL poll, carried across restarts
+  // (meta.last_poll, read at start), so its age keeps growing through a
+  // restart while the polls still fail. It is absent only before the first
+  // good poll ever.
+  // _success is about the latest poll since this start: 1 it succeeded, 0 it
+  // failed, -1 none has finished yet — VM/alerts can `== 0` or `< 0`
+  // distinctly. The error is checked first: when it was checked second, a
+  // restart whose polls all failed reported -1 for as long as they failed.
+  const successVal = lastPollError ? 0 : (lastPollTime == null ? -1 : 1);
+  lines.push(`# HELP sensorpush_last_poll_timestamp_seconds Unix epoch (seconds) of the last successful poll, kept across restarts.`);
   lines.push(`# TYPE sensorpush_last_poll_timestamp_seconds gauge`);
-  if (lastPollTime != null) lines.push(`sensorpush_last_poll_timestamp_seconds ${Math.floor(lastPollTime / 1000)}`);
+  if (lastGoodPollTime != null) lines.push(`sensorpush_last_poll_timestamp_seconds ${Math.floor(lastGoodPollTime / 1000)}`);
 
-  lines.push(`# HELP sensorpush_last_poll_success 1 if the last poll succeeded, 0 if it errored, -1 if no poll has run yet.`);
+  lines.push(`# HELP sensorpush_last_poll_success 1 if the latest poll since the recorder started succeeded, 0 if it failed, -1 if none has finished yet.`);
   lines.push(`# TYPE sensorpush_last_poll_success gauge`);
   lines.push(`sensorpush_last_poll_success ${successVal}`);
 
@@ -427,6 +434,10 @@ export function createApp(db, config = null, onSwap = null) {
     // op that froze the event loop ALSO failed the healthcheck and escalated a
     // transient stall into an autoheal restart loop. sensorCount now comes
     // from the last poll's in-memory value (null until the first poll runs).
+    // lastPoll is this process's last good poll, never the stored one /metrics
+    // reports: lastPoll and pollError both start empty, and the first poll
+    // fills exactly one, which is how a caller tells whether a restarted
+    // recorder can sign in.
     const { lastPollTime, lastPollError, lastSensorCount } = getPollStatus();
     res.json({
       ok:          true,
