@@ -331,7 +331,7 @@ export function _renderMetrics(db) {
   const lines = [];
   const sensors  = getSensors(db);
   const gateways = getGateways(db);
-  const { lastPollTime, lastPollError, pollSkipped } = getPollStatus();
+  const { lastPollTime, lastGoodPollTime, lastPollError, pollSkipped } = getPollStatus();
 
   // Per-sensor gauges. Skip inactive sensors and per-metric nulls so the
   // scraper doesn't see NaN. Labels carry enough context (id+name+type) for
@@ -365,14 +365,21 @@ export function _renderMetrics(db) {
     lines.push(`sensorpush_gateway_last_seen_timestamp_seconds{gateway_id="${_escapeLabel(g.id)}",gateway_name="${_escapeLabel(g.name)}"} ${g.last_seen}`);
   }
 
-  // Poll-health gauges. _success is -1 when no poll has run yet, 0 on error,
-  // 1 on success — VM/alerts can `== 0` or `< 0` distinctly.
-  const successVal = lastPollTime == null ? -1 : (lastPollError ? 0 : 1);
-  lines.push(`# HELP sensorpush_last_poll_timestamp_seconds Unix epoch (seconds) of the last poll attempt.`);
+  // Poll-health gauges.
+  // _timestamp_seconds is the last SUCCESSFUL poll, carried across restarts
+  // (meta.last_poll, read at start), so its age keeps growing through a
+  // restart while the polls still fail. It is absent only before the first
+  // good poll ever.
+  // _success is about the latest poll since this start: 1 it succeeded, 0 it
+  // failed, -1 none has finished yet — VM/alerts can `== 0` or `< 0`
+  // distinctly. The error is checked first: when it was checked second, a
+  // restart whose polls all failed reported -1 for as long as they failed.
+  const successVal = lastPollError ? 0 : (lastPollTime == null ? -1 : 1);
+  lines.push(`# HELP sensorpush_last_poll_timestamp_seconds Unix epoch (seconds) of the last successful poll, kept across restarts.`);
   lines.push(`# TYPE sensorpush_last_poll_timestamp_seconds gauge`);
-  if (lastPollTime != null) lines.push(`sensorpush_last_poll_timestamp_seconds ${Math.floor(lastPollTime / 1000)}`);
+  if (lastGoodPollTime != null) lines.push(`sensorpush_last_poll_timestamp_seconds ${Math.floor(lastGoodPollTime / 1000)}`);
 
-  lines.push(`# HELP sensorpush_last_poll_success 1 if the last poll succeeded, 0 if it errored, -1 if no poll has run yet.`);
+  lines.push(`# HELP sensorpush_last_poll_success 1 if the latest poll since the recorder started succeeded, 0 if it failed, -1 if none has finished yet.`);
   lines.push(`# TYPE sensorpush_last_poll_success gauge`);
   lines.push(`sensorpush_last_poll_success ${successVal}`);
 
@@ -473,10 +480,16 @@ export function createApp(db, config = null, onSwap = null) {
     //      never polled (fresh deploy, bad credentials) reports healthy — a
     //      restart cannot fix either, and restart-looping a new container is
     //      exactly the old failure. That case is caught by the poll-health
-    //      gauges on /metrics instead (last_poll_success -1), where the remedy
+    //      gauges on /metrics instead (last_poll_success 0), where the remedy
     //      is an alert rather than a container kill.
     //   2. The window is generous — 30 minutes, i.e. six consecutive missed
     //      5-minute polls — so a single slow window never trips it.
+    //
+    // lastPoll is this process's last good poll, never the stored one /metrics
+    // reports: lastPoll and pollError both start empty, and the first poll
+    // fills exactly one, which is how a caller tells whether a restarted
+    // recorder can sign in. Being per-process is also what keeps constraint 1
+    // true after a restart.
     const { lastPollTime, lastPollError, lastSensorCount, pollSkipped } = getPollStatus();
     const limitSecs   = healthMaxPollAgeSecs();
     const pollAgeMs   = lastPollTime == null ? null : Date.now() - lastPollTime;
