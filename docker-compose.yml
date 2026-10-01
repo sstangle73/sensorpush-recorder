@@ -50,9 +50,15 @@ services:
       # misconfigured recorder still reports healthy rather than restart-
       # looping — the false-positive class this healthcheck has to avoid.
       #
-      # Why the poll assertion exists: on 2026-09-02 the poller did nothing for
-      # 20 hours while pure-liveness /health answered ok:true the whole time,
-      # so nothing here could see the outage.
+      # Why the poll assertion exists: pure liveness answers ok:true however
+      # long the poll loop has produced nothing. A recorder that was polling
+      # and then stops succeeding (its password changed, the SensorPush cloud
+      # is down, polls overrunning their interval) gets one restart this way;
+      # the restarted process has not succeeded yet, so it reports healthy
+      # from then on and the poll-age alert carries the outage. (2026-09-02
+      # was a different failure: every scrape failed within 2 ms with no
+      # samples for the whole 20 h, because the container was down after the
+      # failed restart described below.)
       #
       # Caveat worth knowing before tightening any of this: an unhealthy verdict
       # makes autoheal issue `docker restart`, and during the nightly slow-disk

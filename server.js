@@ -470,18 +470,20 @@ export function createApp(db, config = null, onSwap = null) {
     // event loop ALSO failed the healthcheck and escalated a transient stall
     // into an autoheal restart loop.
     //
-    // But pure liveness was too blind in the other direction: it answered
-    // `ok: true` for 20 hours while the poller was doing nothing at all. So we
-    // now also assert, from in-memory state only, that the poll loop is still
-    // producing. Two deliberate constraints keep this from reintroducing the
-    // false positives the DB query caused:
+    // But pure liveness is blind in the other direction: it answers `ok: true`
+    // however long the poll loop has produced nothing. So we now also assert,
+    // from in-memory state only, that the poll loop is still producing. Two
+    // deliberate constraints keep this from reintroducing the false positives
+    // the DB query caused:
     //
     //   1. It engages only AFTER the first successful poll. A recorder that has
     //      never polled (fresh deploy, bad credentials) reports healthy — a
     //      restart cannot fix either, and restart-looping a new container is
     //      exactly the old failure. That case is caught by the poll-health
     //      gauges on /metrics instead (last_poll_success 0), where the remedy
-    //      is an alert rather than a container kill.
+    //      is an alert rather than a container kill. A recorder whose polls
+    //      start failing while it runs (a changed password) therefore gets one
+    //      autoheal restart, then reports healthy.
     //   2. The window is generous — 30 minutes, i.e. six consecutive missed
     //      5-minute polls — so a single slow window never trips it.
     //

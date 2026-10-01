@@ -10,7 +10,9 @@
 //      stayed instant — so the scraper saw the service as down and the
 //      container healthcheck saw it as fine.
 //   2. The poll loop could stop producing forever while /health kept
-//      answering ok:true — 20 hours of it, in the incident.
+//      answering ok:true. (The 20-hour hole of 2026-09-02 itself was the
+//      container down after a failed autoheal restart: every scrape failed
+//      within 2 ms with no samples.)
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'node:http';
 
@@ -198,6 +200,24 @@ describe('poll loop cannot pile up or fail silently', () => {
 
     release();
     await inFlight;
+    expect(getPollStatus().pollSkipped).toBe(0);
+    expect(getPollStatus().pollInFlight).toBe(false);
+  });
+
+  it('ends the skip streak when the in-flight poll fails, too', async () => {
+    const db = openDb(':memory:');
+    let release;
+    const gate = new Promise(r => { release = r; });
+    // Hold the first poll open in sign-in, then fail it.
+    getToken.mockImplementation(async () => { await gate; return null; });
+
+    const inFlight = triggerPoll(db, CREDS);
+    await Promise.resolve();
+    await triggerPoll(db, CREDS);
+    expect(getPollStatus().pollSkipped).toBe(1);
+
+    release();
+    await expect(inFlight).rejects.toThrow('SensorPush auth failed');
     expect(getPollStatus().pollSkipped).toBe(0);
     expect(getPollStatus().pollInFlight).toBe(false);
   });

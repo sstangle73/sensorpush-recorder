@@ -190,9 +190,11 @@ async function _guardedPoll(db, config) {
   _pollInFlight = true;
   try {
     await _poll(db, config);
-    _pollSkipped = 0;
   } finally {
+    // Any finished poll ends the streak, a failed one too: the count is about
+    // polls outrunning their interval, not about whether they succeed.
     _pollInFlight = false;
+    _pollSkipped  = 0;
   }
 }
 
