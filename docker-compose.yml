@@ -42,14 +42,32 @@ services:
       - ./data:/data
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://127.0.0.1:3003/health || exit 1
-      # /health is now a pure in-memory liveness check (no DB query), and the
-      # heavy fsync-bound sqlite work that used to freeze the event loop —
-      # the daily snapshot (now the async online-backup API), the catch-up
-      # poll (now chunked with yields), and unbounded readings growth (now
-      # pruned to a retention window) — no longer blocks it. So a failing
-      # healthcheck should mean the process is genuinely dead, not just busy.
-      # These tolerant values (≈5 min continuously unhealthy before autoheal
-      # acts, plus a long startup grace) remain as defence in depth.
+      # /health does no DB work (no query, no fsync), so a slow disk cannot
+      # fail it on its own. On top of that liveness check it now also asserts
+      # that the poll loop is still producing: unhealthy after 30 min with no
+      # successful poll (HEALTH_MAX_POLL_AGE_SECS, 0 disables). That check
+      # engages only after a first poll has succeeded, so a fresh or
+      # misconfigured recorder still reports healthy rather than restart-
+      # looping — the false-positive class this healthcheck has to avoid.
+      #
+      # Why the poll assertion exists: pure liveness answers ok:true however
+      # long the poll loop has produced nothing. A recorder that was polling
+      # and then stops succeeding (its password changed, the SensorPush cloud
+      # is down, polls overrunning their interval) gets one restart this way;
+      # the restarted process has not succeeded yet, so it reports healthy
+      # from then on and the poll-age alert carries the outage. (2026-09-02
+      # was a different failure: every scrape failed within 2 ms with no
+      # samples for the whole 20 h, because the container was down after the
+      # failed restart described below.)
+      #
+      # Caveat worth knowing before tightening any of this: an unhealthy verdict
+      # makes autoheal issue `docker restart`, and during the nightly slow-disk
+      # window that restart is itself dangerous — on 2026-09-02 the kill got no
+      # exit event ("tried to kill container, but did not receive an exit
+      # event"), the restart request failed, and the container was left dead for
+      # 20 h because `restart: always` does not cover an API restart that
+      # aborted. Keep these values tolerant: ≈5 min continuously unhealthy
+      # before autoheal acts, plus a long startup grace.
       start_period: 180s
       interval: 1m
       timeout: 10s

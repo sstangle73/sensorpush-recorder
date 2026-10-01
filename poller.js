@@ -25,6 +25,21 @@ const DISCOVERY_INTERVAL_MS = 3600 * 1000;
 let _lastWeatherPollTime = null;
 let _lastWeatherError    = null;
 
+// Re-entrancy guard for the 5-minute poll loop. node:sqlite is fully
+// synchronous, so a poll's insert+recompute bursts occupy the single event
+// loop. When the underlying disk goes slow (the nightly hypervisor backup
+// fsync-freezes this guest and drives await from ~2ms to ~1200ms), a poll can
+// easily outlast its 5-minute interval. Without a guard, setInterval keeps
+// launching more, and the overlapping polls multiply exactly the synchronous
+// DB work that is already the bottleneck. Skipping a tick is always correct:
+// the poll window is anchored on getLatestTs, so the next successful poll
+// picks up whatever the skipped one would have fetched.
+let _pollInFlight  = false;
+let _pollSkipped   = 0;
+// Last "nothing to do" reason we logged, so a persistent misconfiguration
+// reports once instead of every 5 minutes forever.
+let _lastIssueLogged = null;
+
 // Raw-readings retention. Older rows are pruned daily (in yielding batches);
 // hourly aggregates survive forever, so long-term history is preserved. Bounds
 // DB growth so fsync-heavy ops (snapshot, catch-up insert, WAL recovery) stay
@@ -53,12 +68,12 @@ export function startPoller(db, config, registerSwap = null) {
   // Failures here must not block sample polling — wrap in try/catch.
   try { mqttConnect(config?.mqtt || {}); } catch (err) { console.error('[poller] mqtt connect:', err.message); }
 
-  _poll(db, config).catch(err => {
+  _guardedPoll(db, config).catch(err => {
     _lastPollError = err.message;
     console.error('[poller] error:', err.message);
   });
   setInterval(() => {
-    _poll(db, config).catch(err => {
+    _guardedPoll(db, config).catch(err => {
       _lastPollError = err.message;
       console.error('[poller] error:', err.message);
     });
@@ -161,15 +176,57 @@ export async function _pruneReadings(db) {
   if (deleted) console.log(`[poller] retention: pruned ${deleted} raw readings older than ${READINGS_RETENTION_DAYS}d`);
 }
 
+// Serialises poll attempts (scheduled, manual, and startup alike). A tick that
+// arrives while one is still running is dropped rather than queued — see the
+// _pollInFlight comment above. Exported state lets /health and /metrics show
+// how many ticks we've had to skip, which is the early warning that polls have
+// started outrunning their interval.
+async function _guardedPoll(db, config) {
+  if (_pollInFlight) {
+    _pollSkipped++;
+    console.warn(`[poller] previous poll still in flight — skipping this tick (${_pollSkipped} skipped in a row)`);
+    return;
+  }
+  _pollInFlight = true;
+  try {
+    await _poll(db, config);
+  } finally {
+    // Any finished poll ends the streak, a failed one too: the count is about
+    // polls outrunning their interval, not about whether they succeed.
+    _pollInFlight = false;
+    _pollSkipped  = 0;
+  }
+}
+
+// Record a "the poll did nothing" condition. These used to be bare `return`s,
+// which meant a recorder that was misconfigured (or getting an empty sensor
+// list from the cloud) polled silently forever: no log line, no error state,
+// no data — and /health still answered `ok: true`. Now the reason lands in
+// lastPollError so /health, /metrics, and the UI all surface it, and it logs
+// once per distinct reason instead of every 5 minutes.
+function _recordPollIssue(reason) {
+  _lastPollError = reason;
+  if (_lastIssueLogged !== reason) {
+    console.error('[poller] poll did nothing:', reason);
+    _lastIssueLogged = reason;
+  }
+}
+
 async function _poll(db, config) {
   const sp = config?.sensorpush;
-  if (!sp?.email || sp.email.includes('YOUR_')) return;
+  if (!sp?.email || sp.email.includes('YOUR_')) {
+    _recordPollIssue('no SensorPush credentials configured — check the /config/config.local.js mount or SENSORPUSH_EMAIL/SENSORPUSH_PASSWORD');
+    return;
+  }
 
   const token = await getToken(sp.email, sp.password);
   if (!token) throw new Error('SensorPush auth failed — check email/password in config');
 
   const sensors = await fetchSensors(token);
-  if (!sensors.length) return;
+  if (!sensors.length) {
+    _recordPollIssue('SensorPush returned an empty sensor list');
+    return;
+  }
   _lastSensorCount = sensors.length;
 
   upsertSensors(db, sensors);
@@ -219,8 +276,9 @@ async function _poll(db, config) {
     }
   }
 
-  _lastPollError = null;
-  _lastPollTime  = Date.now();
+  _lastPollError   = null;
+  _lastIssueLogged = null;
+  _lastPollTime    = Date.now();
   setLastPollTime(db, _lastPollTime);
 
   // MQTT publish. Failures must not surface as poll errors — the readings are
@@ -307,6 +365,8 @@ export function getPollStatus() {
     lastSensorCount:     _lastSensorCount,
     lastWeatherPollTime: _lastWeatherPollTime,
     lastWeatherError:    _lastWeatherError,
+    pollInFlight:        _pollInFlight,
+    pollSkipped:         _pollSkipped,
   };
 }
 
@@ -318,6 +378,9 @@ export function _resetPollerState() {
   _lastDiscoveryAt     = 0;
   _lastWeatherPollTime = null;
   _lastWeatherError    = null;
+  _pollInFlight        = false;
+  _pollSkipped         = 0;
+  _lastIssueLogged     = null;
 }
 
 // Hourly weather poll. On first run (no outdoor_readings yet) backfills a
@@ -352,7 +415,7 @@ export function triggerWeatherPoll(db, config) {
 // Expose manual trigger so the dashboard refresh button can force an immediate poll.
 // Returns a promise that resolves when the poll completes.
 export function triggerPoll(db, config) {
-  return _poll(db, config).catch(err => {
+  return _guardedPoll(db, config).catch(err => {
     _lastPollError = err.message;
     console.error('[poller] manual poll error:', err.message);
     throw err;

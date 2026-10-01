@@ -83,6 +83,8 @@ The first poll backfills 30 days of history; subsequent polls run every 5 minute
 | `RECORDER_TOKEN` env var | Optional shared bearer (alternative to UI-managed file token) |
 | `DB_PATH` env var (default `/data/sensorpush.db`) | SQLite location |
 | `PORT` env var (default `3003`) | HTTP port |
+| `HEALTH_MAX_POLL_AGE_SECS` env var (default `1800`) | `/health` answers 503 when this process's last successful poll is older than this; `0` disables |
+| `METRICS_MAX_AGE_MS` env var (default `15000`) | Max age of the cached `/metrics` body before a scrape triggers a re-render |
 
 CORS: only origins listed in `CORS_ORIGINS` get an `Access-Control-Allow-Origin` header. The header is never `*` — each origin is echoed exactly when it matches.
 
@@ -144,7 +146,7 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/health` | `{ok, sensorCount, lastPoll, pollError}` |
+| GET | `/health` | `{ok, lastPoll, pollAgeSecs, pollError, pollSkipped, sensorCount}`; 503 with `ok: false` and `error` once this process has polled successfully and then not for `HEALTH_MAX_POLL_AGE_SECS` |
 | GET | `/metrics` | Prometheus text exposition (bypasses bearer auth — LAN-scrape pattern) |
 | GET | `/` | sensors list (JSON) or Explorer UI (HTML); JSON response includes `oldestReadingTs` so the Stats YoY toggle knows whether ≥1y of data exists |
 | GET | `/gateways` | per-gateway status; optional `?range=Xd` adds uptime % + primary-sensor count |
