@@ -128,6 +128,7 @@ The token resolution order is `RECORDER_TOKEN` env var → `/data/recorder-token
 
 - **`Authorization: Bearer <token>`**: for programmatic callers (the rosestorie dashboard, scripts, etc.).
 - **A browser session.** The Explorer UI shows a sign-in form; enter the token once and the browser gets a cookie that lasts 90 days. The cookie is `HttpOnly` (page scripts can't read it) and `SameSite=Strict`, and it's marked `Secure` when the request arrived over HTTPS, directly or through a proxy that sets `X-Forwarded-Proto: https`. It holds a random value and an expiry signed with the token, never the token itself. The browser that generates or rotates a token is signed in with the new one. **Settings → Security → Sign out of this browser** ends that browser's session; rotating the token ends every session at once.
+- **A hand-off from a dashboard** (1.1.0). An app that holds the token, such as the rosestorie dashboard, can open the Explorer for its own signed-in users without showing them the token. It calls `POST /auth/handoff` with the bearer and gets a one-time code that expires in 60 seconds. It then opens the Explorer at `<recorder URL>/#handoff=<code>`. The page swaps the code for a 12-hour session (`POST /auth/handoff/redeem`) and sends it as `Authorization: Session <value>`, keeping it in that tab's `sessionStorage`. That works when the dashboard shows the Explorer in an iframe on another site, where browsers refuse the sign-in cookie. A code works once, only while the token it was minted under is still the active one, and stays out of server logs because it's in the URL fragment. Rotating the token ends hand-off sessions too.
 
 A password manager can save the token from the sign-in form like any password.
 
@@ -180,6 +181,8 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | GET | `/settings/notifications/state` | per-condition firing state map |
 | GET / POST / DELETE | `/settings/auth` | recorder-token state, generate/rotate, clear file token |
 | GET / POST / DELETE | `/auth/session` | browser sign-in, open to all: whether a token is required and this browser is signed in; sign in with `{ "token": "…" }`; sign out |
+| POST | `/auth/handoff` | bearer only: a one-time sign-in code for the Explorer (`{ code, expiresIn }`) |
+| POST | `/auth/handoff/redeem` | open to all: swap `{ "code": "…" }` for a 12-hour session sent as `Authorization: Session <value>` |
 
 PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.json`.
 

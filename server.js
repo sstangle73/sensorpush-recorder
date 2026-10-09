@@ -8,7 +8,7 @@ import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExclu
 import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
-import { getToken, getTokenSource, setToken, clearStoredToken, generateToken, tokenMatches, createSession, verifySession, readSessionCookie, sessionCookieHeader } from './auth.js';
+import { getToken, getTokenSource, setToken, clearStoredToken, generateToken, tokenMatches, createSession, verifySession, readSessionCookie, readSessionHeader, sessionCookieHeader, createHandoff, redeemHandoff, HANDOFF_TTL_SECS, HANDOFF_SESSION_MAX_AGE_SECS } from './auth.js';
 import { detectCycles, pickDefaultThermostatSensor, combineZoneSeries } from './hvac.js';
 import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
 import { listBackups, isRestorableName, restoreBackup } from './backups.js';
@@ -110,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v23';
+const CACHE='sensorpush-v24';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -165,9 +165,11 @@ function metricsMaxAgeMs() {
 // Bearer token resolution: env (RECORDER_TOKEN) > /data/recorder-token file
 // (managed via Settings → Security in the UI) > null (no auth). See auth.js.
 //
-// Public bypass paths — health, metrics, UI assets, and the browser sign-in
-// endpoint (each of its methods checks the token or session itself). The
-// auth-bootstrap endpoint needs no entry: with no token set, nothing is gated.
+// Public bypass paths — health, metrics, UI assets, the browser sign-in
+// endpoint (each of its methods checks the token or session itself) and the
+// hand-off redeem, where the one-time code is the credential. Minting a
+// hand-off (/auth/handoff) is not public. The auth-bootstrap endpoint needs
+// no entry: with no token set, nothing is gated.
 const PUBLIC_PATHS = new Set([
   '/health',
   '/metrics',
@@ -175,6 +177,7 @@ const PUBLIC_PATHS = new Set([
   '/icon.svg', '/icon-192.png', '/icon-512.png',
   '/sw.js', '/manifest.json', '/favicon.ico',
   '/auth/session',
+  '/auth/handoff/redeem',
 ]);
 
 // True when the request reached us over TLS, directly or through a proxy that
@@ -186,15 +189,20 @@ function requestIsTls(req) {
 }
 
 // How a request proves it holds the token: 'bearer', 'session', or null.
-// A bearer, when present, is the only thing checked. A session cookie counts
-// only when a browser didn't mark the request as coming from another site:
-// SameSite=Strict already keeps other sites' requests from carrying it, but a
-// sibling subdomain is the "same site", so Sec-Fetch-Site: same-site is refused
-// too. That header only ever narrows access here. Any client can send it, so it
-// never grants any (GHSA-j7mj-3739-5mg9).
+// What the Authorization header presents, a bearer or a hand-off session
+// (`Session <value>`), is the only thing checked when it's there. A session
+// cookie counts only when a browser didn't mark the request as coming from
+// another site: SameSite=Strict already keeps other sites' requests from
+// carrying it, but a sibling subdomain is the "same site", so Sec-Fetch-Site:
+// same-site is refused too. That header only ever narrows access here. Any
+// client can send it, so it never grants any (GHSA-j7mj-3739-5mg9). The
+// header session needs no such check: a browser never adds it by itself.
 function authVia(req, token) {
-  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  const authorization = req.headers.authorization || '';
+  const m = /^Bearer\s+(.+)$/i.exec(authorization);
   if (m) return tokenMatches(m[1], token) ? 'bearer' : null;
+  const headerSession = readSessionHeader(authorization);
+  if (headerSession !== null) return verifySession(headerSession, token) ? 'session' : null;
   if (!verifySession(readSessionCookie(req.headers.cookie), token)) return null;
   const site = req.headers['sec-fetch-site'];
   if (site && site !== 'same-origin' && site !== 'none') return null;
@@ -463,16 +471,17 @@ export function createApp(db, config = null, onSwap = null) {
   });
 
   // Token gate. Only enforced when a token is configured (env or /data
-  // file); then a request needs `Authorization: Bearer <token>` or a valid
-  // session cookie (see authVia). Bypasses:
+  // file); then a request needs `Authorization: Bearer <token>`, a hand-off
+  // session (`Authorization: Session …`) or a valid session cookie (see
+  // authVia). Bypasses:
   //   1. Public paths (health, metrics, UI assets, manifest, sw, favicon,
-  //      and the /auth/session sign-in endpoint).
+  //      the /auth/session sign-in endpoint and the hand-off redeem).
   //   2. HTML GET / — the Explorer UI loads via direct browser nav, then
   //      signs in with the token to get its session cookie.
   //   3. POST /settings/auth/generate when no token is set — bootstrap
   //      flow so a fresh recorder can mint its first token from the UI.
   // The rosestorie dashboard pane goes through user-api's proxy, which
-  // injects the bearer server-side.
+  // injects the bearer server-side, and opens the Explorer with a hand-off.
   app.use((req, res, next) => {
     const token = getToken();
     if (!token) return next();
@@ -1214,6 +1223,36 @@ export function createApp(db, config = null, onSwap = null) {
   app.delete('/auth/session', (req, res) => {
     res.setHeader('Set-Cookie', sessionCookieHeader('', { secure: requestIsTls(req) }));
     res.json({ ok: true });
+  });
+
+  // ── Sign-in hand-off (see auth.js) ──────────────────────────────────────
+  // POST /auth/handoff mints a one-time code and takes the bearer only: a
+  // session, cookie or header, can't mint one. POST /auth/handoff/redeem
+  // { code } is in PUBLIC_PATHS and swaps the code for a session the page
+  // sends as `Authorization: Session <value>`. Neither sets a cookie.
+  app.post('/auth/handoff', (req, res) => {
+    const token = getToken();
+    res.setHeader('Cache-Control', 'no-store');
+    if (token === null) return res.json({ ok: true, authRequired: false });
+    if (authVia(req, token) !== 'bearer') {
+      return res.status(403).json({ ok: false, error: 'a hand-off needs the bearer token' });
+    }
+    res.json({ ok: true, authRequired: true, code: createHandoff(token), expiresIn: HANDOFF_TTL_SECS });
+  });
+
+  app.post('/auth/handoff/redeem', (req, res) => {
+    const token = getToken();
+    res.setHeader('Cache-Control', 'no-store');
+    if (token === null) return res.json({ ok: true, authRequired: false });
+    if (!redeemHandoff(req.body?.code, token)) {
+      return res.status(401).json({ ok: false, error: 'hand-off code unknown, used or expired' });
+    }
+    res.json({
+      ok: true,
+      authRequired: true,
+      session: createSession(token, Date.now(), HANDOFF_SESSION_MAX_AGE_SECS),
+      expiresIn: HANDOFF_SESSION_MAX_AGE_SECS,
+    });
   });
 
   // ── Auth (recorder bearer token) ────────────────────────────────────────

@@ -19,7 +19,10 @@ const TOKEN_FILE = join(TMP, 'recorder-token');
 // Imports must come AFTER env setup so config.js picks up DB_PATH.
 const { createApp } = await import('../server.js');
 const { openDb } = await import('../db.js');
-const { tokenMatches, createSession, verifySession, readSessionCookie, SESSION_MAX_AGE_SECS } = await import('../auth.js');
+const {
+  tokenMatches, createSession, verifySession, readSessionCookie, readSessionHeader, SESSION_MAX_AGE_SECS,
+  createHandoff, redeemHandoff, _resetHandoffs, HANDOFF_TTL_SECS, HANDOFF_SESSION_MAX_AGE_SECS,
+} = await import('../auth.js');
 
 let server, baseUrl, db;
 
@@ -61,7 +64,7 @@ async function api(method, path, opts = {}) {
   const text = await res.text();
   let body;
   try { body = JSON.parse(text); } catch { body = text; }
-  return { status: res.status, body, setCookie: res.headers.get('set-cookie') };
+  return { status: res.status, body, setCookie: res.headers.get('set-cookie'), cacheControl: res.headers.get('cache-control') };
 }
 
 // The sp_session value from a Set-Cookie header ('' when it clears it).
@@ -365,6 +368,116 @@ describe('Browser sessions (/auth/session)', () => {
   });
 });
 
+describe('Sign-in hand-off (/auth/handoff)', () => {
+  const TOK = '55555555555555555555555555555555';
+  const asSession = (s) => ({ Authorization: `Session ${s}` });
+
+  beforeEach(() => _resetHandoffs());
+
+  async function mint() {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/handoff', { token: TOK });
+    expect(r.status).toBe(200);
+    return r.body.code;
+  }
+
+  async function redeem(code) {
+    return api('POST', '/auth/handoff/redeem', { body: { code } });
+  }
+
+  it('is a no-op when no token is set', async () => {
+    const r = await api('POST', '/auth/handoff');
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual({ ok: true, authRequired: false });
+    const d = await redeem('x'.repeat(43));
+    expect(d.body).toEqual({ ok: true, authRequired: false });
+  });
+
+  it('mints a one-time code for the bearer, and sets no cookie', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/handoff', { token: TOK });
+    expect(r.status).toBe(200);
+    expect(r.body.code).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(r.body.expiresIn).toBe(HANDOFF_TTL_SECS);
+    expect(r.cacheControl).toBe('no-store');
+    expect(r.setCookie).toBeNull();
+    expect(JSON.stringify(r.body)).not.toContain(TOK);
+  });
+
+  it('only the bearer can mint one, not a session of either kind', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    expect((await api('POST', '/auth/handoff')).status).toBe(401);
+    expect((await api('POST', '/auth/handoff', { token: 'wrong-token-wrong-token-wrong-tok' })).status).toBe(401);
+    const cookie = createSession(TOK);
+    expect((await api('POST', '/auth/handoff', { session: cookie })).status).toBe(403);
+    expect((await api('POST', '/auth/handoff', { headers: asSession(cookie) })).status).toBe(403);
+  });
+
+  it('swaps the code for a 12-hour header session that gets through the gate', async () => {
+    const code = await mint();
+    const r = await redeem(code);
+    expect(r.status).toBe(200);
+    expect(r.setCookie).toBeNull();
+    expect(r.cacheControl).toBe('no-store');
+    expect(r.body.expiresIn).toBe(HANDOFF_SESSION_MAX_AGE_SECS);
+    const exp = Number(r.body.session.split('.')[0]);
+    expect(exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + HANDOFF_SESSION_MAX_AGE_SECS);
+    expect(exp).toBeGreaterThan(Math.floor(Date.now() / 1000) + HANDOFF_SESSION_MAX_AGE_SECS - 60);
+    const s = asSession(r.body.session);
+    expect((await api('GET', '/settings', { headers: s })).status).toBe(200);
+    expect((await api('GET', '/', { headers: { ...s, Accept: 'application/json' } })).status).toBe(200);
+    expect((await api('GET', '/auth/session', { headers: s })).body.authenticated).toBe(true);
+  });
+
+  it('a code works once', async () => {
+    const code = await mint();
+    expect((await redeem(code)).status).toBe(200);
+    expect((await redeem(code)).status).toBe(401);
+  });
+
+  it('refuses unknown, malformed and missing codes', async () => {
+    await mint();
+    expect((await redeem('A'.repeat(43))).status).toBe(401);
+    expect((await redeem('not a code')).status).toBe(401);
+    expect((await redeem(12345)).status).toBe(401);
+    expect((await api('POST', '/auth/handoff/redeem', { body: {} })).status).toBe(401);
+  });
+
+  it('a code dies when the token changes before it is used', async () => {
+    const code = await mint();
+    writeFileSync(TOKEN_FILE, '66666666666666666666666666666666');
+    expect((await redeem(code)).status).toBe(401);
+  });
+
+  it('a token change ends the header session too', async () => {
+    const { body } = await redeem(await mint());
+    writeFileSync(TOKEN_FILE, '66666666666666666666666666666666');
+    expect((await api('GET', '/settings', { headers: asSession(body.session) })).status).toBe(401);
+  });
+
+  it('a header session, when present, is all that counts', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const cookie = createSession(TOK);
+    const r = await api('GET', '/settings', { session: cookie, headers: asSession('garbage') });
+    expect(r.status).toBe(401);
+    const [exp, nonce, mac] = createSession(TOK).split('.');
+    expect((await api('GET', '/settings', { headers: asSession(`${Number(exp) + 60}.${nonce}.${mac}`) })).status).toBe(401);
+    expect((await api('GET', '/settings', { headers: asSession(createSession('a-different-token-entirely-0000')) })).status).toBe(401);
+  });
+
+  it('the header session works from a cross-site iframe, where a cookie cannot', async () => {
+    const { body } = await redeem(await mint());
+    const r = await api('GET', '/settings', { headers: { ...asSession(body.session), 'Sec-Fetch-Site': 'cross-site' } });
+    expect(r.status).toBe(200);
+  });
+
+  it('Sec-Fetch-Site still opens nothing on the hand-off routes', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/handoff', { headers: { 'Sec-Fetch-Site': 'same-origin' } });
+    expect(r.status).toBe(401);
+  });
+});
+
 describe('auth.js helpers', () => {
   it('tokenMatches compares in constant time, any lengths', () => {
     expect(tokenMatches('abc', 'abc')).toBe(true);
@@ -382,6 +495,45 @@ describe('auth.js helpers', () => {
     expect(verifySession(s, 'tok-tok-tok-tok-tok', t0 + (SESSION_MAX_AGE_SECS - 1) * 1000)).toBe(true);
     expect(verifySession(s, 'tok-tok-tok-tok-tok', t0 + SESSION_MAX_AGE_SECS * 1000)).toBe(false);
     expect(verifySession(s, 'other-token-other', t0)).toBe(false);
+  });
+
+  it('createSession never outlives the 90-day cap', () => {
+    const t0 = Date.UTC(2026, 9, 9);
+    const short = createSession('tok-tok-tok-tok-tok', t0, 3600);
+    expect(Number(short.split('.')[0])).toBe(t0 / 1000 + 3600);
+    const long = createSession('tok-tok-tok-tok-tok', t0, SESSION_MAX_AGE_SECS * 2);
+    expect(Number(long.split('.')[0])).toBe(t0 / 1000 + SESSION_MAX_AGE_SECS);
+  });
+
+  it('redeemHandoff honours the expiry and spends a code either way', () => {
+    _resetHandoffs();
+    const t0 = Date.UTC(2026, 9, 9);
+    const good = createHandoff('tok-tok-tok-tok-tok', t0);
+    expect(redeemHandoff(good, 'tok-tok-tok-tok-tok', t0 + (HANDOFF_TTL_SECS - 1) * 1000)).toBe(true);
+    const late = createHandoff('tok-tok-tok-tok-tok', t0);
+    expect(redeemHandoff(late, 'tok-tok-tok-tok-tok', t0 + HANDOFF_TTL_SECS * 1000)).toBe(false);
+    const wrongToken = createHandoff('tok-tok-tok-tok-tok', t0);
+    expect(redeemHandoff(wrongToken, 'other-token-other', t0)).toBe(false);
+    expect(redeemHandoff(wrongToken, 'tok-tok-tok-tok-tok', t0)).toBe(false);
+    expect(redeemHandoff(good, 'tok-tok-tok-tok-tok', t0)).toBe(false);
+  });
+
+  it('keeps at most 100 codes outstanding, dropping the oldest', () => {
+    _resetHandoffs();
+    const t0 = Date.UTC(2026, 9, 9);
+    const first = createHandoff('tok-tok-tok-tok-tok', t0);
+    const rest = Array.from({ length: 100 }, () => createHandoff('tok-tok-tok-tok-tok', t0));
+    expect(redeemHandoff(first, 'tok-tok-tok-tok-tok', t0)).toBe(false);
+    expect(redeemHandoff(rest[0], 'tok-tok-tok-tok-tok', t0)).toBe(true);
+    expect(redeemHandoff(rest[99], 'tok-tok-tok-tok-tok', t0)).toBe(true);
+  });
+
+  it('readSessionHeader takes only the Session scheme', () => {
+    expect(readSessionHeader('Session a.b.c')).toBe('a.b.c');
+    expect(readSessionHeader('session   a.b.c  ')).toBe('a.b.c');
+    expect(readSessionHeader('Bearer a.b.c')).toBeNull();
+    expect(readSessionHeader('Session a b')).toBeNull();
+    expect(readSessionHeader(undefined)).toBeNull();
   });
 
   it('readSessionCookie finds the cookie among others', () => {
