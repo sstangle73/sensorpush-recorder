@@ -213,6 +213,14 @@ CI: `.gitlab-ci.yml` runs `npm test` on every push and merge request against a N
 
 Run behind a reverse proxy (Cloudflare Tunnel, nginx, Caddy) terminating TLS at e.g. `https://sensors.example.com` → `http://docker-host:3003`. Add that origin to `CORS_ORIGINS` for any frontend that fetches from it.
 
+## Security
+
+Report a security problem privately, as [SECURITY.md](SECURITY.md) says, not in an issue.
+
 ## License
 
 MIT
+
+## Buy me a coffee
+
+If it has kept an eye on your sensors, you can [buy me a coffee](https://buymeacoffee.com/stevenstorie). ☕
