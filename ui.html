@@ -800,6 +800,22 @@ header .spacer { flex: 1; }
 }
 #toast.show { opacity: 1; }
 
+/* ── Sign-in (shown when a token is set and this browser has no session) ── */
+#signin {
+  position: fixed; inset: 0; z-index: 300; background: var(--bg);
+  display: none; align-items: center; justify-content: center; padding: 16px;
+}
+#signin.show { display: flex; }
+#signin form {
+  width: 100%; max-width: 380px; background: var(--bg2);
+  border: 1px solid var(--border); border-radius: 8px; padding: 20px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+#signin h2 { font-size: 15px; font-weight: 600; }
+#signin p { font-size: 12px; color: var(--text2); }
+#signin .set-text-input { flex: none; width: 100%; }
+#signin-error { font-size: 12px; color: var(--warn); min-height: 1em; }
+
 /* ── Events ── */
 #add-event-btn {
   padding: 4px 11px; border-radius: 5px;
@@ -1202,7 +1218,7 @@ header .spacer { flex: 1; }
 
   <div class="set-section">
     <h2>Security</h2>
-    <p class="set-hint" style="margin-bottom:10px">A bearer token gates non-public routes. Browsers loading the Explorer UI from this hostname bypass it via <code>Sec-Fetch-Site: same-origin</code>; cross-origin programmatic callers (the rosestorie dashboard, etc.) must include <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+    <p class="set-hint" style="margin-bottom:10px">A token gates everything but the health check, metrics and this page. A browser signs in once with the token and stays signed in for 90 days with a cookie that page scripts can't read. Programmatic callers (the rosestorie dashboard, scripts, etc.) send <code>Authorization: Bearer &lt;token&gt;</code>. Rotating the token signs every browser out.</p>
     <div id="auth-state" style="margin-bottom:10px;font-size:13px;color:var(--text2)">Loading…</div>
     <div id="auth-actions" style="display:flex;gap:8px;flex-wrap:wrap"></div>
     <div id="auth-fresh-token" style="margin-top:14px;display:none;background:var(--bg-elev);border:1px solid var(--accent);border-radius:6px;padding:12px">
@@ -1242,6 +1258,17 @@ header .spacer { flex: 1; }
       <button class="set-btn" onclick="saveEventFromModal()" style="border-color:var(--accent);color:var(--accent)">Save</button>
     </div>
   </div>
+</div>
+
+<div id="signin">
+  <form onsubmit="submitSignIn(event)" autocomplete="on">
+    <h2>Sign in</h2>
+    <p>This recorder has a token. Enter it once and this browser stays signed in for 90 days.</p>
+    <input type="text" name="username" value="sensorpush-recorder" autocomplete="username" hidden>
+    <input type="password" id="signin-token" class="set-text-input" autocomplete="current-password" placeholder="Recorder token" required>
+    <div id="signin-error" role="alert"></div>
+    <button type="submit" class="set-btn" style="border-color:var(--accent);color:var(--accent)">Sign in</button>
+  </form>
 </div>
 
 <div id="toast"></div>
@@ -1328,6 +1355,61 @@ function fmtDuration(secs) {
 // When accessed directly on port 3003, nginx isn't in the path so the
 // /api/sensors/ prefix doesn't exist — sensor-api routes are at /.
 const API_BASE = window.location.pathname.startsWith('/sensorpush') ? '/api/sensors' : '';
+
+// ── Sign-in ────────────────────────────────────────────────────────────────
+// With a token set, every API call needs the session cookie that POST
+// /auth/session hands out (HttpOnly, so this page never holds the token).
+// init() asks /auth/session first and shows the sign-in form instead of
+// loading; the fetch wrapper catches a session that expires or is cut off by
+// a rotation mid-use, from any of the call sites below.
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const r = await _fetch(...args);
+  if (r.status === 401 && new URL(r.url, location.href).origin === location.origin) showSignIn();
+  return r;
+};
+
+function showSignIn() {
+  const el = document.getElementById('signin');
+  if (el.classList.contains('show')) return;
+  el.classList.add('show');
+  document.getElementById('poll-status').textContent = 'Signed out';
+  document.getElementById('signin-token').focus();
+}
+
+async function submitSignIn(ev) {
+  ev.preventDefault();
+  const input = document.getElementById('signin-token');
+  const errEl = document.getElementById('signin-error');
+  errEl.textContent = '';
+  try {
+    const r = await _fetch(`${API_BASE}/auth/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: input.value }),
+    });
+    if (r.ok) { location.reload(); return; }
+    errEl.textContent = r.status === 401 ? '✗ That token is wrong.' : `✗ Sign-in failed (HTTP ${r.status}).`;
+  } catch (e) {
+    errEl.textContent = '✗ Sign-in failed: ' + e.message;
+  }
+  input.select();
+}
+
+async function signOut() {
+  try { await _fetch(`${API_BASE}/auth/session`, { method: 'DELETE' }); } catch (_) {}
+  location.reload();
+}
+
+// Resolves true when the app can load: no token set, or this browser holds
+// a session. A failed check lets init() carry on and surface its own error.
+async function ensureSignedIn() {
+  try {
+    const s = await _fetch(`${API_BASE}/auth/session`).then(r => r.json());
+    if (s.authRequired && !s.authenticated) { showSignIn(); return false; }
+  } catch (_) {}
+  return true;
+}
 
 // Fixed SVG logical canvas
 const W = 1000, H = 640;
@@ -4083,6 +4165,7 @@ document.addEventListener('visibilitychange', () => {
 
 async function init() {
   document.getElementById('poll-status').textContent = 'Loading…';
+  if (!(await ensureSignedIn())) return;
 
   // Independent first round-trips in parallel: app settings + sensor list.
   // loadSettings swallows its own errors and falls back to defaults; the
@@ -5120,6 +5203,13 @@ async function renderAuthSection() {
       rm.onclick = removeRecorderToken;
       actionsEl.appendChild(rm);
     }
+    if (data.tokenSet) {
+      const out = document.createElement('button');
+      out.className = 'set-btn';
+      out.textContent = 'Sign out of this browser';
+      out.onclick = signOut;
+      actionsEl.appendChild(out);
+    }
   } catch (e) {
     stateEl.textContent = 'Could not load auth state: ' + e.message;
     actionsEl.innerHTML = '';
@@ -5128,7 +5218,7 @@ async function renderAuthSection() {
 
 async function generateRecorderToken(kind) {
   const path = kind === 'rotate' ? '/settings/auth/rotate' : '/settings/auth/generate';
-  if (kind === 'rotate' && !confirm('Rotate token? Existing clients (rosestorie dashboard, etc.) will start failing until you paste the new token into them.')) return;
+  if (kind === 'rotate' && !confirm('Rotate token? Existing clients (rosestorie dashboard, etc.) will start failing until you paste the new token into them, and every other browser is signed out.')) return;
   try {
     const r = await fetch(`${API_BASE}${path}`, { method: 'POST' });
     const data = await r.json();

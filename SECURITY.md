@@ -26,9 +26,13 @@ Only the latest `master` and the `latest` image get fixes.
 ## What's in scope
 
 The recorder: its API, the Explorer UI, the Docker image and the MQTT bridge. These matter most:
-- **The bearer token:** anything that reaches the API without it while a token is set, other than `/health`, `/metrics`, the UI page and its icons, manifest and service worker, or that reads, leaks or replaces the token.
+- **The token and browser sessions:** anything that reaches the API without the token or a session while a token is set, other than `/health`, `/metrics`, the UI page and its icons, manifest and service worker, and the sign-in endpoint; anything that reads, leaks or replaces the token; or a session that outlives a token change or can be forged.
 - **The SensorPush account:** anything that exposes the email, password or session the recorder holds.
 - **Backups and restore:** reading, overwriting or restoring snapshots without the token, or a snapshot name that reaches outside `/data/backups/`.
 - **Outbound requests:** a webhook or ntfy sink, or anything else, made to reach addresses the operator didn't intend.
 
 Out of scope: a recorder run with no token set (the README says it's then open to anyone who can reach it), `/metrics` being readable without the token (documented, for scraping on a LAN), a deployment without TLS, and denial of service by sheer volume.
+
+## Past advisories
+
+- [GHSA-j7mj-3739-5mg9](https://github.com/sstangle73/sensorpush-recorder/security/advisories/GHSA-j7mj-3739-5mg9): before 1.0.1, any request carrying `Sec-Fetch-Site: same-origin` skipped the token. Found by the maintainer; fixed in 1.0.1.

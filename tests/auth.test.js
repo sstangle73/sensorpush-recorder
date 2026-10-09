@@ -19,6 +19,7 @@ const TOKEN_FILE = join(TMP, 'recorder-token');
 // Imports must come AFTER env setup so config.js picks up DB_PATH.
 const { createApp } = await import('../server.js');
 const { openDb } = await import('../db.js');
+const { tokenMatches, createSession, verifySession, readSessionCookie, SESSION_MAX_AGE_SECS } = await import('../auth.js');
 
 let server, baseUrl, db;
 
@@ -49,12 +50,24 @@ afterAll(() => rmSync(TMP, { recursive: true, force: true }));
 async function api(method, path, opts = {}) {
   const res = await fetch(baseUrl + path, {
     method,
-    headers: { ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}), ...(opts.headers || {}) },
+    headers: {
+      ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
+      ...(opts.session ? { Cookie: `sp_session=${opts.session}` } : {}),
+      ...(opts.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(opts.headers || {}),
+    },
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   });
   const text = await res.text();
   let body;
   try { body = JSON.parse(text); } catch { body = text; }
-  return { status: res.status, body };
+  return { status: res.status, body, setCookie: res.headers.get('set-cookie') };
+}
+
+// The sp_session value from a Set-Cookie header ('' when it clears it).
+function sessionFrom(setCookie) {
+  const m = /(?:^|,\s*)sp_session=([^;]*)/.exec(setCookie || '');
+  return m ? m[1] : null;
 }
 
 describe('GET /settings/auth', () => {
@@ -171,10 +184,31 @@ describe('Bearer middleware', () => {
     expect(status).toBe(200);
   });
 
-  it('treats Sec-Fetch-Site: same-origin as same-origin bypass', async () => {
+  // GHSA-j7mj-3739-5mg9: Sec-Fetch-Site is chosen by the client. Any script
+  // can send it, so it must never stand in for the token.
+  it('does not let Sec-Fetch-Site: same-origin stand in for the token', async () => {
+    const tok = 'ffffffffffffffffffffffffffffffff';
+    writeFileSync(TOKEN_FILE, tok);
+    const spoof = { 'Sec-Fetch-Site': 'same-origin' };
+    const json = await api('GET', '/', { headers: { ...spoof, Accept: 'application/json' } });
+    expect(json.status).toBe(401);
+    const settings = await api('GET', '/settings', { headers: spoof });
+    expect(settings.status).toBe(401);
+    const backups = await api('GET', '/backups', { headers: spoof });
+    expect(backups.status).toBe(401);
+    const rotate = await api('POST', '/settings/auth/rotate', { headers: spoof });
+    expect(rotate.status).toBe(401);
+    expect(rotate.body.token).toBeUndefined();
+    const clear = await api('DELETE', '/settings/auth', { headers: spoof });
+    expect(clear.status).toBe(401);
+    expect(readFileSync(TOKEN_FILE, 'utf8')).toBe(tok);
+  });
+
+  it('serves the UI page with Sec-Fetch-Site: same-origin (HTML is public)', async () => {
     writeFileSync(TOKEN_FILE, 'ffffffffffffffffffffffffffffffff');
     const res = await fetch(baseUrl + '/', { headers: { 'Sec-Fetch-Site': 'same-origin' } });
     expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
   });
 
   it('still gates Sec-Fetch-Site: cross-site / none', async () => {
@@ -195,5 +229,164 @@ describe('Bearer middleware', () => {
     const ok = await api('GET', '/sensor-pairs', { token: tok });
     expect(ok.status).toBe(200);
     expect(ok.body.ok).toBe(true);
+  });
+});
+
+describe('Browser sessions (/auth/session)', () => {
+  const TOK = '33333333333333333333333333333333';
+
+  async function signIn() {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/session', { body: { token: TOK } });
+    expect(r.status).toBe(200);
+    return sessionFrom(r.setCookie);
+  }
+
+  it('reports no auth required when no token is set', async () => {
+    const { status, body } = await api('GET', '/auth/session');
+    expect(status).toBe(200);
+    expect(body).toEqual({ ok: true, authRequired: false, authenticated: true });
+  });
+
+  it('reports signed out when a token is set and nothing is presented', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const { status, body } = await api('GET', '/auth/session', { headers: { 'Sec-Fetch-Site': 'same-origin' } });
+    expect(status).toBe(200);
+    expect(body).toEqual({ ok: true, authRequired: true, authenticated: false });
+  });
+
+  it('refuses a wrong token and sets no cookie', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/session', { body: { token: TOK.slice(1) } });
+    expect(r.status).toBe(401);
+    expect(r.setCookie).toBeNull();
+    const missing = await api('POST', '/auth/session', { body: {} });
+    expect(missing.status).toBe(401);
+  });
+
+  it('sets an HttpOnly, SameSite=Strict cookie that never carries the token', async () => {
+    writeFileSync(TOKEN_FILE, TOK);
+    const r = await api('POST', '/auth/session', { body: { token: TOK } });
+    expect(r.setCookie).toMatch(/HttpOnly/);
+    expect(r.setCookie).toMatch(/SameSite=Strict/);
+    expect(r.setCookie).toMatch(/Max-Age=7776000/);
+    expect(r.setCookie).toMatch(/Path=\//);
+    expect(r.setCookie).not.toMatch(/Secure/);
+    expect(r.setCookie).not.toContain(TOK);
+    const tls = await api('POST', '/auth/session', { body: { token: TOK }, headers: { 'X-Forwarded-Proto': 'https' } });
+    expect(tls.setCookie).toMatch(/; Secure/);
+  });
+
+  it('gives each sign-in a different random value', async () => {
+    const a = await signIn();
+    const b = await signIn();
+    expect(a).not.toBe(b);
+  });
+
+  it('lets the session cookie through the gate', async () => {
+    const s = await signIn();
+    const same = { 'Sec-Fetch-Site': 'same-origin' };
+    expect((await api('GET', '/', { session: s, headers: { ...same, Accept: 'application/json' } })).status).toBe(200);
+    expect((await api('GET', '/settings', { session: s, headers: same })).status).toBe(200);
+    // Non-browser clients send no Sec-Fetch-Site; a typed-in URL sends none.
+    expect((await api('GET', '/settings', { session: s })).status).toBe(200);
+    expect((await api('GET', '/settings', { session: s, headers: { 'Sec-Fetch-Site': 'none' } })).status).toBe(200);
+    const state = await api('GET', '/auth/session', { session: s, headers: same });
+    expect(state.body.authenticated).toBe(true);
+  });
+
+  it('refuses the cookie on requests a browser marks as from another site', async () => {
+    const s = await signIn();
+    for (const site of ['cross-site', 'same-site']) {
+      const r = await api('POST', '/settings/auth/rotate', { session: s, headers: { 'Sec-Fetch-Site': site } });
+      expect(r.status).toBe(401);
+    }
+    expect(readFileSync(TOKEN_FILE, 'utf8')).toBe(TOK);
+  });
+
+  it('refuses a tampered or foreign cookie', async () => {
+    const s = await signIn();
+    const [exp, nonce, mac] = s.split('.');
+    const later = `${Number(exp) + 60}.${nonce}.${mac}`;
+    expect((await api('GET', '/settings', { session: later })).status).toBe(401);
+    expect((await api('GET', '/settings', { session: `${exp}.${nonce}.${mac.slice(0, -2)}AA` })).status).toBe(401);
+    expect((await api('GET', '/settings', { session: 'garbage' })).status).toBe(401);
+    expect((await api('GET', '/settings', { session: createSession('a-different-token-entirely-0000') })).status).toBe(401);
+  });
+
+  it('a bearer, when present, is all that counts', async () => {
+    const s = await signIn();
+    const r = await api('GET', '/settings', { session: s, token: 'wrong-token-wrong-token-wrong-tok' });
+    expect(r.status).toBe(401);
+  });
+
+  it('ends every session when the token changes', async () => {
+    const s = await signIn();
+    writeFileSync(TOKEN_FILE, '44444444444444444444444444444444');
+    expect((await api('GET', '/settings', { session: s })).status).toBe(401);
+  });
+
+  it('rotate signs the caller in with the new token and ends the old session', async () => {
+    const s = await signIn();
+    const r = await api('POST', '/settings/auth/rotate', { session: s, headers: { 'Sec-Fetch-Site': 'same-origin' } });
+    expect(r.status).toBe(200);
+    const fresh = sessionFrom(r.setCookie);
+    expect(fresh).toBeTruthy();
+    expect((await api('GET', '/settings', { session: s })).status).toBe(401);
+    expect((await api('GET', '/settings', { session: fresh })).status).toBe(200);
+    expect((await api('GET', '/settings', { token: r.body.token })).status).toBe(200);
+  });
+
+  it('generate signs the caller in with the token it made', async () => {
+    const r = await api('POST', '/settings/auth/generate');
+    expect(r.status).toBe(200);
+    expect((await api('GET', '/settings', { session: sessionFrom(r.setCookie) })).status).toBe(200);
+  });
+
+  it('removing the token clears the cookie', async () => {
+    const s = await signIn();
+    const r = await api('DELETE', '/settings/auth', { session: s });
+    expect(r.status).toBe(200);
+    expect(r.setCookie).toMatch(/sp_session=;.*Max-Age=0/);
+  });
+
+  it('DELETE /auth/session signs this browser out', async () => {
+    const r = await api('DELETE', '/auth/session');
+    expect(r.status).toBe(200);
+    expect(sessionFrom(r.setCookie)).toBe('');
+    expect(r.setCookie).toMatch(/Max-Age=0/);
+  });
+
+  it('signing in with no token set is a no-op', async () => {
+    const r = await api('POST', '/auth/session', { body: { token: 'anything' } });
+    expect(r.status).toBe(200);
+    expect(r.body.authRequired).toBe(false);
+    expect(r.setCookie).toBeNull();
+  });
+});
+
+describe('auth.js helpers', () => {
+  it('tokenMatches compares in constant time, any lengths', () => {
+    expect(tokenMatches('abc', 'abc')).toBe(true);
+    expect(tokenMatches('abd', 'abc')).toBe(false);
+    expect(tokenMatches('abcd', 'abc')).toBe(false);
+    expect(tokenMatches('', 'abc')).toBe(false);
+    expect(tokenMatches(undefined, 'abc')).toBe(false);
+    expect(tokenMatches('abc', null)).toBe(false);
+  });
+
+  it('verifySession honours the expiry', () => {
+    const t0 = Date.UTC(2026, 9, 9);
+    const s = createSession('tok-tok-tok-tok-tok', t0);
+    expect(verifySession(s, 'tok-tok-tok-tok-tok', t0)).toBe(true);
+    expect(verifySession(s, 'tok-tok-tok-tok-tok', t0 + (SESSION_MAX_AGE_SECS - 1) * 1000)).toBe(true);
+    expect(verifySession(s, 'tok-tok-tok-tok-tok', t0 + SESSION_MAX_AGE_SECS * 1000)).toBe(false);
+    expect(verifySession(s, 'other-token-other', t0)).toBe(false);
+  });
+
+  it('readSessionCookie finds the cookie among others', () => {
+    expect(readSessionCookie('a=1; sp_session=x.y.z; b=2')).toBe('x.y.z');
+    expect(readSessionCookie('sp_session_other=1')).toBeNull();
+    expect(readSessionCookie(undefined)).toBeNull();
   });
 });

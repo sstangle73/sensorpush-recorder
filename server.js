@@ -8,7 +8,7 @@ import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExclu
 import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
-import { getToken, getTokenSource, setToken, clearStoredToken, generateToken } from './auth.js';
+import { getToken, getTokenSource, setToken, clearStoredToken, generateToken, tokenMatches, createSession, verifySession, readSessionCookie, sessionCookieHeader } from './auth.js';
 import { detectCycles, pickDefaultThermostatSensor, combineZoneSeries } from './hvac.js';
 import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
 import { listBackups, isRestorableName, restoreBackup } from './backups.js';
@@ -110,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v22';
+const CACHE='sensorpush-v23';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -126,7 +126,7 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather)\\b/))return;
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather|auth)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   e.respondWith(caches.match(e.request).then(cached=>{
@@ -165,15 +165,41 @@ function metricsMaxAgeMs() {
 // Bearer token resolution: env (RECORDER_TOKEN) > /data/recorder-token file
 // (managed via Settings → Security in the UI) > null (no auth). See auth.js.
 //
-// Public bypass paths — health, UI assets, and the auth-bootstrap endpoint
-// (so a fresh recorder can mint its first token without a chicken-and-egg).
+// Public bypass paths — health, metrics, UI assets, and the browser sign-in
+// endpoint (each of its methods checks the token or session itself). The
+// auth-bootstrap endpoint needs no entry: with no token set, nothing is gated.
 const PUBLIC_PATHS = new Set([
   '/health',
   '/metrics',
   '/ui',
   '/icon.svg', '/icon-192.png', '/icon-512.png',
   '/sw.js', '/manifest.json', '/favicon.ico',
+  '/auth/session',
 ]);
+
+// True when the request reached us over TLS, directly or through a proxy that
+// says so. It only decides the session cookie's Secure flag.
+function requestIsTls(req) {
+  if (req.secure) return true;
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return proto === 'https';
+}
+
+// How a request proves it holds the token: 'bearer', 'session', or null.
+// A bearer, when present, is the only thing checked. A session cookie counts
+// only when a browser didn't mark the request as coming from another site:
+// SameSite=Strict already keeps other sites' requests from carrying it, but a
+// sibling subdomain is the "same site", so Sec-Fetch-Site: same-site is refused
+// too. That header only ever narrows access here. Any client can send it, so it
+// never grants any (GHSA-j7mj-3739-5mg9).
+function authVia(req, token) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  if (m) return tokenMatches(m[1], token) ? 'bearer' : null;
+  if (!verifySession(readSessionCookie(req.headers.cookie), token)) return null;
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return null;
+  return 'session';
+}
 
 // ── Comfort-config validation ───────────────────────────────────────────────
 // Used by PUT /settings to reject malformed comfort blobs before they hit
@@ -436,27 +462,23 @@ export function createApp(db, config = null, onSwap = null) {
     next();
   });
 
-  // Bearer-token gate. Only enforced when a token is configured (env or
-  // /data file). Bypasses:
-  //   1. Public paths (health, UI assets, manifest, sw, favicon).
-  //   2. HTML GET / — the Explorer UI loads via direct browser nav.
-  //   3. Same-origin requests (Sec-Fetch-Site: same-origin) — fetches from
-  //      the Explorer UI's own JS context. Browsers set Sec-Fetch-Site
-  //      automatically and JS cannot override it, so cross-origin
-  //      attackers can't spoof it. Cross-origin programmatic access still
-  //      needs the bearer. The rosestorie dashboard pane goes through
-  //      user-api's proxy which injects the bearer server-side.
-  //   4. POST /settings/auth/generate when no token is set — bootstrap
+  // Token gate. Only enforced when a token is configured (env or /data
+  // file); then a request needs `Authorization: Bearer <token>` or a valid
+  // session cookie (see authVia). Bypasses:
+  //   1. Public paths (health, metrics, UI assets, manifest, sw, favicon,
+  //      and the /auth/session sign-in endpoint).
+  //   2. HTML GET / — the Explorer UI loads via direct browser nav, then
+  //      signs in with the token to get its session cookie.
+  //   3. POST /settings/auth/generate when no token is set — bootstrap
   //      flow so a fresh recorder can mint its first token from the UI.
+  // The rosestorie dashboard pane goes through user-api's proxy, which
+  // injects the bearer server-side.
   app.use((req, res, next) => {
     const token = getToken();
     if (!token) return next();
     if (PUBLIC_PATHS.has(req.path)) return next();
     if (req.path === '/' && !(req.headers.accept || '').includes('application/json')) return next();
-    if (req.headers['sec-fetch-site'] === 'same-origin') return next();
-    const auth = req.headers.authorization || '';
-    const m = /^Bearer\s+(.+)$/i.exec(auth);
-    if (!m || m[1] !== token) {
+    if (!authVia(req, token)) {
       res.status(401).json({ error: 'unauthorized' });
       return;
     }
@@ -1164,6 +1186,36 @@ export function createApp(db, config = null, onSwap = null) {
     res.json({ ok: true, states: listNotifStates(db) });
   });
 
+  // ── Browser sign-in (session cookie) ────────────────────────────────────
+  // /auth/session is in PUBLIC_PATHS; each method checks for itself.
+  // GET reports whether a token is required and whether this request holds
+  // it (a bearer or a valid session cookie), so the UI knows to show its
+  // sign-in form. POST { token } signs this browser in. DELETE signs it out.
+  app.get('/auth/session', (req, res) => {
+    const token = getToken();
+    res.setHeader('Cache-Control', 'no-store').json({
+      ok: true,
+      authRequired: token !== null,
+      authenticated: token === null || authVia(req, token) !== null,
+    });
+  });
+
+  app.post('/auth/session', (req, res) => {
+    const token = getToken();
+    if (token === null) return res.json({ ok: true, authRequired: false });
+    const presented = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    if (!tokenMatches(presented, token)) {
+      return res.status(401).json({ ok: false, error: 'wrong token' });
+    }
+    res.setHeader('Set-Cookie', sessionCookieHeader(createSession(token), { secure: requestIsTls(req) }));
+    res.json({ ok: true });
+  });
+
+  app.delete('/auth/session', (req, res) => {
+    res.setHeader('Set-Cookie', sessionCookieHeader('', { secure: requestIsTls(req) }));
+    res.json({ ok: true });
+  });
+
   // ── Auth (recorder bearer token) ────────────────────────────────────────
   // GET /settings/auth — read-only metadata about the current token state.
   // Never returns the token itself; the bearer is shown ONCE on generate
@@ -1183,13 +1235,16 @@ export function createApp(db, config = null, onSwap = null) {
   // so a public-internet recorder with no token configured can be locked
   // down by anyone — race window is bounded by how fast the operator
   // actually clicks Generate after deploy.
-  app.post('/settings/auth/generate', (_req, res) => {
+  // Generate and rotate also sign in the caller with the new token, so the
+  // browser that clicked the button keeps working once it's enforced.
+  app.post('/settings/auth/generate', (req, res) => {
     if (getToken() !== null) {
       return res.status(409).json({ ok: false, error: 'token already set; use /settings/auth/rotate' });
     }
     try {
       const token = generateToken();
       setToken(token);
+      res.setHeader('Set-Cookie', sessionCookieHeader(createSession(token), { secure: requestIsTls(req) }));
       res.json({ ok: true, token });
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message });
@@ -1197,15 +1252,17 @@ export function createApp(db, config = null, onSwap = null) {
   });
 
   // POST /settings/auth/rotate — replace the existing file-based token.
-  // Requires the current bearer (the auth middleware enforces it). 409
-  // when source is env, since file mutation is no-op while env wins.
-  app.post('/settings/auth/rotate', (_req, res) => {
+  // Requires the current bearer or a session (the auth middleware enforces
+  // it). Every session signed with the old token stops verifying. 409 when
+  // source is env, since file mutation is no-op while env wins.
+  app.post('/settings/auth/rotate', (req, res) => {
     if (getTokenSource() === 'env') {
       return res.status(409).json({ ok: false, error: 'token is set via RECORDER_TOKEN env; remove it before rotating via UI' });
     }
     try {
       const token = generateToken();
       setToken(token);
+      res.setHeader('Set-Cookie', sessionCookieHeader(createSession(token), { secure: requestIsTls(req) }));
       res.json({ ok: true, token });
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message });
@@ -1214,12 +1271,13 @@ export function createApp(db, config = null, onSwap = null) {
 
   // DELETE /settings/auth — clear the file-based token (auth disabled).
   // Same env-precedence guard as rotate.
-  app.delete('/settings/auth', (_req, res) => {
+  app.delete('/settings/auth', (req, res) => {
     if (getTokenSource() === 'env') {
       return res.status(409).json({ ok: false, error: 'token is set via RECORDER_TOKEN env; cannot clear via UI' });
     }
     try {
       clearStoredToken();
+      res.setHeader('Set-Cookie', sessionCookieHeader('', { secure: requestIsTls(req) }));
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message });

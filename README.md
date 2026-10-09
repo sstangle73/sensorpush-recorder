@@ -124,7 +124,14 @@ When the recorder is reachable from the public internet (e.g. via Cloudflare Tun
 4. Copy the token shown once (it's stored at `/data/recorder-token` server-side and never displayed again).
 5. Paste it into your client (e.g. the rosestorie dashboard's SensorPush settings).
 
-The token resolution order is `RECORDER_TOKEN` env var → `/data/recorder-token` file → no auth. Same-origin requests (the Explorer UI's own JS) bypass the bearer via `Sec-Fetch-Site: same-origin` so the UI Just Works without a token in browser-accessible JS. Cross-origin programmatic callers (the rosestorie dashboard, scripts, etc.) must include `Authorization: Bearer <token>`.
+The token resolution order is `RECORDER_TOKEN` env var → `/data/recorder-token` file → no auth. Once a token is set, every route except `/health`, `/metrics`, the UI page and its icons, manifest and service worker needs one of:
+
+- **`Authorization: Bearer <token>`**: for programmatic callers (the rosestorie dashboard, scripts, etc.).
+- **A browser session.** The Explorer UI shows a sign-in form; enter the token once and the browser gets a cookie that lasts 90 days. The cookie is `HttpOnly` (page scripts can't read it) and `SameSite=Strict`, and it's marked `Secure` when the request arrived over HTTPS, directly or through a proxy that sets `X-Forwarded-Proto: https`. It holds a random value and an expiry signed with the token, never the token itself. The browser that generates or rotates a token is signed in with the new one. **Settings → Security → Sign out of this browser** ends that browser's session; rotating the token ends every session at once.
+
+A password manager can save the token from the sign-in form like any password.
+
+Versions before 1.0.1 let any request carrying `Sec-Fetch-Site: same-origin` skip the token ([GHSA-j7mj-3739-5mg9](https://github.com/sstangle73/sensorpush-recorder/security/advisories/GHSA-j7mj-3739-5mg9)). Browsers set that header themselves, but any other client can send it too, so update if your recorder has a token and can be reached by someone you don't trust.
 
 **Config-as-code mode — env var:**
 
@@ -138,7 +145,7 @@ services:
 
 Env var wins over the file. Use this if you'd rather keep the secret out of the writable container filesystem (e.g. injected from Vault, Compose secret, etc.). To rotate when env-managed, edit compose and restart.
 
-To rotate a UI-managed token: Settings → Security → **Rotate token**. Existing clients fail until you paste the new value into them.
+To rotate a UI-managed token: Settings → Security → **Rotate token**. Existing clients fail until you paste the new value into them, and every other browser has to sign in again.
 
 ## API
 
@@ -172,6 +179,7 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | POST | `/settings/notifications/test` | one-off dispatch to webhook / ntfy / all (bypasses state machine) |
 | GET | `/settings/notifications/state` | per-condition firing state map |
 | GET / POST / DELETE | `/settings/auth` | recorder-token state, generate/rotate, clear file token |
+| GET / POST / DELETE | `/auth/session` | browser sign-in, open to all: whether a token is required and this browser is signed in; sign in with `{ "token": "…" }`; sign out |
 
 PWA assets: `/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/sw.js`, `/manifest.json`.
 

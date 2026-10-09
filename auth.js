@@ -18,10 +18,13 @@
 //
 // On every request the bearer middleware calls getToken(), so generation
 // + rotation + clear take effect without a restart.
+//
+// Browsers sign in once with the token and get a session cookie instead of
+// holding the token in page JS (see the session section at the bottom).
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 import { DB_PATH } from './config.js';
 
@@ -97,3 +100,73 @@ export function clearStoredToken() {
 }
 
 export const TOKEN_FILE_PATH = TOKEN_FILE;
+
+/**
+ * Constant-time check of a presented token against the active one. Both
+ * sides are hashed first, so timingSafeEqual always compares equal-length
+ * buffers and leaks neither the content nor the length.
+ */
+export function tokenMatches(candidate, token) {
+  if (typeof candidate !== 'string' || typeof token !== 'string' || !token) return false;
+  const a = createHash('sha256').update(candidate, 'utf8').digest();
+  const b = createHash('sha256').update(token, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+// ── Browser sessions ────────────────────────────────────────────────────
+// The Explorer UI signs in once with the token (POST /auth/session) and
+// gets this cookie back, so page JS never holds the token. HttpOnly keeps
+// it out of page JS, SameSite=Strict keeps other sites from sending it,
+// and server.js adds Secure when the request came over TLS.
+//
+// The value is `<expiry>.<nonce>.<mac>`: an expiry in epoch seconds, 16
+// random bytes, and an HMAC-SHA256 over both, keyed by the active token.
+// Nothing is stored server-side, so sessions survive restarts, and a
+// rotated (or changed env) token ends every session at once: the old MACs
+// stop verifying. Signing out clears one browser's cookie; rotating the
+// token is how to cut off every browser.
+
+export const SESSION_COOKIE = 'sp_session';
+export const SESSION_MAX_AGE_SECS = 90 * 24 * 60 * 60;
+
+function sessionMac(token, payload) {
+  return createHmac('sha256', token).update(`sp-session-v1.${payload}`).digest('base64url');
+}
+
+/** A new session value for `token`, valid for SESSION_MAX_AGE_SECS. */
+export function createSession(token, now = Date.now()) {
+  const exp = Math.floor(now / 1000) + SESSION_MAX_AGE_SECS;
+  const payload = `${exp}.${randomBytes(16).toString('base64url')}`;
+  return `${payload}.${sessionMac(token, payload)}`;
+}
+
+/** True when `value` was made by createSession(token) and hasn't expired. */
+export function verifySession(value, token, now = Date.now()) {
+  if (typeof value !== 'string' || typeof token !== 'string' || !token) return false;
+  const parts = value.split('.');
+  if (parts.length !== 3) return false;
+  const [expStr, nonce, mac] = parts;
+  if (!/^\d{1,12}$/.test(expStr) || !/^[A-Za-z0-9_-]{22}$/.test(nonce)) return false;
+  const exp = Number(expStr);
+  const nowSecs = Math.floor(now / 1000);
+  if (exp <= nowSecs || exp > nowSecs + SESSION_MAX_AGE_SECS) return false;
+  const want = Buffer.from(sessionMac(token, `${expStr}.${nonce}`));
+  const got = Buffer.from(mac);
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+/** The session cookie's value from a Cookie header, or null. */
+export function readSessionCookie(cookieHeader) {
+  if (typeof cookieHeader !== 'string') return null;
+  for (const part of cookieHeader.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === SESSION_COOKIE) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+/** Set-Cookie value carrying `value`; an empty value clears the cookie. */
+export function sessionCookieHeader(value, { secure = false } = {}) {
+  const maxAge = value ? SESSION_MAX_AGE_SECS : 0;
+  return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
+}

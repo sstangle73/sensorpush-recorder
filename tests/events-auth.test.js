@@ -91,4 +91,20 @@ describe('Events routes require bearer auth', () => {
     const { status } = await call('GET', '/events', { token: 'wrong-token' });
     expect(status).toBe(401);
   });
+
+  // GHSA-j7mj-3739-5mg9: a script can send Sec-Fetch-Site, so it isn't auth.
+  it('Sec-Fetch-Site: same-origin without bearer → 401', async () => {
+    const spoof = { 'Sec-Fetch-Site': 'same-origin', 'Content-Type': 'application/json' };
+    const post = await fetch(baseUrl + '/events', {
+      method: 'POST', headers: spoof, body: JSON.stringify({ ts: 2000, label: 'spoofed' }),
+    });
+    expect(post.status).toBe(401);
+    const get = await fetch(baseUrl + '/events', { headers: spoof });
+    expect(get.status).toBe(401);
+  });
+
+  it('a bearer of a different length → 401, not a throw', async () => {
+    const { status } = await call('GET', '/events', { token: TOKEN + 'x' });
+    expect(status).toBe(401);
+  });
 });
