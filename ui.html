@@ -1264,6 +1264,7 @@ header .spacer { flex: 1; }
   <form onsubmit="submitSignIn(event)" autocomplete="on">
     <h2>Sign in</h2>
     <p>This recorder has a token. Enter it once and this browser stays signed in for 90 days.</p>
+    <p id="signin-note" hidden></p>
     <input type="text" name="username" value="sensorpush-recorder" autocomplete="username" hidden>
     <input type="password" id="signin-token" class="set-text-input" autocomplete="current-password" placeholder="Recorder token" required>
     <div id="signin-error" role="alert"></div>
@@ -1362,16 +1363,75 @@ const API_BASE = window.location.pathname.startsWith('/sensorpush') ? '/api/sens
 // init() asks /auth/session first and shows the sign-in form instead of
 // loading; the fetch wrapper catches a session that expires or is cut off by
 // a rotation mid-use, from any of the call sites below.
+//
+// A dashboard that holds the token (RoseStorie) opens this page at
+// #handoff=<one-time code> instead. redeemHandoff() swaps the code for a
+// 12-hour session, kept in this tab's sessionStorage and sent as
+// `Authorization: Session …` on same-origin calls: the dashboard shows this
+// page in an iframe on its own site, where the sp_session cookie can't be set.
+const HANDOFF_KEY = 'sp_handoff_session';
+let _handoffSession = null;
+let _handoffNote = '';
+try { _handoffSession = sessionStorage.getItem(HANDOFF_KEY); } catch (_) {}
+
+function forgetHandoffSession() {
+  _handoffSession = null;
+  try { sessionStorage.removeItem(HANDOFF_KEY); } catch (_) {}
+}
+
+// `init` with the hand-off session added, unless it already says how to auth.
+function withSession(init = {}) {
+  if (!_handoffSession) return init;
+  const headers = new Headers(init.headers || {});
+  if (!headers.has('Authorization')) headers.set('Authorization', `Session ${_handoffSession}`);
+  return { ...init, headers };
+}
+
+async function redeemHandoff() {
+  const m = /^#(?:.*&)?handoff=([A-Za-z0-9_-]+)/.exec(location.hash);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  try {
+    const r = await _fetch(`${API_BASE}/auth/handoff/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: m[1] }),
+    });
+    const d = await r.json();
+    if (r.ok && d.session) {
+      _handoffSession = d.session;
+      try { sessionStorage.setItem(HANDOFF_KEY, d.session); } catch (_) {}
+      return;
+    }
+  } catch (_) {}
+  _handoffNote = 'The link from your dashboard has expired. Close this and open the Explorer from the dashboard again.';
+}
+
+// A frame already showing this page that's pointed at #handoff=… only jumps
+// to the fragment; reload so init() redeems it.
+window.addEventListener('hashchange', () => {
+  if (/^#(?:.*&)?handoff=/.test(location.hash)) location.reload();
+});
+
 const _fetch = window.fetch.bind(window);
-window.fetch = async (...args) => {
-  const r = await _fetch(...args);
-  if (r.status === 401 && new URL(r.url, location.href).origin === location.origin) showSignIn();
+window.fetch = async (input, init) => {
+  const plainUrl = typeof input === 'string' || input instanceof URL;
+  const sameOrigin = new URL(plainUrl ? String(input) : input.url, location.href).origin === location.origin;
+  const r = await _fetch(input, sameOrigin && plainUrl ? withSession(init) : init);
+  if (r.status === 401 && sameOrigin) showSignIn();
   return r;
 };
 
 function showSignIn() {
   const el = document.getElementById('signin');
   if (el.classList.contains('show')) return;
+  if (_handoffSession) {
+    forgetHandoffSession();
+    _handoffNote = 'Your sign-in from the dashboard has ended. Close this and open the Explorer from the dashboard again.';
+  }
+  const note = document.getElementById('signin-note');
+  note.textContent = _handoffNote;
+  note.hidden = !_handoffNote;
   el.classList.add('show');
   document.getElementById('poll-status').textContent = 'Signed out';
   document.getElementById('signin-token').focus();
@@ -1397,6 +1457,7 @@ async function submitSignIn(ev) {
 }
 
 async function signOut() {
+  forgetHandoffSession();
   try { await _fetch(`${API_BASE}/auth/session`, { method: 'DELETE' }); } catch (_) {}
   location.reload();
 }
@@ -1404,8 +1465,9 @@ async function signOut() {
 // Resolves true when the app can load: no token set, or this browser holds
 // a session. A failed check lets init() carry on and surface its own error.
 async function ensureSignedIn() {
+  await redeemHandoff();
   try {
-    const s = await _fetch(`${API_BASE}/auth/session`).then(r => r.json());
+    const s = await _fetch(`${API_BASE}/auth/session`, withSession()).then(r => r.json());
     if (s.authRequired && !s.authenticated) { showSignIn(); return false; }
   } catch (_) {}
   return true;

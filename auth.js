@@ -20,7 +20,8 @@
 // + rotation + clear take effect without a restart.
 //
 // Browsers sign in once with the token and get a session cookie instead of
-// holding the token in page JS (see the session section at the bottom).
+// holding the token in page JS, or arrive from a dashboard that holds the
+// token with a one-time hand-off code (see the two sections at the bottom).
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -133,9 +134,9 @@ function sessionMac(token, payload) {
   return createHmac('sha256', token).update(`sp-session-v1.${payload}`).digest('base64url');
 }
 
-/** A new session value for `token`, valid for SESSION_MAX_AGE_SECS. */
-export function createSession(token, now = Date.now()) {
-  const exp = Math.floor(now / 1000) + SESSION_MAX_AGE_SECS;
+/** A new session value for `token`, valid for `maxAgeSecs` (at most SESSION_MAX_AGE_SECS). */
+export function createSession(token, now = Date.now(), maxAgeSecs = SESSION_MAX_AGE_SECS) {
+  const exp = Math.floor(now / 1000) + Math.min(maxAgeSecs, SESSION_MAX_AGE_SECS);
   const payload = `${exp}.${randomBytes(16).toString('base64url')}`;
   return `${payload}.${sessionMac(token, payload)}`;
 }
@@ -169,4 +170,68 @@ export function readSessionCookie(cookieHeader) {
 export function sessionCookieHeader(value, { secure = false } = {}) {
   const maxAge = value ? SESSION_MAX_AGE_SECS : 0;
   return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`;
+}
+
+/** The session value from an `Authorization: Session <value>` header, or null. */
+export function readSessionHeader(authorization) {
+  const m = /^Session\s+(\S+)\s*$/i.exec(typeof authorization === 'string' ? authorization : '');
+  return m ? m[1] : null;
+}
+
+// ── Sign-in hand-off ────────────────────────────────────────────────────
+// A server that holds the token (RoseStorie's user-api) can open the Explorer
+// for someone signed in to it without ever showing them the token. It calls
+// POST /auth/handoff with the bearer and gets a one-time code, then opens the
+// page at `#handoff=<code>`; the page swaps the code for a session
+// (POST /auth/handoff/redeem). A fragment never reaches a server, so the code
+// stays out of access logs and Referer headers.
+//
+// A code is 32 random bytes, lives HANDOFF_TTL_SECS, works once, and only
+// while the token it was minted under is still the active one. Codes live in
+// this process's memory: a restart drops the outstanding ones, which costs a
+// re-open at most.
+//
+// The session comes back in the response body, not as a cookie, and the page
+// sends it as `Authorization: Session <value>`. RoseStorie shows the Explorer
+// in an iframe on its own site, and browsers refuse a SameSite=Strict cookie
+// set inside a cross-site iframe (Safari refuses any third-party cookie). The
+// page keeps it in sessionStorage, where its scripts can read it, so it lasts
+// HANDOFF_SESSION_MAX_AGE_SECS rather than the cookie's 90 days. A header
+// isn't sent by the browser on its own, so other sites can't ride on it.
+
+export const HANDOFF_TTL_SECS = 60;
+export const HANDOFF_SESSION_MAX_AGE_SECS = 12 * 60 * 60;
+const MAX_LIVE_HANDOFFS = 100;
+const _handoffs = new Map(); // sha256(code) hex → { exp: epoch ms, tokenHash: Buffer }
+
+function sha256(s) {
+  return createHash('sha256').update(s, 'utf8').digest();
+}
+
+/** A new one-time hand-off code, bound to `token`. */
+export function createHandoff(token, now = Date.now()) {
+  for (const [key, h] of _handoffs) if (h.exp <= now) _handoffs.delete(key);
+  while (_handoffs.size >= MAX_LIVE_HANDOFFS) _handoffs.delete(_handoffs.keys().next().value);
+  const code = randomBytes(32).toString('base64url');
+  _handoffs.set(sha256(code).toString('hex'), { exp: now + HANDOFF_TTL_SECS * 1000, tokenHash: sha256(token) });
+  return code;
+}
+
+/**
+ * True when `code` came from createHandoff under `token` and hasn't expired.
+ * Any code that's found is spent, whether or not it was still good.
+ */
+export function redeemHandoff(code, token, now = Date.now()) {
+  if (typeof code !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(code)) return false;
+  if (typeof token !== 'string' || !token) return false;
+  const key = sha256(code).toString('hex');
+  const h = _handoffs.get(key);
+  if (!h) return false;
+  _handoffs.delete(key);
+  return h.exp > now && timingSafeEqual(h.tokenHash, sha256(token));
+}
+
+/** Test hook: forget every outstanding code. */
+export function _resetHandoffs() {
+  _handoffs.clear();
 }
