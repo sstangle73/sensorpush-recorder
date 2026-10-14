@@ -26,12 +26,12 @@ vi.mock('../sensorpush.js', () => ({
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { createApp } from '../server.js';
 import { openDb, upsertSensors } from '../db.js';
-import { triggerPoll, getPollStatus, _resetPollerState } from '../poller.js';
+import { triggerPoll, getPollStatus, _resetPollerState, _pollTick } from '../poller.js';
 
 const CREDS = { sensorpush: { email: 'a@b.com', password: 'pw' } };
 
-async function withServer(db, fn) {
-  const server = http.createServer(createApp(db));
+async function withServer(db, fn, config) {
+  const server = http.createServer(createApp(db, config));
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   try { return await fn(base); }
@@ -191,10 +191,10 @@ describe('poll loop cannot pile up or fail silently', () => {
     await Promise.resolve();
     expect(getPollStatus().pollInFlight).toBe(true);
 
-    // A second attempt arriving mid-poll is dropped, not queued: without this
+    // An interval tick arriving mid-poll is dropped, not queued: without this
     // the 5-minute interval keeps launching polls that each add synchronous
     // insert+recompute bursts to an event loop already behind on disk.
-    await triggerPoll(db, CREDS);
+    await _pollTick(db, CREDS);
     expect(getPollStatus().pollSkipped).toBe(1);
     expect(fetchSensors).toHaveBeenCalledTimes(1);
 
@@ -213,7 +213,7 @@ describe('poll loop cannot pile up or fail silently', () => {
 
     const inFlight = triggerPoll(db, CREDS);
     await Promise.resolve();
-    await triggerPoll(db, CREDS);
+    await _pollTick(db, CREDS);
     expect(getPollStatus().pollSkipped).toBe(1);
 
     release();
@@ -236,5 +236,77 @@ describe('poll loop cannot pile up or fail silently', () => {
     await triggerPoll(db, {});
     expect(getPollStatus().lastPollError).toMatch(/no SensorPush credentials/);
     expect(fetchSensors).not.toHaveBeenCalled();
+  });
+});
+
+// A dashboard that forces a poll on its refresh timer (RoseStorie's sensors
+// pane, every 60 s, until 2026-10-14) must not multiply the poll loop's work.
+describe('forced polls coalesce', () => {
+  const SENSOR = { id: 's1', name: 'Test', type: 'HT1', active: true };
+
+  beforeEach(() => {
+    _resetPollerState();
+    vi.clearAllMocks();
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([SENSOR]);
+    fetchGateways.mockResolvedValue([]);
+    fetchSamples.mockResolvedValue([]);
+  });
+  afterEach(() => { _resetPollerState(); vi.useRealTimers(); });
+
+  it('waits for a running poll instead of starting another, without counting a skipped tick', async () => {
+    const db = openDb(':memory:');
+    let release;
+    const gate = new Promise(r => { release = r; });
+    fetchSensors.mockImplementation(async () => { await gate; return [SENSOR]; });
+
+    const running = _pollTick(db, CREDS);
+    let answered = false;
+    const forced = triggerPoll(db, CREDS).then(r => { answered = true; return r; });
+    await Promise.resolve();
+    expect(answered).toBe(false);
+    expect(getPollStatus().pollSkipped).toBe(0);
+
+    release();
+    await running;
+    expect(await forced).toEqual({ coalesced: true });
+    expect(fetchSensors).toHaveBeenCalledTimes(1);
+    expect(getPollStatus().lastPollTime).not.toBeNull();
+  });
+
+  it('answers a forced poll from one that finished under a minute ago, and polls again after', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const db = openDb(':memory:');
+
+    expect(await triggerPoll(db, CREDS)).toEqual({ coalesced: false });
+    vi.setSystemTime(Date.now() + 59_000);
+    expect(await triggerPoll(db, CREDS)).toEqual({ coalesced: true });
+    expect(fetchSensors).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(Date.now() + 2_000);
+    expect(await triggerPoll(db, CREDS)).toEqual({ coalesced: false });
+    expect(fetchSensors).toHaveBeenCalledTimes(2);
+  });
+
+  it('counts a failed poll too, so a failing cloud is not retried on every press', async () => {
+    const db = openDb(':memory:');
+    getToken.mockResolvedValue(null);
+
+    await expect(triggerPoll(db, CREDS)).rejects.toThrow('SensorPush auth failed');
+    expect(await triggerPoll(db, CREDS)).toEqual({ coalesced: true });
+    expect(getToken).toHaveBeenCalledTimes(1);
+    expect(getPollStatus().lastPollError).toMatch('SensorPush auth failed');
+  });
+
+  it('POST /poll says when the last poll answered it', async () => {
+    const db = openDb(':memory:');
+    await withServer(db, async (base) => {
+      const first  = await (await fetch(base + '/poll', { method: 'POST' })).json();
+      const second = await (await fetch(base + '/poll', { method: 'POST' })).json();
+      expect(first).toMatchObject({ ok: true, coalesced: false });
+      expect(first.lastPoll).toEqual(expect.any(String));
+      expect(second).toMatchObject({ ok: true, coalesced: true, lastPoll: first.lastPoll });
+    }, CREDS);
+    expect(fetchSensors).toHaveBeenCalledTimes(1);
   });
 });
