@@ -36,6 +36,11 @@ let _lastWeatherError    = null;
 // picks up whatever the skipped one would have fetched.
 let _pollInFlight  = false;
 let _pollSkipped   = 0;
+// The poll now running, so a forced poll can wait on it rather than start
+// another, and when the last poll finished, whatever its outcome. Both are
+// for triggerPoll's coalescing.
+let _pollRun            = null;
+let _lastPollFinishedAt = 0;
 // Last "nothing to do" reason we logged, so a persistent misconfiguration
 // reports once instead of every 5 minutes forever.
 let _lastIssueLogged = null;
@@ -68,16 +73,8 @@ export function startPoller(db, config, registerSwap = null) {
   // Failures here must not block sample polling — wrap in try/catch.
   try { mqttConnect(config?.mqtt || {}); } catch (err) { console.error('[poller] mqtt connect:', err.message); }
 
-  _guardedPoll(db, config).catch(err => {
-    _lastPollError = err.message;
-    console.error('[poller] error:', err.message);
-  });
-  setInterval(() => {
-    _guardedPoll(db, config).catch(err => {
-      _lastPollError = err.message;
-      console.error('[poller] error:', err.message);
-    });
-  }, 5 * 60 * 1000);
+  _pollTick(db, config);
+  setInterval(() => _pollTick(db, config), 5 * 60 * 1000);
 
   // Outdoor weather is a separate hourly loop. It only runs when
   // config.weather.{lat,lon} are configured — otherwise the table stays
@@ -176,11 +173,22 @@ export async function _pruneReadings(db) {
   if (deleted) console.log(`[poller] retention: pruned ${deleted} raw readings older than ${READINGS_RETENTION_DAYS}d`);
 }
 
+// One scheduled tick (startup and the 5-minute interval): a guarded poll whose
+// failure lands in lastPollError instead of escaping the timer. Exported for
+// tests, which need a tick the guard can drop.
+export function _pollTick(db, config) {
+  return _guardedPoll(db, config).catch(err => {
+    _lastPollError = err.message;
+    console.error('[poller] error:', err.message);
+  });
+}
+
 // Serialises poll attempts (scheduled, manual, and startup alike). A tick that
 // arrives while one is still running is dropped rather than queued — see the
 // _pollInFlight comment above. Exported state lets /health and /metrics show
 // how many ticks we've had to skip, which is the early warning that polls have
-// started outrunning their interval.
+// started outrunning their interval. Forced polls never reach the skip branch:
+// triggerPoll joins the running poll first.
 async function _guardedPoll(db, config) {
   if (_pollInFlight) {
     _pollSkipped++;
@@ -188,13 +196,16 @@ async function _guardedPoll(db, config) {
     return;
   }
   _pollInFlight = true;
+  _pollRun = _poll(db, config);
   try {
-    await _poll(db, config);
+    await _pollRun;
   } finally {
     // Any finished poll ends the streak, a failed one too: the count is about
     // polls outrunning their interval, not about whether they succeed.
-    _pollInFlight = false;
-    _pollSkipped  = 0;
+    _pollInFlight       = false;
+    _pollSkipped        = 0;
+    _pollRun            = null;
+    _lastPollFinishedAt = Date.now();
   }
 }
 
@@ -380,6 +391,8 @@ export function _resetPollerState() {
   _lastWeatherError    = null;
   _pollInFlight        = false;
   _pollSkipped         = 0;
+  _pollRun             = null;
+  _lastPollFinishedAt  = 0;
   _lastIssueLogged     = null;
 }
 
@@ -412,14 +425,37 @@ export function triggerWeatherPoll(db, config) {
   });
 }
 
-// Expose manual trigger so the dashboard refresh button can force an immediate poll.
-// Returns a promise that resolves when the poll completes.
-export function triggerPoll(db, config) {
-  return _guardedPoll(db, config).catch(err => {
+// A forced poll answered by the last one when that finished less than this
+// long ago. Not a setting: it only has to absorb repeats, see triggerPoll.
+const FORCED_POLL_MIN_GAP_MS = 60 * 1000;
+
+// Manual trigger (POST /poll) so a dashboard's refresh button can force an
+// immediate poll. Resolves to { coalesced } once there is a fresh poll to read.
+//
+// Forced polls coalesce. Until 2026-10-14 RoseStorie's sensors pane sent one
+// on its 60-second refresh timer, so a kiosk left on that pane made the
+// recorder run 1,440 full polls a day where the loop is built for 288: five
+// times the SensorPush traffic, and five times the synchronous insert and
+// recompute bursts behind the 2026 wedges (CLAUDE.md, Known issues). Now a
+// forced poll that arrives while a poll is running waits for that one, without
+// counting as a skipped tick (that gauge is about the interval falling
+// behind), and one that arrives within FORCED_POLL_MIN_GAP_MS of the last
+// poll finishing, failed or not, is answered by it.
+export async function triggerPoll(db, config) {
+  if (_pollRun) {
+    // The running poll's own caller reports a failure.
+    await _pollRun.catch(() => {});
+    return { coalesced: true };
+  }
+  if (Date.now() - _lastPollFinishedAt < FORCED_POLL_MIN_GAP_MS) return { coalesced: true };
+  try {
+    await _guardedPoll(db, config);
+  } catch (err) {
     _lastPollError = err.message;
     console.error('[poller] manual poll error:', err.message);
     throw err;
-  });
+  }
+  return { coalesced: false };
 }
 
 export function getBackfillStatus() {

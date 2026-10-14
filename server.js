@@ -1352,9 +1352,11 @@ export function createApp(db, config = null, onSwap = null) {
   app.post('/poll', async (_req, res) => {
     if (!config) return res.status(503).json({ ok: false, error: 'No config available' });
     try {
-      await triggerPoll(db, config);
+      // coalesced: answered by a poll already running or just finished, not a
+      // new fetch from the cloud.
+      const { coalesced } = await triggerPoll(db, config);
       const { lastPollTime } = getPollStatus();
-      res.json({ ok: true, lastPoll: lastPollTime ? new Date(lastPollTime).toISOString() : null });
+      res.json({ ok: true, lastPoll: lastPollTime ? new Date(lastPollTime).toISOString() : null, coalesced });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }

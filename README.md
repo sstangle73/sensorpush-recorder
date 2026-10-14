@@ -170,7 +170,7 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | GET | `/hvac?range=24h` | duty-cycle inference for thermostat-reference sensors (per-cycle list, heating/cooling runtime %, 7-day daily breakdown, short-cycle warnings) |
 | GET / POST / DELETE | `/sensor-pairs` | manage same-environment sensor pairs used by drift analysis |
 | GET | `/sensor-pairs/:id/drift?range=30d` | mean delta + linear-regression slope per day; `drifting` / `stable` / `unknown` |
-| POST | `/poll` | trigger immediate cloud poll |
+| POST | `/poll` | trigger immediate cloud poll; answered by the running or last poll instead (`coalesced: true`) when one is in progress or finished under 60 s ago |
 | POST | `/backfill` | start broad historical re-fetch from `{fromDate: 'YYYY-MM-DD'}` (UTC midnight) |
 | POST | `/backfill-gaps` | start targeted gap-only re-fetch over `{range}` |
 | GET | `/backfill/status` | poll backfill progress (shared by both backfill modes) |
