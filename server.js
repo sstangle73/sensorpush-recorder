@@ -110,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v24';
+const CACHE='sensorpush-v25';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -126,7 +126,9 @@ self.addEventListener('activate',e=>{
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const url=new URL(e.request.url);
-  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather|auth)\\b/))return;
+  // Data routes go to the network. Anything else is answered cache-first,
+  // so a data route missing here hands the page its previous answer.
+  if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather|auth|events|sensor-pairs)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
   // ignoreVary: '/' says Vary: Accept, and the copy stored at install asked
