@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
+import vm from 'node:vm';
 import { createApp, _renderMetrics } from '../server.js';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings } from '../db.js';
 import { vi } from 'vitest';
@@ -1107,6 +1108,55 @@ describe('icon + manifest + sw routes', () => {
     // '/' says Vary: Accept; without ignoreVary the copy cached at install
     // (Accept: text/html) never matches a navigation, so offline gets nothing.
     expect(text).toContain('caches.match(e.request,{ignoreVary:true})');
+  });
+});
+
+// Runs the served sw.js with stand-ins for a worker's globals and says whether
+// its fetch handler answers a GET itself. It answers cache-first, so the page
+// gets the previous response: right for the page and its icons, wrong for data.
+async function swAnswers(path, accept = '*/*') {
+  const swText = await (await fetch(baseUrl + '/sw.js')).text();
+  const listeners = {};
+  const self = {
+    addEventListener: (type, fn) => { listeners[type] = fn; },
+    skipWaiting() {},
+    registration: { scope: 'http://sp.test/' },
+    clients: { claim() {} },
+  };
+  const cache = { add: async () => {}, put: async () => {} };
+  const caches = { open: async () => cache, match: async () => undefined, keys: async () => [], delete: async () => true };
+  vm.runInNewContext(swText, { self, caches, fetch: async () => new Response(''), Request, Response, URL, Promise });
+  let answered = false;
+  listeners.fetch({
+    request: new Request('http://sp.test' + path, { headers: { Accept: accept } }),
+    respondWith: () => { answered = true; },
+  });
+  return answered;
+}
+
+describe('service worker routing', () => {
+  // Answered from the SW's cache, the Explorer's re-fetch after adding an
+  // event or a sensor pair got the list from before, so the new one didn't
+  // show until a later load (/events and /sensor-pairs, until 1.1.3).
+  it('leaves every API path the Explorer uses to the network', async () => {
+    const ui = await (await fetch(baseUrl + '/', { headers: { Accept: 'text/html' } })).text();
+    const segments = [...new Set([...ui.matchAll(/\$\{API_BASE\}\/([A-Za-z][\w-]*)/g)].map(m => m[1]))];
+    expect(segments).toEqual(expect.arrayContaining(['events', 'sensor-pairs', 'settings', 'weather']));
+    const paths = [
+      ...segments.map(s => '/' + s),
+      '/sensor-pairs/7/drift?range=30d',
+      '/s1/history?range=24h', '/s1/history/all?range=7d', '/s1/gaps?range=7d',
+    ];
+    const answered = [];
+    for (const p of paths) if (await swAnswers(p)) answered.push(p);
+    expect(answered).toEqual([]);
+  });
+
+  it('leaves the JSON at / to the network, and answers the page and its icons from its cache', async () => {
+    expect(await swAnswers('/', 'application/json')).toBe(false);
+    expect(await swAnswers('/', 'text/html,application/xhtml+xml')).toBe(true);
+    expect(await swAnswers('/icon-192.png')).toBe(true);
+    expect(await swAnswers('/manifest.json')).toBe(true);
   });
 });
 
