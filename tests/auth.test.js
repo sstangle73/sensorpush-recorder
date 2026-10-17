@@ -465,6 +465,21 @@ describe('Sign-in hand-off (/auth/handoff)', () => {
     expect((await api('GET', '/settings', { headers: asSession(createSession('a-different-token-entirely-0000')) })).status).toBe(401);
   });
 
+  // A framed Explorer fetches the sensor list from the URL its page loaded
+  // from. Stored, that JSON is what the frame showed after a history step or
+  // a restored tab, and a ↗ tap then only changed the fragment, so the dump
+  // stayed up (Steven, 2026-10-15). The gate's 401 is JSON at / too.
+  it('nothing the gate or GET / answers in JSON at / is stored', async () => {
+    const { body } = await redeem(await mint());
+    const json = { Accept: 'application/json' };
+    for (const [headers, status] of [[{ ...json, ...asSession(body.session) }, 200], [json, 401]]) {
+      const res = await fetch(baseUrl + '/', { headers });
+      expect(res.status).toBe(status);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('vary')).toMatch(/\bAccept\b(?!-)/);
+    }
+  });
+
   it('the header session works from a cross-site iframe, where a cookie cannot', async () => {
     const { body } = await redeem(await mint());
     const r = await api('GET', '/settings', { headers: { ...asSession(body.session), 'Sec-Fetch-Site': 'cross-site' } });

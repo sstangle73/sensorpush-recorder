@@ -78,6 +78,25 @@ describe('GET / (sensors list)', () => {
     expect(body.ok).toBe(true);
   });
 
+  // The page and the sensor list share one URL, so a browser keeps one cache
+  // entry for both. A step back in history, or a restored tab, shows that
+  // entry without asking the server; when the Explorer's own fetch had left
+  // the JSON there, the page came up as a raw JSON dump (RoseStorie's pop-out,
+  // 2026-10-15).
+  it('never lets the JSON at / be stored where the page load would find it', async () => {
+    const res = await fetch(baseUrl + '/', { headers: { Accept: 'application/json' } });
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('vary')).toMatch(/\bAccept\b(?!-)/);
+  });
+
+  it('tells caches that the page at / varies by Accept, and lets it be stored', async () => {
+    const res = await fetch(baseUrl + '/', {
+      headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+    });
+    expect(res.headers.get('vary')).toMatch(/\bAccept\b(?!-)/);
+    expect(res.headers.get('cache-control')).toBeNull();
+  });
+
   it('returns sensor data after upsert + readings', async () => {
     upsertSensors(db, [{ id: 'test1', name: 'Kitchen', type: 'HT1', active: true, batteryVoltage: 2.85 }]);
     const now = Math.floor(Date.now() / 1000);
@@ -1085,6 +1104,9 @@ describe('icon + manifest + sw routes', () => {
     expect(r.headers.get('content-type')).toContain('javascript');
     const text = await r.text();
     expect(text).toContain('addEventListener');
+    // '/' says Vary: Accept; without ignoreVary the copy cached at install
+    // (Accept: text/html) never matches a navigation, so offline gets nothing.
+    expect(text).toContain('caches.match(e.request,{ignoreVary:true})');
   });
 });
 
