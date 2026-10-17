@@ -150,7 +150,7 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 
 ## API
 
-`GET /` returns the sensor list as JSON when called with `Accept: application/json` (default for `fetch()`), and serves the Explorer UI when called with `Accept: text/html` (default for browser navigation). The dual response on the root URL is what lets `https://sensors.example.com` work as both an API endpoint and a UI.
+`GET /` returns the sensor list as JSON when the request's `Accept` header includes `application/json`, and serves the Explorer UI otherwise: a browser navigation, or a bare `fetch()`, which sends `*/*`. The dual response on the root URL is what lets `https://sensors.example.com` work as both an API endpoint and a UI. Both answers say `Vary: Accept`, and the JSON comes with `Cache-Control: no-store`, so a browser going back in history never shows the list in place of the page (fixed in 1.1.2).
 
 | Method | Path | Notes |
 |---|---|---|

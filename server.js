@@ -129,7 +129,10 @@ self.addEventListener('fetch',e=>{
   if(url.pathname.match(/\\/(history|gaps|poll|health|gateways|backfill|backups|settings|battery|hvac|weather|auth)\\b/))return;
   // Root path serves HTML for navigation but JSON for data fetches — let data fetches bypass SW
   if(url.pathname==='/'&&!(e.request.headers.get('Accept')||'').includes('text/html'))return;
-  e.respondWith(caches.match(e.request).then(cached=>{
+  // ignoreVary: '/' says Vary: Accept, and the copy stored at install asked
+  // for plain text/html, so it would never match a navigation's longer Accept.
+  // Only the page is ever stored for '/': data fetches return above.
+  e.respondWith(caches.match(e.request,{ignoreVary:true}).then(cached=>{
     const net=fetch(e.request).then(r=>{if(r.ok)caches.open(CACHE).then(c=>c.put(e.request,r.clone()));return r;}).catch(()=>null);
     return cached||net||new Response('Offline',{status:503});
   }));
@@ -179,6 +182,12 @@ const PUBLIC_PATHS = new Set([
   '/auth/session',
   '/auth/handoff/redeem',
 ]);
+
+// GET / answers JSON only to a caller that asks for it; anything else gets
+// the Explorer page (see the route).
+function wantsJson(req) {
+  return (req.headers.accept || '').includes('application/json');
+}
 
 // True when the request reached us over TLS, directly or through a proxy that
 // says so. It only decides the session cookie's Secure flag.
@@ -470,6 +479,23 @@ export function createApp(db, config = null, onSwap = null) {
     next();
   });
 
+  // The page and the sensor list share the URL /, so a browser keeps one
+  // cache entry for both, and the Explorer's own fetch of the list replaces
+  // the page there. A step back in history or a restored tab shows that entry
+  // without asking us, so the page came up as a raw JSON dump; in RoseStorie's
+  // pop-out a ↗ tap then only changed the fragment, and the dump stayed
+  // (2026-10-15). Vary: Accept says the two differ, and no-store keeps every
+  // JSON answer at / out of the cache, the gate's 401 included: this runs
+  // before the gate, and after the CORS block, whose Vary: Origin would
+  // overwrite it.
+  app.use((req, res, next) => {
+    if (req.path === '/') {
+      res.vary('Accept');
+      if (wantsJson(req)) res.setHeader('Cache-Control', 'no-store');
+    }
+    next();
+  });
+
   // Token gate. Only enforced when a token is configured (env or /data
   // file); then a request needs `Authorization: Bearer <token>`, a hand-off
   // session (`Authorization: Session …`) or a valid session cookie (see
@@ -486,7 +512,7 @@ export function createApp(db, config = null, onSwap = null) {
     const token = getToken();
     if (!token) return next();
     if (PUBLIC_PATHS.has(req.path)) return next();
-    if (req.path === '/' && !(req.headers.accept || '').includes('application/json')) return next();
+    if (req.path === '/' && !wantsJson(req)) return next();
     if (!authVia(req, token)) {
       res.status(401).json({ error: 'unauthorized' });
       return;
@@ -592,7 +618,7 @@ export function createApp(db, config = null, onSwap = null) {
   // of a raw JSON dump. The UI's own fetch() calls set Accept: application/json
   // so they continue to receive the sensor list.
   app.get('/', (req, res) => {
-    if (!(req.headers.accept || '').includes('application/json')) {
+    if (!wantsJson(req)) {
       return res.setHeader('Content-Type', 'text/html').send(UI_HTML);
     }
     const rows    = getSensors(db);
