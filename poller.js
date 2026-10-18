@@ -1,7 +1,7 @@
 import { backup } from 'node:sqlite';
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from './sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from './weather.js';
-import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs, pruneReadingsOlderThan } from './db.js';
+import { upsertSensors, insertReadings, recomputeHourlyAgg, getLatestTs, setLastPollTime, getLastPollTime, getGaps, upsertGateways, recordGatewayStatus, pruneGatewayStatus, pruneBatteryHistory, pruneNotificationLog, getUiSettings, getSensors, getGateways, insertOutdoorReadings, getLatestOutdoorTs, pruneReadingsOlderThan } from './db.js';
 import { connect as mqttConnect, publishReading, publishDiscovery, isConnected as mqttIsConnected } from './mqtt.js';
 import { runNotifications } from './notifications.js';
 
@@ -167,6 +167,8 @@ export async function _snapshotDb(db) {
 // aggregates are untouched — long-term history survives at hourly resolution.
 // Exported for tests.
 export async function _pruneReadings(db) {
+  pruneBatteryHistory(db);   // its own fixed 400-day window, independent of READINGS_RETENTION_DAYS
+  pruneNotificationLog(db);  // same 400 days
   if (!(READINGS_RETENTION_DAYS > 0)) return;
   const cutoff  = Math.floor(Date.now() / 1000) - READINGS_RETENTION_DAYS * 86400;
   const deleted = await pruneReadingsOlderThan(db, cutoff, { batchSize: 5000 });

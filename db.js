@@ -122,6 +122,21 @@ export function openDb(path) {
       pending_since      INTEGER
     );
 
+    -- Every fire/recover the notifier sent, with each sink's result as JSON
+    -- ({"ntfy":{"ok":true}}). notification_state only keeps the latest per
+    -- key; this is the history ("how often did the fridge alert this month?").
+    -- Pruned with battery_history's 400-day window.
+    CREATE TABLE IF NOT EXISTS notification_log (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts         INTEGER NOT NULL,
+      key        TEXT NOT NULL,
+      transition TEXT NOT NULL,
+      title      TEXT,
+      message    TEXT,
+      delivered  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_notification_log_ts ON notification_log(ts);
+
     -- Outdoor weather samples from Open-Meteo. Single-location series (we only
     -- track one lat/lon per recorder), so no location_id column. UNIQUE(ts)
     -- + INSERT OR IGNORE matches the readings table's de-dup semantics, so
@@ -131,6 +146,17 @@ export function openDb(path) {
       temp      REAL,
       humidity  REAL,
       dewpoint  REAL
+    );
+
+    -- Battery voltage per sensor, one row per sensor per hour. SensorPush's
+    -- /samples never carries battery voltage (readings.battery_voltage is
+    -- NULL in every row it writes); only /devices/sensors does, and the
+    -- sensors table keeps just the latest. The battery forecast reads this.
+    CREATE TABLE IF NOT EXISTS battery_history (
+      sensor_id TEXT NOT NULL,
+      hour_ts   INTEGER NOT NULL,
+      v         REAL NOT NULL,
+      PRIMARY KEY (sensor_id, hour_ts)
     );
   `);
   // Migrate existing DBs that predate the excluded columns.
@@ -184,6 +210,8 @@ export function upsertSensors(db, sensors) {
       address         = excluded.address,
       device_id       = excluded.device_id
   `);
+  // The hour's latest voltage wins, so a 5-minute poll cadence still stores 24 rows a day.
+  const batt = db.prepare(`INSERT OR REPLACE INTO battery_history (sensor_id, hour_ts, v) VALUES (?, ?, ?)`);
   const now = Math.floor(Date.now() / 1000);
   db.exec('BEGIN');
   try {
@@ -194,6 +222,9 @@ export function upsertSensors(db, sensors) {
         s.alerts ? JSON.stringify(s.alerts) : null,
         s.rssi ?? null, s.address ?? null, s.deviceId ?? null,
       );
+      if (Number.isFinite(s.batteryVoltage) && s.batteryVoltage > 0) {
+        batt.run(s.id, now - (now % 3600), s.batteryVoltage);
+      }
     }
     db.exec('COMMIT');
   } catch(e) {
@@ -475,12 +506,23 @@ export function getSensors(db) {
 // replacement date. Returns `[{ ts, v }]` sorted by ts.
 export function getBatteryHistory(db, sensorId, lookbackDays = 30) {
   const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
+  // battery_history is the real source (one row per poll hour, from
+  // /devices/sensors). readings.battery_voltage is kept in the UNION for
+  // samples that did carry a voltage (tests, other importers).
   return db.prepare(`
+    SELECT hour_ts AS ts, v FROM battery_history WHERE sensor_id = ? AND hour_ts >= ?
+    UNION ALL
     SELECT ts, battery_voltage AS v
     FROM readings
     WHERE sensor_id = ? AND ts >= ? AND battery_voltage IS NOT NULL
     ORDER BY ts
-  `).all(sensorId, since);
+  `).all(sensorId, since, sensorId, since);
+}
+
+// battery_history grows by 24 rows per sensor per day; keep 400 days.
+export function pruneBatteryHistory(db, olderThanSecs = 400 * 86400) {
+  const cutoff = Math.floor(Date.now() / 1000) - olderThanSecs;
+  db.prepare(`DELETE FROM battery_history WHERE hour_ts < ?`).run(cutoff);
 }
 
 // Fit a linear decline to daily-aggregated battery voltage and project the
@@ -755,12 +797,19 @@ export function getGaps(db, sensorId, range) {
     ? db.prepare(`SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM readings  WHERE sensor_id = ? AND excluded = 0 AND ts      >= ?`).get(sensorId, startTs)
     : db.prepare(`SELECT MIN(hour_ts) AS lo, MAX(hour_ts) AS hi FROM hourly_agg WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?`).get(sensorId, startTs);
 
+  // A sensor added partway through the window wasn't missing before its
+  // first reading ever: coverage is measured from then, not from startTs.
+  const first = db.prepare(`SELECT MIN(ts) AS t FROM readings WHERE sensor_id = ?`).get(sensorId)?.t;
+  const firstHour = db.prepare(`SELECT MIN(hour_ts) AS t FROM hourly_agg WHERE sensor_id = ?`).get(sensorId)?.t;
+  const firstEver = [first, firstHour].filter(v => v != null).reduce((a, b) => Math.min(a, b), Infinity);
+  const trackedFromTs = isFinite(firstEver) ? Math.max(startTs, firstEver) : startTs;
+
   if (bounds.lo == null) {
     // No readings at all in the window — one big gap covering everything.
-    gaps.push({ startTs, endTs: now, durationSecs: now - startTs });
+    gaps.push({ startTs: trackedFromTs, endTs: now, durationSecs: now - trackedFromTs });
   } else {
-    if (bounds.lo - startTs > gapThreshold) {
-      gaps.push({ startTs, endTs: bounds.lo, durationSecs: bounds.lo - startTs });
+    if (bounds.lo - trackedFromTs > gapThreshold) {
+      gaps.push({ startTs: trackedFromTs, endTs: bounds.lo, durationSecs: bounds.lo - trackedFromTs });
     }
     if (now - bounds.hi > gapThreshold) {
       gaps.push({ startTs: bounds.hi, endTs: now, durationSecs: now - bounds.hi });
@@ -769,10 +818,11 @@ export function getGaps(db, sensorId, range) {
   // Re-sort: leading/trailing additions may not have landed in duration order.
   gaps.sort((a, b) => b.durationSecs - a.durationSecs);
 
-  const gapSecs    = gaps.reduce((s, g) => s + g.durationSecs, 0);
-  const coveragePct = Math.max(0, Math.min(100, (rangeSeconds - gapSecs) / rangeSeconds * 100));
+  const gapSecs     = gaps.reduce((s, g) => s + g.durationSecs, 0);
+  const trackedSecs = Math.max(1, now - trackedFromTs);
+  const coveragePct = Math.max(0, Math.min(100, (trackedSecs - gapSecs) / trackedSecs * 100));
 
-  return { gaps, sparseHours, coveragePct, rangeStartTs: startTs, rangeEndTs: now };
+  return { gaps, sparseHours, coveragePct, rangeStartTs: startTs, rangeEndTs: now, trackedFromTs };
 }
 
 export function getUiSettings(db) {
@@ -943,6 +993,27 @@ export function setNotifState(db, key, { active, lastNotifiedAt, lastTransitionA
   );
 }
 
+export function logNotification(db, { ts, key, transition, title, message, delivered }) {
+  db.prepare(`
+    INSERT INTO notification_log (ts, key, transition, title, message, delivered)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(ts, key, transition, title ?? null, message ?? null, delivered ? JSON.stringify(delivered) : null);
+}
+
+// Newest first. `key` narrows to one condition:target (exact match).
+export function listNotificationLog(db, { limit = 100, key = null } = {}) {
+  const n = Math.max(1, Math.min(1000, Math.floor(limit) || 100));
+  const rows = key
+    ? db.prepare(`SELECT * FROM notification_log WHERE key = ? ORDER BY ts DESC, id DESC LIMIT ?`).all(key, n)
+    : db.prepare(`SELECT * FROM notification_log ORDER BY ts DESC, id DESC LIMIT ?`).all(n);
+  return rows.map(r => ({ ...r, delivered: r.delivered ? JSON.parse(r.delivered) : null }));
+}
+
+export function pruneNotificationLog(db, keepDays = 400) {
+  const cutoff = Math.floor(Date.now() / 1000) - keepDays * 86400;
+  return db.prepare(`DELETE FROM notification_log WHERE ts < ?`).run(cutoff).changes;
+}
+
 export function listNotifStates(db) {
   return db.prepare(`SELECT key, active, last_notified_at, last_transition_at, pending_since FROM notification_state`).all();
 }
@@ -952,19 +1023,31 @@ export function listNotifStates(db) {
 // reading — mirrors the UI's loadLiveBaselines() but reads aggregate rows
 // already in the local DB. Returns null when the bucket has < 5 hours of
 // data (not enough to estimate variance).
+// Dew point (°F) from air temperature (°F) and RH (%), Magnus form with
+// the Alduchov-Eskridge constants. Matches the UI's dewPointF().
+export function dewPointF(tF, rh) {
+  if (tF == null || rh == null || !(rh > 0)) return null;
+  const tc = (tF - 32) * 5 / 9;
+  const g  = Math.log(Math.min(rh, 100) / 100) + 17.625 * tc / (243.04 + tc);
+  return (243.04 * g / (17.625 - g)) * 9 / 5 + 32;
+}
+
 export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {
   const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
   const rows = db.prepare(`
-    SELECT temp_avg AS t, hum_avg AS h
+    SELECT temp_avg AS t, hum_avg AS h, dewpoint_avg AS d
     FROM hourly_agg
     WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?
       AND ((hour_ts / 3600) % 24) = ?
   `).all(sensorId, since, hourOfDay);
   let tSum = 0, tSum2 = 0, tN = 0;
   let hSum = 0, hSum2 = 0, hN = 0;
+  let dSum = 0, dSum2 = 0, dN = 0;
   for (const r of rows) {
     if (r.t != null) { tSum += r.t; tSum2 += r.t * r.t; tN++; }
     if (r.h != null) { hSum += r.h; hSum2 += r.h * r.h; hN++; }
+    const d = r.d ?? dewPointF(r.t, r.h);
+    if (d != null) { dSum += d; dSum2 += d * d; dN++; }
   }
   const sd = (sum, sum2, n) => {
     if (n < 2) return null;
@@ -976,7 +1059,9 @@ export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {
     tempSd:   sd(tSum, tSum2, tN),
     humMean:  hN > 0 ? hSum / hN : null,
     humSd:    sd(hSum, hSum2, hN),
-    nT: tN, nH: hN,
+    dewMean:  dN > 0 ? dSum / dN : null,
+    dewSd:    sd(dSum, dSum2, dN),
+    nT: tN, nH: hN, nD: dN,
   };
 }
 
