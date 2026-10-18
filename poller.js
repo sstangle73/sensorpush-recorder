@@ -352,6 +352,7 @@ async function _runNotifications(db) {
     sensors:     sensorRows,
     gateways:    gatewayRows,
     notifConfig,
+    groupRules:  settings?.groups?.rules,
     nowMs:       Date.now(),
   });
 }

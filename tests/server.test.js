@@ -1716,3 +1716,96 @@ describe('GET /metrics (Prometheus exposition)', () => {
     expect(body.endsWith('\n')).toBe(true);
   });
 });
+
+describe('sensor groups and metered HVAC (1.3)', () => {
+  let gDb, gSrv, gUrl;
+  beforeAll(async () => {
+    gDb = openDb(':memory:');
+    await new Promise(r => {
+      gSrv = http.createServer(createApp(gDb));
+      gSrv.listen(0, '127.0.0.1', () => { gUrl = `http://127.0.0.1:${gSrv.address().port}`; r(); });
+    });
+    upsertSensors(gDb, [
+      { id: 'living',   name: 'Living Room',     type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'attic',    name: 'Attic',           type: 'HT1', active: true, batteryVoltage: null },
+      { id: 'backpack', name: 'Steven Backpack', type: 'HT1', active: true, batteryVoltage: null },
+    ]);
+    const now = Math.floor(Date.now() / 1000);
+    for (const id of ['living', 'attic', 'backpack']) {
+      const samples = [];
+      for (let i = 0; i <= 36; i++) {
+        const t = now - 3 * 3600 + i * 600;
+        samples.push({ observed: new Date(t * 1000).toISOString(), temperature: 68 + (i / 36) * 3, humidity: 45, barometric_pressure: null, battery_voltage: null });
+      }
+      insertReadings(gDb, id, samples);
+    }
+  });
+  afterAll(() => new Promise(r => gSrv.close(r)));
+
+  const put = body => fetch(gUrl + '/settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ranges: ['24h'], ...body }),
+  });
+  const hvac = () => fetch(gUrl + '/hvac?range=24h').then(r => r.json());
+
+  it('stores group rules and returns them from GET /settings', async () => {
+    const rules = [{ match: 'glacier|cooler', group: 'mobile' }, { match: 'attic|bedroom', group: 'house', subgroup: 'Second floor' }];
+    expect((await put({ groups: { rules } })).status).toBe(200);
+    const s = await fetch(gUrl + '/settings').then(r => r.json());
+    expect(s.settings.groups).toEqual({ rules });
+  });
+
+  it('leaves group rules alone when a client sends no groups key', async () => {
+    await put({ groups: { rules: [{ match: 'x', group: 'other' }] } });
+    await put({ hvac: { shortCycleMinutes: 5 } });
+    const s = await fetch(gUrl + '/settings').then(r => r.json());
+    expect(s.settings.groups.rules).toEqual([{ match: 'x', group: 'other' }]);
+  });
+
+  it.each([
+    ['a non-array rules', { rules: 'x' }],
+    ['an unknown group', { rules: [{ match: 'x', group: 'garden' }] }],
+    ['a regex that does not compile', { rules: [{ match: '(', group: 'house' }] }],
+    ['an empty match', { rules: [{ match: '', group: 'house' }] }],
+    ['an unknown rule key', { rules: [{ match: 'x', group: 'house', colour: 'red' }] }],
+    ['an unknown top-level key', { rules: [], extra: 1 }],
+  ])('rejects %s', async (_label, groups) => {
+    const r = await put({ groups });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toMatch(/groups/);
+  });
+
+  it('rejects a malformed hvac.meteredGroups', async () => {
+    expect((await put({ hvac: { meteredGroups: 'attic' } })).status).toBe(400);
+    expect((await put({ hvac: { meteredGroups: [3] } })).status).toBe(400);
+  });
+
+  it('never auto-selects or analyses a mobile sensor, even when flagged', async () => {
+    await put({ groups: { rules: [] }, hvac: { sensors: { backpack: { thermostat: true }, living: { thermostat: true } } } });
+    const body = await hvac();
+    expect(body.referenceIds).toEqual(['living']);
+    expect(Object.keys(body.heatingZones)).toEqual(['Living Room']);
+  });
+
+  it('drops a room marked as metered elsewhere and says so', async () => {
+    await put({ hvac: { meteredGroups: ['Attic'], sensors: { attic: { thermostat: true }, living: { thermostat: true } } } });
+    const body = await hvac();
+    expect(body.referenceIds).toEqual(['living']);
+    expect(body.metered.sensorIds).toEqual(['attic']);
+  });
+
+  it('drops a metered heating zone but keeps the same sensors\' cooling zone', async () => {
+    await put({ hvac: { meteredGroups: ['steam'], sensors: { living: { thermostat: true, zone: 'Steam', coolingZone: 'Window AC' } } } });
+    const body = await hvac();
+    expect(body.heatingZones).toEqual({});
+    expect(Object.keys(body.coolingZones)).toEqual(['Window AC']);
+    expect(body.metered.zones).toEqual(['Steam']);
+  });
+
+  it('a user rule moves a sensor out of the outdoor gate and the auto-default', async () => {
+    // "Living Room" as a mobile sensor leaves only the attic to auto-select.
+    await put({ groups: { rules: [{ match: 'living', group: 'mobile' }] }, hvac: {} });
+    const body = await hvac();
+    expect(body.autoDefaultId).toBe('attic');
+  });
+});

@@ -803,6 +803,32 @@ describe('runNotifications', () => {
     expect(r.find(x => x.kind === 'anomaly')?.transition).toBe('fire');
   });
 
+  it('skips anomaly for a mobile sensor, by the default rules and by a user rule', async () => {
+    fetch.mockResolvedValue(jsonResp({}, 200));
+    const db  = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    seedFlatBaseline(db, 'bp', 70, 50);
+    seedFlatBaseline(db, 'gl', 70, 50);
+    const cfg = {
+      enabled: true, webhook: { enabled: true, url: 'https://x' },
+      conditions: { anomaly: { enabled: true, sigma: 3, dwellSecs: 0 } },
+    };
+    const sensors = [
+      { id: 'bp', name: 'Steven Backpack', temperature: 95, humidity: 50, alerts: null, lastTs: now },
+      { id: 'gl', name: 'Ecoflow Glacier', temperature: 95, humidity: 50, alerts: null, lastTs: now },
+    ];
+    const r = await runNotifications(db, {
+      sensors, gateways: [], notifConfig: cfg,
+      groupRules: [{ match: 'glacier', group: 'mobile' }],
+    });
+    expect(r.filter(x => x.kind === 'anomaly')).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+
+    // Without the user rule the cooler is "other" and fires as before.
+    const r2 = await runNotifications(db, { sensors, gateways: [], notifConfig: cfg });
+    expect(r2.filter(x => x.kind === 'anomaly').map(x => x.sensorId)).toEqual(['gl']);
+  });
+
   it('threshold dwell-gates: a transient excursion never fires; a sustained one fires after the dwell', async () => {
     fetch.mockResolvedValue(jsonResp({}, 200));
     const db  = makeDb();

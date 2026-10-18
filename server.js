@@ -12,6 +12,7 @@ import { getToken, getTokenSource, setToken, clearStoredToken, generateToken, to
 import { detectCycles, pickDefaultThermostatSensor, combineZoneSeries } from './hvac.js';
 import { validateNotifConfig, dispatchWebhook, dispatchNtfy } from './notifications.js';
 import { listBackups, isRestorableName, restoreBackup } from './backups.js';
+import { classifySensor, validGroupsConfig, isMetered } from './groups.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
@@ -110,7 +111,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v26';
+const CACHE='sensorpush-v27';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -311,6 +312,10 @@ function _validHvacConfig(c) {
           }
         }
       }
+    } else if (k === 'meteredGroups') {
+      const v = c.meteredGroups;
+      if (v == null) continue;
+      if (!Array.isArray(v) || v.length > 100 || !v.every(x => typeof x === 'string' && x.length <= 80)) return false;
     } else if (k === 'shortCycleMinutes' || k === 'slopeThresholdF' || k === 'outdoorMarginF') {
       const v = c[k];
       if (v == null) continue;
@@ -322,10 +327,6 @@ function _validHvacConfig(c) {
   return true;
 }
 
-// Server-side mirror of ui.html's classifySensor (top-level group only),
-// kept in sync with the keyword set there. Used to scope the auto-default
-// thermostat reference to indoor sensors only. If you tweak the keyword
-// lists in ui.html, update them here too.
 // Compute (epochMs - "wall clock as if it were UTC") for a given IANA tz at a
 // given instant — i.e. the tz's offset in seconds, with DST applied. Returns
 // 0 for an unknown tz so callers degrade to UTC behavior rather than
@@ -361,15 +362,9 @@ function _localDateStr(epochSecs, tz) {
   }
 }
 
-function _classifySensorGroup(name) {
-  const n = name || '';
-  if (/\b(fridge|refrig\w*|freezer|cabinet|rack|server|cooler|glacier|wine|incubator|pantry)\b/i.test(n))
-    return 'appliance';
-  if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
-    return 'outside';
-  if (/\b(attic|bedroom|bedrm|bath|nursery|loft|master|kids?|living|kitchen|dining|family|foyer|den|study|office|main|hallway|entry|mudroom|basement|cellar|crawl)\b/i.test(n))
-    return 'house';
-  return 'other';
+// Top-level group of a sensor (groups.js), with the user's rules applied.
+function _classifySensorGroup(name, settings) {
+  return classifySensor(name, settings).group;
 }
 
 // Escape a Prometheus label value per the text exposition spec: backslash,
@@ -875,8 +870,19 @@ export function createApp(db, config = null, onSwap = null) {
     const slopeThresholdF = hvacCfg.slopeThresholdF   != null ? hvacCfg.slopeThresholdF   : 0.5;
     const outdoorMarginF  = hvacCfg.outdoorMarginF    != null ? hvacCfg.outdoorMarginF    : 2.0;
     const flagged         = hvacCfg.sensors || {};
+    const metered         = hvacCfg.meteredGroups || [];
 
-    const sensorRows = db.prepare('SELECT id, name FROM sensors').all();
+    // Mobile sensors never stand for a room, and a group whose equipment the
+    // user meters elsewhere is left to that meter (settings.hvac.meteredGroups).
+    const allSensorRows = db.prepare('SELECT id, name FROM sensors').all();
+    const groupOf = s => classifySensor(s.name, settings);
+    const meteredSensorIds = [];
+    const sensorRows = allSensorRows.filter(s => {
+      const g = groupOf(s);
+      if (g.group === 'mobile') return false;
+      if (isMetered(metered, g.group, g.subgroup)) { meteredSensorIds.push(s.id); return false; }
+      return true;
+    });
     const explicit   = sensorRows.filter(s => flagged[s.id]?.thermostat === true).map(s => s.id);
 
     // Outdoor samples (when available) gate cycle classification: a heating
@@ -892,8 +898,8 @@ export function createApp(db, config = null, onSwap = null) {
     // window so a single dataset covers every detectCycles call below.
     const outdoorLookbackSecs = Math.max(rangeSecs, 7 * 86400);
     const since = Math.floor(Date.now() / 1000) - outdoorLookbackSecs;
-    const outsideIds = sensorRows
-      .filter(s => _classifySensorGroup(s.name) === 'outside')
+    const outsideIds = allSensorRows
+      .filter(s => _classifySensorGroup(s.name, settings) === 'outside')
       .map(s => s.id);
     let outdoorSamples = [];
     let outdoorSource  = null;
@@ -932,7 +938,7 @@ export function createApp(db, config = null, onSwap = null) {
       const since24h = Math.floor(Date.now() / 1000) - 86400;
       const stableInputs = sensorRows.map(s => ({
         id:      s.id,
-        group:   _classifySensorGroup(s.name),
+        group:   _classifySensorGroup(s.name, settings),
         samples: db.prepare(
           'SELECT ts, temperature FROM readings WHERE sensor_id = ? AND ts >= ? AND excluded = 0 ORDER BY ts'
         ).all(s.id, since24h),
@@ -957,9 +963,14 @@ export function createApp(db, config = null, onSwap = null) {
       const cfg   = flagged[id] || {};
       const hZone = (cfg.zone        || '').toString().trim() || sensor.name;
       const cZone = (cfg.coolingZone || '').toString().trim() || sensor.name;
-      (heatingZoneMap[hZone] ||= []).push(sensor);
-      (coolingZoneMap[cZone] ||= []).push(sensor);
+      if (!isMetered(metered, hZone)) (heatingZoneMap[hZone] ||= []).push(sensor);
+      if (!isMetered(metered, cZone)) (coolingZoneMap[cZone] ||= []).push(sensor);
     }
+    const meteredZones = [...new Set(referenceIds.flatMap(id => {
+      const cfg = flagged[id] || {}, name = sensorById[id]?.name;
+      return [(cfg.zone || '').toString().trim() || name, (cfg.coolingZone || '').toString().trim() || name]
+        .filter(z => isMetered(metered, z));
+    }))].sort();
 
     // Daily buckets must align with the *user's* local calendar day, not the
     // server's UTC day — otherwise a user east of UTC sees "today's" data
@@ -1029,6 +1040,7 @@ export function createApp(db, config = null, onSwap = null) {
       outdoorSource,
       heatingZones,
       coolingZones,
+      metered: { sensorIds: meteredSensorIds, zones: meteredZones },
     });
   });
 
@@ -1153,7 +1165,7 @@ export function createApp(db, config = null, onSwap = null) {
   });
 
   app.put('/settings', (req, res) => {
-    const { ranges, comfort, driftThresholds, hvac, notifications } = req.body ?? {};
+    const { ranges, comfort, driftThresholds, hvac, notifications, groups } = req.body ?? {};
     if (!Array.isArray(ranges) || !ranges.every(r => /^\d+(h|d|yr)$/.test(r))) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: ranges' });
     }
@@ -1169,6 +1181,9 @@ export function createApp(db, config = null, onSwap = null) {
     if (notifications !== undefined && !validateNotifConfig(notifications)) {
       return res.status(400).json({ ok: false, error: 'Invalid settings: notifications' });
     }
+    if (groups !== undefined && !validGroupsConfig(groups)) {
+      return res.status(400).json({ ok: false, error: 'Invalid settings: groups' });
+    }
     // Merge with whatever else is in the meta blob (future fields stay untouched
     // even when the client only sends ranges, and vice versa).
     const existing = getUiSettings(db) || {};
@@ -1177,6 +1192,7 @@ export function createApp(db, config = null, onSwap = null) {
     if (driftThresholds !== undefined) payload.driftThresholds = driftThresholds;
     if (hvac            !== undefined) payload.hvac            = hvac;
     if (notifications   !== undefined) payload.notifications   = notifications;
+    if (groups          !== undefined) payload.groups          = groups;
     setUiSettings(db, payload);
     res.json({ ok: true });
   });
