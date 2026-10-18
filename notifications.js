@@ -24,13 +24,14 @@
 // fires on the next transition, not the current static state).
 
 import fetch from 'node-fetch';
-import { getNotifState, setNotifState, getHourlyBaseline } from './db.js';
+import { getNotifState, setNotifState, getHourlyBaseline, dewPointF, logNotification } from './db.js';
 
 // Same floors the Live tab uses — at very stable baselines a ±2σ trip would
 // fire on natural minute-to-minute jitter, so we floor σ at a value bigger
 // than typical short-term noise for each metric.
 export const ANOMALY_TEMP_SD_FLOOR = 0.4;
 export const ANOMALY_HUM_SD_FLOOR  = 1.0;
+export const ANOMALY_DEW_SD_FLOOR  = 0.5;
 
 // Anomaly trip is |deviation| >= sigma * sd. 2σ flags ~5% of normal samples,
 // which is far too noisy across 10 sensors × 2 metrics × 12 polls/hour; 3σ
@@ -191,6 +192,11 @@ export async function evaluateAndNotify(db, key, isActive, buildEvent, notifConf
     ...event,
   };
   const dispatched = await dispatchAll(payload, notifConfig);
+  try {
+    logNotification(db, { ts: nowSecs, key, transition, title: event.title, message: event.message, delivered: dispatched });
+  } catch (e) {
+    console.error(`[notifications] log write failed for ${key}: ${e.message}`);
+  }
   // pendingSince omitted → setNotifState clears it: a fired or recovered
   // condition is no longer "pending".
   setNotifState(db, key, {
@@ -247,7 +253,18 @@ export function evaluateAnomaly(db, sensor, { nowMs = Date.now(), sigma = DEFAUL
       out.push(`T ${sensor.temperature.toFixed(1)}°F unusually ${dir} for ${hour}:00 (baseline ${b.tempMean.toFixed(1)}°F ±${b.tempSd.toFixed(1)}, n=${b.nT})`);
     }
   }
-  if (sensor.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
+  // Moisture is judged on dew point: RH moves with temperature alone, so a
+  // season change or a heating cycle swung it past the band with no change
+  // in the water in the air. RH stays the fallback while no dew baseline exists.
+  const dew = sensor.dewpoint ?? dewPointF(sensor.temperature, sensor.humidity);
+  if (dew != null && b.dewMean != null && b.dewSd != null && b.nD >= 5) {
+    const sd  = Math.max(b.dewSd, ANOMALY_DEW_SD_FLOOR);
+    const dev = dew - b.dewMean;
+    if (Math.abs(dev) >= sigma * sd) {
+      const dir = dev > 0 ? 'humid' : 'dry';
+      out.push(`Dew point ${dew.toFixed(1)}°F unusually ${dir} for ${hour}:00 (baseline ${b.dewMean.toFixed(1)}°F ±${b.dewSd.toFixed(1)}, n=${b.nD})`);
+    }
+  } else if (sensor.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
     const sd  = Math.max(b.humSd, ANOMALY_HUM_SD_FLOOR);
     const dev = sensor.humidity - b.humMean;
     if (Math.abs(dev) >= sigma * sd) {

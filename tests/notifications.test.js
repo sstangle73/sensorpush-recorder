@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('node-fetch', () => ({ default: vi.fn() }));
 import fetch from 'node-fetch';
 
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getNotifState } from '../db.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getNotifState, listNotificationLog } from '../db.js';
 import {
   dispatchWebhook, dispatchNtfy, dispatchAll,
   decideTransition, evaluateAndNotify,
@@ -446,9 +446,54 @@ describe('evaluateAnomaly', () => {
     // dev = 1.0°F is inside the default 3σ band (1.2°F) → no trip.
     expect(evaluateAnomaly(db, { id: 'def', temperature: 71, humidity: 50 })).toEqual([]);
   });
+
+  it('judges humidity on dew point: warming at constant moisture is not "dry"', () => {
+    const db = makeDb();
+    const hourOfDay = new Date().getHours();
+    seedBaseline(db, 'dp', hourOfDay, 70, 50);   // dew ≈ 50.5°F
+    // 76°F at 40.4% RH holds the same water (dew ≈ 50.5°F). RH alone is 10
+    // points under its baseline and used to fire "dry".
+    const r = evaluateAnomaly(db, { id: 'dp', temperature: 76, humidity: 40.4 });
+    expect(r.some(s => /warm/.test(s))).toBe(true);
+    expect(r.some(s => /humid|dry/.test(s))).toBe(false);
+  });
+
+  it('flags a real moisture change as a dew-point anomaly', () => {
+    const db = makeDb();
+    const hourOfDay = new Date().getHours();
+    seedBaseline(db, 'dq', hourOfDay, 70, 50);
+    const r = evaluateAnomaly(db, { id: 'dq', temperature: 70, humidity: 65 });
+    expect(r.some(s => /^Dew point .* unusually humid/.test(s))).toBe(true);
+  });
 });
 
 // ── dwell-time gating ────────────────────────────────────────────────────────
+
+describe('notification log', () => {
+  const build = t => ({ title: t === 'fire' ? 'Fridge warm' : 'Fridge ok', message: 'T 44°F', detail: {} });
+
+  it('records each fire and recover with each sink result, newest first', async () => {
+    fetch.mockResolvedValueOnce(jsonResp({}, 200)).mockResolvedValueOnce(jsonResp({}, 500));
+    const db  = makeDb();
+    const cfg = { enabled: true, ntfy: { enabled: true, url: 'https://ntfy.example/t' } };
+    await evaluateAndNotify(db, 'threshold:f1', true,  build, cfg, { nowMs: 1_000_000_000 });
+    await evaluateAndNotify(db, 'threshold:f1', true,  build, cfg, { nowMs: 1_000_300_000 }); // skip: not logged
+    await evaluateAndNotify(db, 'threshold:f1', false, build, cfg, { nowMs: 1_000_600_000 });
+    const log = listNotificationLog(db);
+    expect(log.map(e => e.transition)).toEqual(['recover', 'fire']);
+    expect(log[1]).toMatchObject({ key: 'threshold:f1', title: 'Fridge warm', ts: 1_000_000, delivered: { ntfy: { ok: true } } });
+    expect(log[0].delivered.ntfy.ok).toBe(false);
+  });
+
+  it('filters by key and caps the limit', async () => {
+    const db = makeDb();
+    for (let i = 0; i < 3; i++) {
+      await evaluateAndNotify(db, `sensor-offline:s${i}`, true, build, { enabled: true }, { nowMs: (1_000_000 + i) * 1000 });
+    }
+    expect(listNotificationLog(db, { key: 'sensor-offline:s1' })).toHaveLength(1);
+    expect(listNotificationLog(db, { limit: 2 })).toHaveLength(2);
+  });
+});
 
 describe('evaluateAndNotify dwell gating', () => {
   const cfg   = { enabled: true, webhook: { enabled: true, url: 'https://x' } };

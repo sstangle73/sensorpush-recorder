@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
-import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, getOldestReadingTs, getOutdoorHistory, getLatestOutdoorReading } from './db.js';
+import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, listNotificationLog, getOldestReadingTs, getOutdoorHistory, getLatestOutdoorReading } from './db.js';
 import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
 import { loadConfig, DB_PATH, PORT } from './config.js';
@@ -110,7 +110,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v25';
+const CACHE='sensorpush-v26';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -235,11 +235,19 @@ function _validRange(r) {
   }
   return true;
 }
+// A comfort entry: temp / hum / dew ranges ({lo, hi}, °F or %RH or °F dew
+// point) and surfaceF, the temperature of the coldest surface the room's air
+// touches (a crawl space, a stone wall). The mold panel judges RH on that
+// surface when it is set.
 function _validComfortEntry(e) {
   if (e == null) return true;
   if (typeof e !== 'object' || Array.isArray(e)) return false;
   for (const k of Object.keys(e)) {
-    if (k !== 'temp' && k !== 'hum') return false;
+    if (k === 'surfaceF') {
+      if (e[k] != null && (typeof e[k] !== 'number' || !isFinite(e[k]) || e[k] < -40 || e[k] > 120)) return false;
+      continue;
+    }
+    if (k !== 'temp' && k !== 'hum' && k !== 'dew') return false;
     if (!_validRange(e[k])) return false;
   }
   return true;
@@ -355,7 +363,7 @@ function _localDateStr(epochSecs, tz) {
 
 function _classifySensorGroup(name) {
   const n = name || '';
-  if (/\b(fridge|refrig|freezer|cabinet|rack|server|cooler|wine|incubator|pantry)\b/i.test(n))
+  if (/\b(fridge|refrig\w*|freezer|cabinet|rack|server|cooler|glacier|wine|incubator|pantry)\b/i.test(n))
     return 'appliance';
   if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
     return 'outside';
@@ -1221,6 +1229,14 @@ export function createApp(db, config = null, onSwap = null) {
   // hatch and we don't want a stray click clearing the firing-flags map).
   app.get('/settings/notifications/state', (_req, res) => {
     res.json({ ok: true, states: listNotifStates(db) });
+  });
+
+  // GET /settings/notifications/log?limit=100&key=threshold:abc — every
+  // fire/recover sent, newest first, with each sink's delivery result.
+  app.get('/settings/notifications/log', (req, res) => {
+    const limit = Number(req.query.limit) || 100;
+    const key   = typeof req.query.key === 'string' && req.query.key ? req.query.key : null;
+    res.json({ ok: true, entries: listNotificationLog(db, { limit, key }) });
   });
 
   // ── Browser sign-in (session cookie) ────────────────────────────────────

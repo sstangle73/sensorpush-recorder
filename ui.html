@@ -1072,12 +1072,12 @@ header .spacer { flex: 1; }
     <p class="set-hint" style="margin-bottom:10px">Sets the temperature/humidity range counted as "in comfort" on the Stats tab. Sensors inherit their group's defaults; per-sensor entries override the group. Blank = no comfort metric.</p>
     <div class="set-subheader">Group defaults</div>
     <table class="comfort-table"><thead>
-      <tr><th>Group</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th></tr>
+      <tr><th>Group</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th><th>Dew min °F</th><th>Dew max °F</th></tr>
     </thead><tbody id="comfort-groups-body"></tbody></table>
     <div class="set-subheader">Per-sensor overrides</div>
-    <p class="set-hint" style="margin:-2px 0 6px">Blank = use group default. Useful for fridges, freezers, wine cellars, etc.</p>
+    <p class="set-hint" style="margin:-2px 0 6px">Blank = use group default. Useful for fridges, freezers, wine cellars, etc. <b>Cold surface °F</b> is the temperature of the coldest surface the room's air reaches (a crawl space, a stone wall, a slab): the Mold panel then judges relative humidity on that surface, where mold actually grows, instead of in the air.</p>
     <table class="comfort-table"><thead>
-      <tr><th>Sensor</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th></tr>
+      <tr><th>Sensor</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th><th>Dew min °F</th><th>Dew max °F</th><th>Cold surface °F</th></tr>
     </thead><tbody id="comfort-sensors-body"></tbody></table>
     <div style="display:flex;gap:8px;margin-top:12px">
       <button class="set-btn" onclick="saveComfortPresets()">Save</button>
@@ -1184,7 +1184,7 @@ header .spacer { flex: 1; }
         <input type="checkbox" id="notif-cond-anomaly"> Anomaly
         <span style="color:var(--text3);font-size:11px">— deviates &gt;</span>
         <input type="number" id="notif-cond-anomaly-sigma" min="1" max="6" step="0.5" value="3" style="width:54px" class="set-text-input">
-        <span style="color:var(--text3);font-size:11px">σ from 14-day hour-of-day baseline, sustained for</span>
+        <span style="color:var(--text3);font-size:11px">σ from 14-day hour-of-day baseline (humidity judged as dew point), sustained for</span>
         <input type="number" id="notif-cond-anomaly-dwell-mins" min="0" step="5" value="30" style="width:60px" class="set-text-input">
         <span style="color:var(--text3);font-size:11px">min</span>
       </label>
@@ -1208,6 +1208,9 @@ header .spacer { flex: 1; }
       <button class="set-btn" onclick="saveNotifications()">Save</button>
       <span id="notif-save-status" style="font-size:12px;color:var(--text2)"></span>
     </div>
+
+    <h3 style="font-size:13px;margin:16px 0 6px">Recent notifications</h3>
+    <div id="notif-log" style="font-size:12px;color:var(--text2)">Loading…</div>
   </div>
 
   <div class="set-section">
@@ -1323,6 +1326,34 @@ function heatIndex(tF, rh) {
     hi += ((rh - 85) / 10) * ((87 - tF) / 5);
   }
   return hi;
+}
+
+// ── Psychrometrics ──────────────────────────────────────────────────────────
+// Relative humidity can't be compared across rooms at different temperatures,
+// or against outdoors: 60% RH at 55°F holds far less water than 50% at 75°F.
+// Dew point and humidity ratio (grains of water per pound of dry air) can.
+// Magnus with the Alduchov-Eskridge coefficients; sea-level pressure, as
+// dehumidifiers display grains.
+function _satVaporHpa(tF) {
+  const tc = (tF - 32) / 1.8;
+  return 6.1094 * Math.exp(17.625 * tc / (243.04 + tc));
+}
+function dewPointF(tF, rh) {
+  if (tF == null || rh == null || !(rh > 0)) return null;
+  const tc = (tF - 32) / 1.8;
+  const g  = Math.log(Math.min(rh, 100) / 100) + 17.625 * tc / (243.04 + tc);
+  return 243.04 * g / (17.625 - g) * 1.8 + 32;
+}
+function grainsPerLb(dewF) {
+  if (dewF == null || !isFinite(dewF)) return null;
+  const pw = _satVaporHpa(dewF);
+  return 4353.6 * pw / (1013.25 - pw);
+}
+// RH the air would have against a surface at surfaceF: what mold on a cold
+// wall or crawl space responds to (≥80% sustained), and ≥100% is condensation.
+function surfaceRh(dewF, surfaceF) {
+  if (dewF == null || surfaceF == null) return null;
+  return 100 * _satVaporHpa(dewF) / _satVaporHpa(surfaceF);
 }
 
 // Color-code RSSI: ≥-70 strong (green), -70..-85 fair (warn), <-85 weak (excl).
@@ -1542,6 +1573,7 @@ const OUTDOOR_COLOR    = '#9aa0a6';
 // window is at least ±0.8°F, and at 1.0 %RH similarly.
 const ANOMALY_TEMP_SD_FLOOR = 0.4;
 const ANOMALY_HUM_SD_FLOOR  = 1.0;
+const ANOMALY_DEW_SD_FLOOR  = 0.5;
 
 // ── Analytics ─────────────────────────────────────────────────────────────
 
@@ -1891,12 +1923,14 @@ async function loadLiveBaselines() {
     if (!d?.ok) return;
     // Accumulators per hour: sum, sum², count for T and H separately.
     const acc = {};
-    for (let h = 0; h < 24; h++) acc[h] = { sumT: 0, sumT2: 0, sumH: 0, sumH2: 0, nT: 0, nH: 0 };
+    for (let h = 0; h < 24; h++) acc[h] = { sumT: 0, sumT2: 0, sumH: 0, sumH2: 0, sumD: 0, sumD2: 0, nT: 0, nH: 0, nD: 0 };
     for (const s of (d.samples || [])) {
       const hour = new Date(s.ts * 1000).getHours();
       const a = acc[hour];
       if (s.temperature != null) { a.sumT += s.temperature; a.sumT2 += s.temperature * s.temperature; a.nT++; }
       if (s.humidity    != null) { a.sumH += s.humidity;    a.sumH2 += s.humidity    * s.humidity;    a.nH++; }
+      const dew = s.dewpoint ?? dewPointF(s.temperature, s.humidity);
+      if (dew           != null) { a.sumD += dew;           a.sumD2 += dew           * dew;           a.nD++; }
     }
     const stats = {};
     for (let h = 0; h < 24; h++) {
@@ -1904,12 +1938,15 @@ async function loadLiveBaselines() {
       // Bessel-corrected sample variance; guard against floating-point negatives.
       const tVar = a.nT > 1 ? Math.max(0, (a.sumT2 - a.sumT * a.sumT / a.nT) / (a.nT - 1)) : null;
       const hVar = a.nH > 1 ? Math.max(0, (a.sumH2 - a.sumH * a.sumH / a.nH) / (a.nH - 1)) : null;
+      const dVar = a.nD > 1 ? Math.max(0, (a.sumD2 - a.sumD * a.sumD / a.nD) / (a.nD - 1)) : null;
       stats[h] = {
         tempMean: a.nT > 0 ? a.sumT / a.nT : null,
         tempSd:   tVar != null ? Math.sqrt(tVar) : null,
         humMean:  a.nH > 0 ? a.sumH / a.nH : null,
         humSd:    hVar != null ? Math.sqrt(hVar) : null,
-        nT: a.nT, nH: a.nH,
+        dewMean:  a.nD > 0 ? a.sumD / a.nD : null,
+        dewSd:    dVar != null ? Math.sqrt(dVar) : null,
+        nT: a.nT, nH: a.nH, nD: a.nD,
       };
     }
     _liveBaselines[ids[i]] = stats;
@@ -1947,7 +1984,20 @@ function anomaliesForSensor(s, seenCls) {
       });
     }
   }
-  if (s.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
+  // Moisture on dew point, as the notifier does (RH moves with temperature alone).
+  const dew = s.dewpoint ?? dewPointF(s.temperature, s.humidity);
+  if (dew != null && b.dewMean != null && b.dewSd != null && b.nD >= 5) {
+    const sd  = Math.max(b.dewSd, ANOMALY_DEW_SD_FLOOR);
+    const dev = dew - b.dewMean;
+    if (Math.abs(dev) >= sigma * sd) {
+      const sign = dev > 0 ? 'humid' : 'dry';
+      notes.push({
+        kind:  'hum',
+        short: `Unusually ${sign}`,
+        label: `Dew point ${dev > 0 ? 'higher' : 'lower'} than typical ${hourStr}: now ${dew.toFixed(1)}°F vs typical ${b.dewMean.toFixed(1)}°F (σ ${b.dewSd.toFixed(1)}, n=${b.nD})`,
+      });
+    }
+  } else if (s.humidity != null && b.humMean != null && b.humSd != null && b.nH >= 5) {
     const sd  = Math.max(b.humSd, ANOMALY_HUM_SD_FLOOR);
     const dev = s.humidity - b.humMean;
     if (Math.abs(dev) >= sigma * sd) {
@@ -2010,7 +2060,7 @@ const RT_GROUPS = [
 // Fridge" sensor lands under Appliances, not Outside.
 function classifySensor(name) {
   const n = name || '';
-  if (/\b(fridge|refrig|freezer|cabinet|rack|server|cooler|wine|incubator|pantry)\b/i.test(n))
+  if (/\b(fridge|refrig\w*|freezer|cabinet|rack|server|cooler|glacier|wine|incubator|pantry)\b/i.test(n))
     return { group: 'appliance', subgroup: null };
   if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
     return { group: 'outside', subgroup: null };
@@ -2267,7 +2317,7 @@ const DEFAULT_COMFORT = {
 // leaves the other null.
 function resolveComfort(sensorId) {
   const sensor = _sensors[sensorId];
-  if (!sensor) return { temp: null, hum: null };
+  if (!sensor) return { temp: null, hum: null, dew: null, surfaceF: null };
   const groupKey   = classifySensor(sensor.name).group;
   const c          = _settings.comfort || DEFAULT_COMFORT;
   const grpDefault = c.groups?.[groupKey] || null;
@@ -2275,6 +2325,8 @@ function resolveComfort(sensorId) {
   return {
     temp: override?.temp ?? grpDefault?.temp ?? null,
     hum:  override?.hum  ?? grpDefault?.hum  ?? null,
+    dew:  override?.dew  ?? grpDefault?.dew  ?? null,
+    surfaceF: override?.surfaceF ?? grpDefault?.surfaceF ?? null,
   };
 }
 
@@ -2408,12 +2460,15 @@ function _alertPct(samples, alerts) {
 function computeSensorStats(samples, comfort) {
   const tempVals  = samples.map(s => s.temperature).filter(v => v != null);
   const humVals   = samples.map(s => s.humidity).filter(v => v != null);
+  const dewVals   = samples.map(s => s.dewpoint ?? dewPointF(s.temperature, s.humidity)).filter(v => v != null);
   const tempRange = _extremeRange(samples, 'temperature', 'tempMin', 'tempMax');
   const humRange  = _extremeRange(samples, 'humidity',    'humMin',  'humMax');
   // Comfort %: only meaningful when bounds are configured for this sensor.
   // _inRangePct treats null lo/hi as ±Infinity, so we gate at the call site.
   const tempC = comfort?.temp;
   const humC  = comfort?.hum;
+  const dewC  = comfort?.dew;
+  const inDew = dewC ? dewVals.filter(v => v >= (dewC.lo ?? -Infinity) && v <= (dewC.hi ?? Infinity)).length : 0;
   return {
     sampleCount:    samples.length,
     tempAvg:        _mean(tempVals),
@@ -2430,6 +2485,8 @@ function computeSensorStats(samples, comfort) {
     humDailySwing:  _dailySwing(samples, 'humidity', 'humMin', 'humMax'),
     humComfortPct:  humC ? _inRangePct(samples, 'humidity', humC.lo ?? -Infinity, humC.hi ?? Infinity) : null,
     humSlope:       _slopePerDay(samples, 'humidity'),
+    dewAvg:         _mean(dewVals),
+    dewComfortPct:  dewC && dewVals.length ? inDew / dewVals.length : null,
   };
 }
 
@@ -2700,85 +2757,70 @@ function renderStatsHighlights(all, valid) {
   return `<div class="an-section"><h2>Highlights (${_statsRange})</h2>${blocks.join('')}</div>`;
 }
 
+// Indoor vs outdoor over the Stats range, by floor, in absolute humidity.
+// RH is not compared: a warm room at 50% can hold more water than cold
+// outdoor air at 80%. "Wetter than outdoors" means people, cooking and
+// showers are adding moisture faster than air exchange removes it; only
+// then does ventilating dry the room.
+function indoorOutdoorRows(all) {
+  const outside = all.filter(x => x.group.group === 'outside' && x.stats.dewAvg != null);
+  if (!outside.length) return null;
+  const outDew  = _mean(outside.map(x => x.stats.dewAvg));
+  const outTemp = _mean(outside.filter(x => x.stats.tempAvg != null).map(x => x.stats.tempAvg));
+  const rows = [];
+  for (const sg of RT_GROUPS[0].subgroups) {
+    const members = all.filter(x => x.group.group === 'house' && x.group.subgroup === sg.key && x.stats.dewAvg != null);
+    if (!members.length) continue;
+    const dew  = _mean(members.map(x => x.stats.dewAvg));
+    const temp = _mean(members.filter(x => x.stats.tempAvg != null).map(x => x.stats.tempAvg));
+    rows.push({ key: sg.key, label: sg.label, n: members.length, temp, dew,
+                grains: grainsPerLb(dew), dGrains: grainsPerLb(dew) - grainsPerLb(outDew) });
+  }
+  return { rows, outTemp, outDew, outGrains: grainsPerLb(outDew) };
+}
+
 function renderIndoorOutdoor(all) {
-  const outside = all.filter(x => x.group.group === 'outside' && x.stats.tempAvg != null);
-  const house   = all.filter(x => x.group.group === 'house'   && x.stats.tempAvg != null);
-  if (!outside.length || !house.length) return '';
-
-  const outAvg = _mean(outside.map(x => x.stats.tempAvg));
-  const inAvg  = _mean(house.map(x   => x.stats.tempAvg));
-  const delta  = inAvg - outAvg;
-  const outSwing = _mean(outside.filter(x => x.stats.tempDailySwing != null).map(x => x.stats.tempDailySwing));
-  const inSwing  = _mean(house.filter(x   => x.stats.tempDailySwing != null).map(x => x.stats.tempDailySwing));
-
-  // Humidity delta where both sides have it
-  const outHum = outside.filter(x => x.stats.humAvg != null);
-  const inHum  = house.filter(x   => x.stats.humAvg != null);
-  let humLine = '';
-  if (outHum.length && inHum.length) {
-    const oH = _mean(outHum.map(x => x.stats.humAvg));
-    const iH = _mean(inHum.map(x  => x.stats.humAvg));
-    const dH = iH - oH;
-    const arrowH = dH > 1 ? '↑' : dH < -1 ? '↓' : '≈';
-    const cls = dH > 1 ? 'stats-up' : dH < -1 ? 'stats-down' : 'stats-flat';
-    humLine = `<div class="stats-io-line">
-      <span class="rt-dim">Humidity:</span>
-      <b>${Math.round(iH)}% RH</b> <span class="${cls}">${arrowH} ${Math.abs(dH).toFixed(0)}%</span>
-      <span class="rt-dim">vs outdoor</span> <b>${Math.round(oH)}% RH</b>
-    </div>`;
-  }
-
-  // Swing dampening — how much do interior walls/insulation smooth diurnal swings.
-  let dampLine = '';
-  if (outSwing && inSwing && outSwing > 0) {
-    const ratio = inSwing / outSwing;
-    const pct   = Math.round(ratio * 100);
-    const summary = pct < 50 ? 'well-insulated'
-                  : pct < 80 ? 'moderately insulated'
-                  : 'poorly insulated';
-    dampLine = `<div class="stats-io-line">
-      <span class="rt-dim">Daily swing:</span>
-      <b>${inSwing.toFixed(1)}°F</b> indoor vs <b>${outSwing.toFixed(1)}°F</b> outdoor —
-      house dampens to <b>${pct}%</b> <span class="rt-dim">(${summary})</span>
-    </div>`;
-  }
-
-  const arrow = delta > 0 ? '↑' : delta < 0 ? '↓' : '=';
-  const cls   = delta > 0 ? 'stats-up' : delta < 0 ? 'stats-down' : 'stats-flat';
-
+  const io = indoorOutdoorRows(all);
+  if (!io || !io.rows.length) return '';
+  const word = d => d > 2 ? '▲ wetter' : d < -2 ? '▼ drier' : '≈ same';
+  const cls  = d => d > 2 ? 'stats-up' : d < -2 ? 'stats-down' : 'stats-flat';
+  const rows = io.rows.map(r => `<tr>
+      <td>${esc(r.label)}${r.n > 1 ? ` <span class="rt-dim">(${r.n})</span>` : ''}</td>
+      <td>${fmtNum(r.temp)}°F</td>
+      <td>${fmtNum(r.dew)}°F</td>
+      <td><b>${fmtNum(r.grains)}</b></td>
+      <td class="${cls(r.dGrains)}">${word(r.dGrains)} ${r.dGrains >= 0 ? '+' : '−'}${Math.abs(r.dGrains).toFixed(1)}</td>
+    </tr>`).join('');
   return `<div class="an-section"><h2>Indoor vs Outdoor (${_statsRange})</h2>
-    <div style="display:flex;flex-direction:column;gap:6px">
-      <div class="stats-io-line">
-        <span class="rt-dim">Temperature:</span>
-        <b>${inAvg.toFixed(1)}°F</b> <span class="${cls}">${arrow} ${Math.abs(delta).toFixed(1)}°F</span>
-        <span class="rt-dim">vs outdoor</span> <b>${outAvg.toFixed(1)}°F</b>
-      </div>
-      ${humLine}
-      ${dampLine}
-    </div>
+    <div class="stats-table-wrap"><table class="an-table">
+      <thead><tr><th>Floor</th><th>Temp</th><th>Dew point</th><th>gr/lb</th><th>vs outdoors</th></tr></thead>
+      <tbody>${rows}
+        <tr><td>Outdoors</td><td>${fmtNum(io.outTemp)}°F</td><td>${fmtNum(io.outDew)}°F</td><td><b>${fmtNum(io.outGrains)}</b></td><td></td></tr>
+      </tbody>
+    </table></div>
+    <div class="stats-footnote">Averages over the range. Moisture is compared as dew point and humidity ratio (grains of water per pound of dry air, at sea-level pressure), not relative humidity, which changes with temperature alone. "Wetter" (more than 2 gr/lb above outdoors) means the rooms are adding moisture faster than air exchange removes it; opening up dries them only then.</div>
   </div>`;
 }
 
-// Today's indoor-vs-outdoor delta against Open-Meteo. Distinct from
-// renderIndoorOutdoor (which compares house sensors to *outside* sensors) —
-// this one uses the externally-fetched outdoor reading so it works even when
-// you don't have an outdoor SensorPush. Renders nothing when weather isn't
-// configured or no reading has come in yet.
+// Today's indoor-vs-outdoor delta against Open-Meteo: the House sensors' current
+// readings (not the range average) against the latest outdoor reading.
+// Renders nothing when weather isn't configured or no reading has come in yet.
 function renderOutdoorWeatherDelta(all) {
   if (!_outdoorConfigured || !_outdoorLatest) return '';
-  const house = all.filter(x => x.group.group === 'house' && x.stats.tempAvg != null);
+  const house = all.filter(x => x.group.group === 'house' && x.sensor.temperature != null);
   if (!house.length) return '';
-
-  const indoorMean = {
-    temp:     _mean(house.map(x => x.stats.tempAvg)),
-    humidity: _mean(house.filter(x => x.stats.humAvg != null).map(x => x.stats.humAvg)),
+  const dews = house.map(x => dewPointF(x.sensor.temperature, x.sensor.humidity)).filter(v => v != null);
+  const indoorNow = {
+    temp:     _mean(house.map(x => x.sensor.temperature)),
+    humidity: _mean(house.filter(x => x.sensor.humidity != null).map(x => x.sensor.humidity)),
+    dewpoint: dews.length ? _mean(dews) : null,
   };
   const outdoor = {
     temp:     _outdoorLatest.temp,
     humidity: _outdoorLatest.humidity,
     dewpoint: _outdoorLatest.dewpoint,
   };
-  const d = computeOutdoorDelta(indoorMean, outdoor);
+  const d = computeOutdoorDelta(indoorNow, outdoor);
   if (!d) return '';
 
   const lines = [];
@@ -2792,17 +2834,17 @@ function renderOutdoorWeatherDelta(all) {
       <span class="rt-dim">vs outdoor</span> <b>${d.temp.outdoor.toFixed(1)}°F</b>
     </div>`);
   }
-  if (d.hum) {
-    const arrow = d.hum.delta > 1 ? '↑' : d.hum.delta < -1 ? '↓' : '≈';
-    const cls   = d.hum.delta > 1 ? 'stats-up' : d.hum.delta < -1 ? 'stats-down' : 'stats-flat';
+  if (d.grains) {
+    const g = d.grains.delta;
+    const cls = g > 2 ? 'stats-up' : g < -2 ? 'stats-down' : 'stats-flat';
+    const word = g > 2 ? '▲ wetter' : g < -2 ? '▼ drier' : '≈ same';
     lines.push(`<div class="stats-io-line">
-      <span class="rt-dim">Humidity:</span>
-      <b>${Math.round(d.hum.indoor)}% RH</b>
-      <span class="${cls}">${arrow} ${Math.abs(d.hum.delta).toFixed(0)}%</span>
-      <span class="rt-dim">vs outdoor</span> <b>${Math.round(d.hum.outdoor)}% RH</b>
+      <span class="rt-dim">Moisture:</span>
+      <b>${d.grains.indoor.toFixed(1)} gr/lb</b> <span class="rt-dim">(dew ${d.dewpoint.indoor.toFixed(1)}°F)</span>
+      <span class="${cls}">${word} ${Math.abs(g).toFixed(1)} gr/lb</span>
+      <span class="rt-dim">vs outdoor</span> <b>${d.grains.outdoor.toFixed(1)} gr/lb</b> <span class="rt-dim">(dew ${d.dewpoint.outdoor.toFixed(1)}°F)</span>
     </div>`);
-  }
-  if (d.dewpoint) {
+  } else if (d.dewpoint) {
     lines.push(`<div class="stats-io-line">
       <span class="rt-dim">Outdoor dew point:</span> <b>${d.dewpoint.outdoor.toFixed(1)}°F</b>
     </div>`);
@@ -2810,11 +2852,11 @@ function renderOutdoorWeatherDelta(all) {
 
   const age = Math.round((Date.now() - _outdoorLatest.ts * 1000) / 60000);
   const ageLabel = age < 60 ? `${age} min ago` : age < 24*60 ? `${Math.round(age/60)} hr ago` : `${Math.round(age/60/24)} d ago`;
-  return `<div class="an-section"><h2>Indoor vs Outdoor (Open-Meteo · current)</h2>
+  return `<div class="an-section"><h2>Indoor vs Outdoor (Open-Meteo · now)</h2>
     <div style="display:flex;flex-direction:column;gap:6px">
       ${lines.join('')}
     </div>
-    <div class="stats-footnote">Outdoor reading fetched ${ageLabel}. Indoor figure is the average across House-zone sensors.</div>
+    <div class="stats-footnote">Outdoor reading fetched ${ageLabel}. Indoor is the current average of the House sensors; moisture is compared as humidity ratio, since relative humidity changes with temperature alone.</div>
   </div>`;
 }
 
@@ -2846,11 +2888,11 @@ function renderStatsTable(all, kind) {
 
   const headers = isTemp
     ? `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>Swing/day</th><th>In comfort</th>${showAlert ? '<th>In alert</th>' : ''}<th>Trend</th></tr>`
-    : `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>In comfort</th>${showAlert ? '<th>In alert</th>' : ''}</tr>`;
+    : `<tr><th>Sensor</th><th>Avg RH</th><th>Min–Max</th><th>σ</th><th>Dew point</th><th>gr/lb</th><th>RH in comfort</th><th>Dew in comfort</th>${showAlert ? '<th>In alert</th>' : ''}</tr>`;
 
   // Insert group rows between sensor rows so the user can see classification
   // boundaries without a separate legend.
-  const colCount = (isTemp ? 7 : 5) + (showAlert ? 1 : 0);
+  const colCount = (isTemp ? 7 : 8) + (showAlert ? 1 : 0);
   let lastGroup = null, lastSub = null, isFirst = true;
   const rows = sorted.map(x => {
     const s = x.stats;
@@ -2880,6 +2922,7 @@ function renderStatsTable(all, kind) {
     // sensor (via group default or per-sensor override) — otherwise "—".
     const tempComfortCell = x.comfort?.temp ? fmtPct(s.tempComfortPct) : '—';
     const humComfortCell  = x.comfort?.hum  ? fmtPct(s.humComfortPct)  : '—';
+    const dewComfortCell  = x.comfort?.dew  ? fmtPct(s.dewComfortPct)  : '—';
 
     if (isTemp) {
       const slope = s.tempSlope;
@@ -2901,14 +2944,17 @@ function renderStatsTable(all, kind) {
       <td>${s.humAvg != null ? Math.round(s.humAvg) + '%' : '—'}</td>
       <td>${s.humMin != null ? `${Math.round(s.humMin)}–${Math.round(s.humMax)}%` : '—'}</td>
       <td>${fmtNum(s.humStddev, 2)}</td>
+      <td>${s.dewAvg != null ? fmtNum(s.dewAvg) + '°F' : '—'}</td>
+      <td>${s.dewAvg != null ? fmtNum(grainsPerLb(s.dewAvg)) : '—'}</td>
       <td>${humComfortCell}</td>
+      <td>${dewComfortCell}</td>
       ${alertCell}
     </tr>`;
   }).join('');
 
   const footnote = isTemp
     ? `<div class="stats-footnote">Comfort range is configured per group (and optionally overridden per sensor) in Settings → Comfort Presets. σ = standard deviation. Trend = linear regression slope per day.</div>`
-    : `<div class="stats-footnote">Comfort range is configured per group (and optionally overridden per sensor) in Settings → Comfort Presets.</div>`;
+    : `<div class="stats-footnote">Comfort ranges are set per group (and optionally per sensor) in Settings → Comfort Presets. Relative humidity rises and falls with temperature alone, so compare rooms, and indoors with outdoors, by dew point or gr/lb (grains of water per pound of dry air): a dew-point range is the better comfort measure.</div>`;
 
   return `<div class="an-section"><h2>${title}</h2>
     <div class="stats-table-wrap"><table class="an-table"><thead>${headers}</thead><tbody>${rows}</tbody></table></div>
@@ -3556,31 +3602,48 @@ function _longestRunSecs(samples, pred) {
 // "Low" is dropped from the section entirely so the page doesn't sprout
 // noise for the dry rooms. Pairing each tier with a distinct glyph keeps
 // the levels readable when the color cue is lost (grayscale, CB users).
-function moldRisk(samples) {
-  const validHum    = samples.filter(s => s.humidity != null);
-  const validSpread = samples.filter(s => s.temperature != null && s.dewpoint != null);
+//
+// With `surfaceF` (a room's coldest surface, from Comfort Presets) every
+// percentage is judged on that surface instead of in the air: the air's
+// dew point is held, the temperature drops to the surface's, and RH rises
+// accordingly (surfaceRh). `condensing` is then the fraction of time the
+// dew point reached the surface itself. A 56°F crawl space under 64°F air
+// at 60% sits near 80% on the cold side, which the air reading hides.
+function moldRisk(samples, { surfaceF = null } = {}) {
+  const dewOf = s => s.dewpoint ?? dewPointF(s.temperature, s.humidity);
+  const onSurface = surfaceF != null && isFinite(surfaceF);
+  const rh = onSurface
+    ? s => { const d = s.humidity != null ? dewOf(s) : null; return d == null ? null : surfaceRh(d, surfaceF); }
+    : s => s.humidity;
+  const rhs         = samples.map(rh);
+  const validHum    = rhs.filter(v => v != null);
+  const validSpread = samples.filter(s => s.temperature != null && dewOf(s) != null);
   if (!validHum.length && !validSpread.length) return null;
 
   const pct70 = validHum.length
-    ? validHum.filter(s => s.humidity >= 70).length / validHum.length : 0;
+    ? validHum.filter(v => v >= 70).length / validHum.length : 0;
   const pct80 = validHum.length
-    ? validHum.filter(s => s.humidity >= 80).length / validHum.length : 0;
+    ? validHum.filter(v => v >= 80).length / validHum.length : 0;
   const spread = validSpread.length
-    ? validSpread.filter(s => s.temperature - s.dewpoint < 5).length / validSpread.length : 0;
-  const runHrs = _longestRunSecs(samples, s => s.humidity != null && s.humidity >= 70) / 3600;
+    ? validSpread.filter(s => (onSurface ? surfaceF : s.temperature) - dewOf(s) < 5).length / validSpread.length : 0;
+  const condensing = onSurface && validSpread.length
+    ? validSpread.filter(s => dewOf(s) >= surfaceF).length / validSpread.length : null;
+  const runHrs = _longestRunSecs(samples, s => { const v = rh(s); return v != null && v >= 70; }) / 3600;
 
   let level = 'low';
   if (pct70 >= 0.50 || pct80 >= 0.25 || runHrs >= 168)      level = 'high';
   else if (pct70 >= 0.25 || runHrs >= 72)                   level = 'elevated';
   else if (pct70 >= 0.05 || runHrs >= 24 || spread >= 0.10) level = 'moderate';
 
-  return { level, pct70, pct80, spread, runHrs };
+  return { level, pct70, pct80, spread, runHrs, condensing, surfaceF: onSurface ? surfaceF : null };
 }
 
 function renderMoldRisk(all) {
-  const data = all.map(x => {
+  // House rooms only: a fridge or a cooler is wet and cold by design, and
+  // an outdoor sensor's RH says nothing about a building.
+  const data = all.filter(x => x.group.group === 'house').map(x => {
     const samples = _statsHistory[x.id] || [];
-    return { x, risk: samples.length ? moldRisk(samples) : null };
+    return { x, risk: samples.length ? moldRisk(samples, { surfaceF: x.comfort?.surfaceF }) : null };
   }).filter(d => d.risk && d.risk.level !== 'low');
   if (!data.length) return '';
 
@@ -3600,20 +3663,21 @@ function renderMoldRisk(all) {
   const rows = data.map(({ x, risk }) => {
     const t = tier[risk.level];
     return `<tr>
-      <td><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}</td>
+      <td><span class="stats-dot" style="background:${_colorMap[x.id] || '#888'}"></span>${esc(x.sensor.name)}${risk.surfaceF != null ? ` <span class="rt-dim">(surface ${fmtNum(risk.surfaceF)}°F)</span>` : ''}</td>
       <td style="color:${t.color}"><span style="margin-right:4px">${t.glyph}</span>${t.label}</td>
       <td>${(risk.pct70 * 100).toFixed(0)}%</td>
       <td>${(risk.spread * 100).toFixed(0)}%</td>
+      <td>${risk.condensing != null ? (risk.condensing * 100).toFixed(0) + '%' : '—'}</td>
       <td>${fmtRun(risk.runHrs)}</td>
     </tr>`;
   }).join('');
 
   return `<div class="an-section"><h2>Mold &amp; condensation risk (${_statsRange})</h2>
     <div class="stats-table-wrap"><table class="an-table">
-      <thead><tr><th>Sensor</th><th>Risk</th><th>Time ≥70% RH</th><th>Close to dew</th><th>Longest humid run</th></tr></thead>
+      <thead><tr><th>Sensor</th><th>Risk</th><th>Time ≥70% RH</th><th>Close to dew</th><th>Condensing</th><th>Longest humid run</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <div class="stats-footnote">Sustained relative humidity ≥70% feeds mold growth; a dewpoint depression under 5°F (air close to saturation) makes surface condensation likely. The first percentage is fraction of time the sensor read ≥70% RH; the second is fraction of time temperature was within 5°F of dewpoint; the last is the longest unbroken stretch ≥70% RH. Low-risk sensors are omitted.</div>
+    <div class="stats-footnote">Sustained relative humidity ≥70% feeds mold growth; a dewpoint depression under 5°F (air close to saturation) makes surface condensation likely. The first percentage is fraction of time the sensor read ≥70% RH; the second is fraction of time temperature was within 5°F of dewpoint; the last is the longest unbroken stretch ≥70% RH. Mold grows on surfaces, not in air: for a room with a <b>Cold surface °F</b> in Settings → Comfort Presets, every column is judged on that surface, and "Condensing" is the time its dew point reached it. House rooms only; low-risk rooms are omitted.</div>
   </div>`;
 }
 
@@ -3679,10 +3743,11 @@ function hvacActivity(samples) {
 }
 
 function renderHVACActivity(all) {
-  // Skip outside sensors (no HVAC) and appliances (fridges/freezers cycle
-  // on their own and would dominate the chart). House + Other only.
+  // House rooms only: outside sensors have no HVAC, appliances (fridges,
+  // coolers) cycle on their own, and "other" is where portable sensors (a
+  // backpack, a car) land, whose swings are travel, not heating.
   const data = all
-    .filter(x => x.group.group === 'house' || x.group.group === 'other')
+    .filter(x => x.group.group === 'house')
     .map(x => ({ x, hvac: hvacActivity(_statsHistory[x.id] || []) }))
     .filter(d => d.hvac);
   if (!data.length) return '';
@@ -3703,12 +3768,12 @@ function renderHVACActivity(all) {
     </tr>`;
   }).join('');
 
-  return `<div class="an-section"><h2>HVAC activity (${_statsRange})</h2>
+  return `<div class="an-section"><h2>HVAC activity · inferred from temperature (${_statsRange})</h2>
     <div class="stats-table-wrap"><table class="an-table">
       <thead><tr><th>Sensor</th><th>Cycles/day</th><th>Active time</th><th>Pattern</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <div class="stats-footnote">"Cycles/day" counts heating-to-cooling pivots in the hour-to-hour temperature slope — a coasting room rarely flips direction, an actively driven one flips several times a day. "Active time" is hours per day where temperature changed by ≥${HVAC_ACTIVE_SLOPE}°F/hr. Outdoor sensors and appliances are excluded; both have their own dynamics that aren't HVAC.</div>
+    <div class="stats-footnote">"Cycles/day" counts heating-to-cooling pivots in the hour-to-hour temperature slope — a coasting room rarely flips direction, an actively driven one flips several times a day. "Active time" is hours per day where temperature changed by ≥${HVAC_ACTIVE_SLOPE}°F/hr. Outdoor sensors and appliances are excluded; both have their own dynamics that aren't HVAC. This is a guess from room air, not a measurement: a system that holds a room steady (a mini-split, or AC running all afternoon) barely moves the slope and reads as passive, while sun, cooking and open windows read as cycles. Use a power or thermostat feed for real runtime.</div>
   </div>`;
 }
 
@@ -3893,7 +3958,7 @@ function renderHvacPanel() {
   const coolNames = Object.keys(cooling).sort();
 
   if (!heatNames.length && !coolNames.length) {
-    return `<div class="an-section"><h2>HVAC zone analysis</h2>
+    return `<div class="an-section"><h2>HVAC zone analysis · inferred from temperature</h2>
       <div class="stats-footnote">No thermostat-reference sensor configured yet, and no indoor sensor has 24 h of data to auto-select. Set one in Settings → HVAC, or wait for the next poll.</div>
     </div>`;
   }
@@ -3916,12 +3981,12 @@ function renderHvacPanel() {
     ? ` Cycles are <b>gated by direction</b> using ${sourceLabel}: a heating cycle requires outdoor temp at least ${info.config?.outdoorMarginF ?? 2}°F below indoor (and vice versa for cooling), so "AC just shut off and the room warmed back up" no longer registers as a heating cycle.`
     : ` Outdoor gating is currently inactive — tag a sensor with "outside" / "outdoor" / "yard" / "patio" / "deck" in its name, or configure <code>weather.lat/lon</code>, to suppress off-recovery mislabeling.`;
 
-  return `<div class="an-section"><h2>HVAC zone analysis</h2>
+  return `<div class="an-section"><h2>HVAC zone analysis · inferred from temperature</h2>
     <div class="hvac-col-title" style="font-size:13px;margin-top:4px"><span style="color:${HVAC_COLOR_HEAT}">▲</span> Heating zones</div>
     ${heatingBlocks}
     <div class="hvac-col-title" style="font-size:13px;margin-top:16px"><span style="color:${HVAC_COLOR_COOL}">▼</span> Cooling zones</div>
     ${coolingBlocks}
-    <div class="stats-footnote">Each zone's analysis runs on the <b>mean temperature</b> across its member sensors at 5-min resolution — multi-sensor zones boost signal-to-noise (a furnace cycle that warms 3 of 4 rooms together is more visible in the average than in any single room). Cycle detection uses a Schmitt trigger at ${info.config?.slopeThresholdF ?? 0.5}°F/hr (enter) with a 40% exit threshold to suppress flicker.${gateNote} Short cycles often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Configure heating/cooling zones in Settings → HVAC.</div>
+    <div class="stats-footnote">Each zone's analysis runs on the <b>mean temperature</b> across its member sensors at 5-min resolution — multi-sensor zones boost signal-to-noise (a furnace cycle that warms 3 of 4 rooms together is more visible in the average than in any single room). Cycle detection uses a Schmitt trigger at ${info.config?.slopeThresholdF ?? 0.5}°F/hr (enter) with a 40% exit threshold to suppress flicker.${gateNote} Short cycles often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Configure heating/cooling zones in Settings → HVAC. Runtime here is inferred from how fast room air warms or cools, not measured: hydronic heat and mini-splits change room temperature slowly and steadily and are mostly missed, and a cycle can be credited to sun or cooking. Treat it as a pattern, not a meter reading.</div>
   </div>`;
 }
 
@@ -4338,6 +4403,12 @@ function computeOutdoorDelta(indoor, outdoor) {
   }
   if (outdoor.dewpoint != null) {
     out.dewpoint = { outdoor: outdoor.dewpoint };
+    if (indoor.dewpoint != null) {
+      out.dewpoint.indoor = indoor.dewpoint;
+      out.dewpoint.delta  = indoor.dewpoint - outdoor.dewpoint;
+      const gi = grainsPerLb(indoor.dewpoint), go = grainsPerLb(outdoor.dewpoint);
+      out.grains = { indoor: gi, outdoor: go, delta: gi - go };
+    }
   }
   if (out.temp == null && out.hum == null && out.dewpoint == null) return null;
   return out;
@@ -4805,7 +4876,33 @@ async function renderSettings() {
 }
 
 // ── Notifications panel ──────────────────────────────────────────────────
+// Last 50 notifications sent. ▲ fired / ✓ recovered carry the meaning
+// without color; a ✗ marks a sink that failed to deliver.
+async function loadNotificationLog() {
+  const el = document.getElementById('notif-log');
+  if (!el) return;
+  const d = await fetch(`${API_BASE}/settings/notifications/log?limit=50`).then(r => r.json()).catch(() => null);
+  if (!d?.ok) { el.textContent = 'Could not load the log.'; return; }
+  if (!d.entries.length) { el.textContent = 'None sent yet.'; return; }
+  const rows = d.entries.map(e => {
+    const fired = e.transition === 'fire';
+    const sinks = Object.entries(e.delivered || {})
+      .map(([k, v]) => v?.ok ? `✓ ${esc(k)}` : `<span style="color:var(--excl)">✗ ${esc(k)}${v?.error ? ': ' + esc(v.error) : ''}</span>`)
+      .join(' · ') || '<span class="rt-dim">no sink enabled</span>';
+    return `<tr>
+      <td style="white-space:nowrap">${esc(new Date(e.ts * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}</td>
+      <td style="white-space:nowrap">${fired ? '▲ Fired' : '✓ Recovered'}</td>
+      <td><b>${esc(e.title || e.key)}</b>${e.message ? `<div class="rt-dim">${esc(e.message)}</div>` : ''}</td>
+      <td>${sinks}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div class="stats-table-wrap"><table class="an-table">
+    <thead><tr><th>When</th><th></th><th>Alert</th><th>Delivered</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
 function renderNotifications() {
+  loadNotificationLog();
   const n = _settings.notifications || {};
   document.getElementById('notif-master-enabled').checked   = !!n.enabled;
   document.getElementById('notif-webhook-enabled').checked  = !!n.webhook?.enabled;
@@ -5146,6 +5243,8 @@ function renderComfortPresets() {
       <td>${_comfortNumInput(e?.temp?.hi, g, null, 'tempHi')}</td>
       <td>${_comfortNumInput(e?.hum?.lo,  g, null, 'humLo')}</td>
       <td>${_comfortNumInput(e?.hum?.hi,  g, null, 'humHi')}</td>
+      <td>${_comfortNumInput(e?.dew?.lo,  g, null, 'dewLo')}</td>
+      <td>${_comfortNumInput(e?.dew?.hi,  g, null, 'dewHi')}</td>
     </tr>`;
   }).join('');
 
@@ -5157,7 +5256,7 @@ function renderComfortPresets() {
   })).sort(_sortStats);
 
   if (!sensorOrder.length) {
-    sensorsBody.innerHTML = `<tr><td colspan="5" style="color:var(--text3)">No sensors registered yet.</td></tr>`;
+    sensorsBody.innerHTML = `<tr><td colspan="8" style="color:var(--text3)">No sensors registered yet.</td></tr>`;
     return;
   }
 
@@ -5173,6 +5272,9 @@ function renderComfortPresets() {
       <td>${_comfortNumInput(ov?.temp?.hi, null, x.id, 'tempHi')}</td>
       <td>${_comfortNumInput(ov?.hum?.lo,  null, x.id, 'humLo')}</td>
       <td>${_comfortNumInput(ov?.hum?.hi,  null, x.id, 'humHi')}</td>
+      <td>${_comfortNumInput(ov?.dew?.lo,  null, x.id, 'dewLo')}</td>
+      <td>${_comfortNumInput(ov?.dew?.hi,  null, x.id, 'dewHi')}</td>
+      <td>${_comfortNumInput(ov?.surfaceF, null, x.id, 'surfaceF')}</td>
     </tr>`;
   }).join('');
 }
@@ -5190,6 +5292,9 @@ function _collectComfortFromInputs() {
     if (f === 'tempHi') (entry.temp = entry.temp || {}).hi = v;
     if (f === 'humLo')  (entry.hum  = entry.hum  || {}).lo = v;
     if (f === 'humHi')  (entry.hum  = entry.hum  || {}).hi = v;
+    if (f === 'dewLo')  (entry.dew  = entry.dew  || {}).lo = v;
+    if (f === 'dewHi')  (entry.dew  = entry.dew  || {}).hi = v;
+    if (f === 'surfaceF') entry.surfaceF = v;
   });
   document.querySelectorAll('#comfort-sensors-body .comfort-input').forEach(inp => {
     const id = inp.dataset.sensor, f = inp.dataset.field;
@@ -5200,6 +5305,9 @@ function _collectComfortFromInputs() {
     if (f === 'tempHi') (entry.temp = entry.temp || {}).hi = v;
     if (f === 'humLo')  (entry.hum  = entry.hum  || {}).lo = v;
     if (f === 'humHi')  (entry.hum  = entry.hum  || {}).hi = v;
+    if (f === 'dewLo')  (entry.dew  = entry.dew  || {}).lo = v;
+    if (f === 'dewHi')  (entry.dew  = entry.dew  || {}).hi = v;
+    if (f === 'surfaceF') entry.surfaceF = v;
   });
   // Drop empty group/sensor objects to keep storage tidy.
   for (const k of Object.keys(result.groups))  if (!Object.keys(result.groups[k]).length)  delete result.groups[k];

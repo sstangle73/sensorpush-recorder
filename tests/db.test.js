@@ -5,7 +5,7 @@ import {
   setReadingExcluded, setHourlyExcluded, setLastPollTime, getLastPollTime, getGaps,
   upsertGateways, recordGatewayStatus, getGateways, gatewayOnlineDuringWindow, pruneGatewayStatus,
   getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway,
-  getBatteryHistory, computeBatteryForecast, getOldestReadingTs, pruneReadingsOlderThan,
+  getBatteryHistory, pruneBatteryHistory, computeBatteryForecast, getOldestReadingTs, pruneReadingsOlderThan,
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
   insertOutdoorReadings, getLatestOutdoorTs, getOutdoorHistory, getLatestOutdoorReading,
@@ -576,8 +576,12 @@ describe('getGaps', () => {
 
     it('detects a leading gap when readings start well after the window start', () => {
       const db = sensorDb();
-      // Single reading at end of window — leading gap should cover ~24h
+      // The sensor has reported before (3 days ago), then went silent until
+      // one reading at the end of the window — leading gap should cover ~24h
       insertReadings(db, 'g1', [{
+        observed: new Date((NOW - 3 * 86400) * 1000).toISOString(),
+        temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9,
+      }, {
         observed: new Date((NOW - 60) * 1000).toISOString(),
         temperature: 70, humidity: 50, barometric_pressure: null, battery_voltage: 2.9,
       }]);
@@ -585,6 +589,16 @@ describe('getGaps', () => {
       const leading = gaps.find(g => g.startTs <= NOW - 86000);
       expect(leading).toBeDefined();
       expect(leading.durationSecs).toBeGreaterThan(86000);
+    });
+
+    it('does not count the time before a new sensor\'s first reading as a gap', () => {
+      const db = sensorDb();
+      // First reading ever, 2 hours ago, then every 5 minutes since.
+      insertReadings(db, 'g1', makeSamples('g1', 24, NOW - 7200, 300));
+      const r = getGaps(db, 'g1', '24h');
+      expect(r.trackedFromTs).toBe(NOW - 7200);
+      expect(r.gaps.find(g => g.startTs < NOW - 7200)).toBeUndefined();
+      expect(r.coveragePct).toBeGreaterThan(95);
     });
 
     it('returns sparseHours even at raw resolution (≤24h ranges)', () => {
@@ -1047,6 +1061,26 @@ describe('getBatteryHistory', () => {
     expect(rows).toHaveLength(3);
     expect(rows[0].v).toBeCloseTo(2.85);
     expect(rows[2].v).toBeCloseTo(2.80);
+  });
+
+  it('reads the per-hour voltages upsertSensors records (samples carry none)', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'Attic', type: 'HT1', active: true, batteryVoltage: 2.97 }]);
+    upsertSensors(db, [{ id: 's1', name: 'Attic', type: 'HT1', active: true, batteryVoltage: 2.96 }]);  // same hour: replaces
+    upsertSensors(db, [{ id: 's2', name: 'Basement', type: 'HT1', active: true, batteryVoltage: null }]);
+    const rows = getBatteryHistory(db, 's1', 30);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].v).toBeCloseTo(2.96);
+    expect(getBatteryHistory(db, 's2', 30)).toHaveLength(0);
+  });
+
+  it('pruneBatteryHistory drops hours older than the window', () => {
+    const db = makeDb();
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare('INSERT INTO battery_history (sensor_id, hour_ts, v) VALUES (?, ?, ?)').run('s1', now - 500 * 86400, 3.0);
+    db.prepare('INSERT INTO battery_history (sensor_id, hour_ts, v) VALUES (?, ?, ?)').run('s1', now - 3600, 2.9);
+    pruneBatteryHistory(db);
+    expect(db.prepare('SELECT COUNT(*) n FROM battery_history').get().n).toBe(1);
   });
 
   it('skips rows with NULL voltage', () => {

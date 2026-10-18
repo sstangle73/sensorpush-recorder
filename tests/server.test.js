@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import vm from 'node:vm';
 import { createApp, _renderMetrics } from '../server.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings } from '../db.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings, logNotification } from '../db.js';
 import { vi } from 'vitest';
 
 let server, baseUrl, db;
@@ -615,6 +615,18 @@ describe('GET /settings/notifications/state', () => {
   });
 });
 
+describe('GET /settings/notifications/log', () => {
+  it('returns the sent notifications, newest first', async () => {
+    logNotification(db, { ts: 100, key: 'threshold:x', transition: 'fire', title: 'X warm', message: 'm', delivered: { ntfy: { ok: true } } });
+    logNotification(db, { ts: 200, key: 'threshold:x', transition: 'recover', title: 'X ok', message: 'm', delivered: {} });
+    const res  = await fetch(baseUrl + '/settings/notifications/log?key=threshold:x');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.entries.map(e => e.transition)).toEqual(['recover', 'fire']);
+    expect(body.entries[1].delivered).toEqual({ ntfy: { ok: true } });
+  });
+});
+
 describe('PUT /settings — notifications validation', () => {
   it('accepts a valid notifications config alongside ranges', async () => {
     const r = await fetch(baseUrl + '/settings', {
@@ -727,6 +739,30 @@ describe('GET/PUT /settings', () => {
     const { body } = await get('/settings');
     expect(body.settings.comfort).toEqual(planted);
     expect(body.settings.ranges).toEqual(['1h']);
+  });
+
+  it('PUT accepts a dew-point range and a cold-surface temperature', async () => {
+    const comfort = {
+      groups:  { house: { dew: { lo: 35, hi: 55 } } },
+      sensors: { basement: { surfaceF: 56.3 } },
+    };
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'], comfort }),
+    });
+    expect(r.status).toBe(200);
+    const { body } = await get('/settings');
+    expect(body.settings.comfort).toEqual(comfort);
+  });
+
+  it('PUT rejects a cold-surface temperature out of range', async () => {
+    const r = await fetch(baseUrl + '/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranges: ['1h'], comfort: { sensors: { b: { surfaceF: 500 } } } }),
+    });
+    expect(r.status).toBe(400);
   });
 
   it('PUT rejects malformed comfort — wrong types', async () => {
