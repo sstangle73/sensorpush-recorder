@@ -1068,6 +1068,20 @@ header .spacer { flex: 1; }
     <p class="set-hint" style="margin-top:8px">Space-separated. Resolution is determined by unit: <b>h</b> = raw readings · <b>d</b> = hourly averages · <b>yr</b> = daily averages.</p>
   </div>
   <div class="set-section">
+    <h2>Sensor Groups</h2>
+    <p class="set-hint" style="margin-bottom:10px">Sensors are grouped by name: House (with rooms), Outside, Appliances, Mobile and Other. Your rules are checked first, top to bottom, then the built-in ones; the first match wins. <b>Match</b> is a case-insensitive regular expression on the sensor's name. <b>Room</b> (House only) is any label, e.g. "Second floor"; Indoor vs Outdoor compares moisture by room. Mobile sensors (a backpack, a car) are left out of anomaly alerts and the HVAC panels; mold and indoor-vs-outdoor look at House sensors only.</p>
+    <table class="comfort-table"><thead>
+      <tr><th>Match (regex)</th><th>Group</th><th>Room</th><th></th></tr>
+    </thead><tbody id="group-rules-body"></tbody></table>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="set-btn" onclick="addGroupRule()">Add rule</button>
+      <button class="set-btn" onclick="saveGroupRules()">Save</button>
+    </div>
+    <div class="set-subheader" style="margin-top:14px">Result</div>
+    <div id="group-preview" class="set-hint"></div>
+  </div>
+
+  <div class="set-section">
     <h2>Comfort Presets</h2>
     <p class="set-hint" style="margin-bottom:10px">Sets the temperature/humidity range counted as "in comfort" on the Stats tab. Sensors inherit their group's defaults; per-sensor entries override the group. Blank = no comfort metric.</p>
     <div class="set-subheader">Group defaults</div>
@@ -1129,6 +1143,9 @@ header .spacer { flex: 1; }
     <table class="comfort-table"><thead>
       <tr><th>Sensor</th><th style="width:90px">Thermostat</th><th>Heating zone</th><th>Cooling zone</th></tr>
     </thead><tbody id="hvac-sensors-body"></tbody></table>
+    <div class="set-subheader" style="margin-top:14px">Metered elsewhere</div>
+    <p class="set-hint" style="margin:-2px 0 6px">Tick a room or zone whose heating or cooling you measure some other way (a circuit monitor, a smart thermostat). The HVAC panels, which only infer runtime from room temperature, then leave it out instead of contradicting the meter.</p>
+    <div id="hvac-metered" style="display:flex;flex-wrap:wrap;gap:6px 16px"></div>
     <div style="display:flex;gap:8px;margin-top:12px">
       <button class="set-btn" onclick="saveHvacSettings()">Save</button>
       <button class="set-btn" onclick="resetHvacSettings()">Clear all flags</button>
@@ -1963,6 +1980,8 @@ function anomaliesForSensor(s, seenCls) {
   // same σ the notifier fires on, so the Live badge can't disagree with ntfy.
   const aCfg = _settings.notifications?.conditions?.anomaly || {};
   if ((aCfg.excludeSensors || []).includes(s.id)) return null;
+  // A mobile sensor has no "normal for this hour"; the notifier skips it too.
+  if (classifySensor(s.name).group === 'mobile') return null;
   const sigma = aCfg.sigma ?? 3;
   const baseline = _liveBaselines[s.id];
   if (!baseline) return null;
@@ -2042,7 +2061,8 @@ function realtimeCardClick(id) {
 
 // Group/sub-group structure for the Live view.
 // Order here is the rendering order. Each subgroup's label maps to the
-// keys returned by classifySensor().
+// keys returned by classifySensor(). Rooms a user names in their own group
+// rules ("Second floor") are added after these by rtGroups().
 const RT_GROUPS = [
   { key: 'house', label: 'House', subgroups: [
     { key: 'attic',    label: 'Attic' },
@@ -2052,27 +2072,64 @@ const RT_GROUPS = [
   ]},
   { key: 'outside',   label: 'Outside',    subgroups: null },
   { key: 'appliance', label: 'Appliances', subgroups: null },
+  { key: 'mobile',    label: 'Mobile',     subgroups: null },
   { key: 'other',     label: 'Other',      subgroups: null },
 ];
 
-// Keyword-based classification of a sensor by display name. Order matters:
-// Appliance and Outside are checked before House subgroups so a "Garage
-// Fridge" sensor lands under Appliances, not Outside.
-function classifySensor(name) {
+// RT_GROUPS plus the house rooms named by the user's group rules, in rule order.
+function rtGroups() {
+  const builtIn = new Set(RT_GROUPS[0].subgroups.map(sg => sg.key));
+  const extra = [];
+  for (const r of (_settings.groups?.rules || [])) {
+    if (r.group !== 'house') continue;
+    const sub = classifyByRules('', [{ match: '', group: 'house', subgroup: r.subgroup }], []).subgroup;
+    if (sub && !builtIn.has(sub) && !extra.some(e => e.key === sub)) extra.push({ key: sub, label: sub });
+  }
+  if (!extra.length) return RT_GROUPS;
+  return [{ ...RT_GROUPS[0], subgroups: [...RT_GROUPS[0].subgroups, ...extra] }, ...RT_GROUPS.slice(1)];
+}
+
+// The default name rules, checked after the user's own (Settings → Sensor
+// groups). A copy of groups.js's defaultGroupRules() and classifyByRules():
+// tests/groups.test.js fails when they drift apart.
+function defaultGroupRules() {
+  return [
+    // Appliance before Outside, so a "Garage Fridge" is an appliance.
+    { match: '\\b(fridge|refrig\\w*|freezer|cabinet|server|wine|incubator|pantry)\\b', group: 'appliance' },
+    { match: '\\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\\b', group: 'outside' },
+    // Sensors that travel: their swings are trips, not weather or heating.
+    { match: '\\b(backpack|bag|car|vehicle|truck|rv|camper|boat|travel|portable|mobile)\\b', group: 'mobile' },
+    { match: '\\battic\\b', group: 'house', subgroup: 'attic' },
+    { match: '\\b(bedroom|bedrm|bath|nursery|loft|master|kids?)\\b', group: 'house', subgroup: 'bedrooms' },
+    { match: '\\b(living|kitchen|dining|family|foyer|den|study|office|main|hallway|entry|mudroom)\\b', group: 'house', subgroup: 'living' },
+    { match: '\\b(basement|cellar|crawl)\\b', group: 'house', subgroup: 'basement' },
+  ];
+}
+
+// First matching rule wins; a rule whose regex doesn't compile is skipped.
+// Returns { group, subgroup }; subgroup is null outside 'house'.
+function classifyByRules(name, userRules, defaults) {
   const n = name || '';
-  if (/\b(fridge|refrig\w*|freezer|cabinet|rack|server|cooler|glacier|wine|incubator|pantry)\b/i.test(n))
-    return { group: 'appliance', subgroup: null };
-  if (/\b(outside|outdoor|yard|patio|deck|shed|garage|exterior|porch)\b/i.test(n))
-    return { group: 'outside', subgroup: null };
-  if (/\battic\b/i.test(n))
-    return { group: 'house', subgroup: 'attic' };
-  if (/\b(bedroom|bedrm|bath|nursery|loft|master|kids?)\b/i.test(n))
-    return { group: 'house', subgroup: 'bedrooms' };
-  if (/\b(living|kitchen|dining|family|foyer|den|study|office|main|hallway|entry|mudroom)\b/i.test(n))
-    return { group: 'house', subgroup: 'living' };
-  if (/\b(basement|cellar|crawl)\b/i.test(n))
-    return { group: 'house', subgroup: 'basement' };
+  const builtIn = { attic: 'attic', bedrooms: 'bedrooms', 'living rooms': 'living', living: 'living', basement: 'basement' };
+  for (const r of [...(Array.isArray(userRules) ? userRules : []), ...(defaults || [])]) {
+    if (!r || typeof r.match !== 'string') continue;
+    let re;
+    try { re = new RegExp(r.match, 'i'); } catch { continue; }
+    if (!re.test(n)) continue;
+    if (r.group !== 'house') return { group: r.group, subgroup: null };
+    const label = (r.subgroup || '').toString().trim();
+    return { group: 'house', subgroup: label ? (builtIn[label.toLowerCase()] || label) : null };
+  }
   return { group: 'other', subgroup: null };
+}
+
+const _DEFAULT_GROUP_RULES = defaultGroupRules();
+
+// Which kind of place a sensor sits in, from its name: the user's rules
+// first, then the defaults. Appliance and Outside come before the house
+// rooms so a "Garage Fridge" sensor lands under Appliances.
+function classifySensor(name) {
+  return classifyByRules(name, _settings.groups?.rules, _DEFAULT_GROUP_RULES);
 }
 
 function renderRtCard(id) {
@@ -2197,7 +2254,7 @@ function renderRealtime() {
   // on wide screens.
   const houseSections = [];
   const otherSections = [];
-  for (const grp of RT_GROUPS) {
+  for (const grp of rtGroups()) {
     const groupBuckets = bucketed[grp.key];
     if (!groupBuckets) continue;
     let sectionHTML = '';
@@ -2306,6 +2363,7 @@ const DEFAULT_COMFORT = {
     house:     { temp: { lo: 68, hi: 76 }, hum: { lo: 30, hi: 60 } },
     outside:   null,
     appliance: null,
+    mobile:    null,
     other:     null,
   },
   sensors: {},
@@ -2744,7 +2802,7 @@ function renderStatsHighlights(all, valid) {
   // are different "kinds of place" — comparing a fridge to the outdoor
   // sensor isn't a useful comparison, so we don't make it.
   const blocks = [];
-  for (const grp of RT_GROUPS) {
+  for (const grp of rtGroups()) {
     const zoneAll = all.filter(x => x.group.group === grp.key);
     const cards   = _highlightCardsForZone(zoneAll);
     if (!cards.length) continue;
@@ -2762,14 +2820,16 @@ function renderStatsHighlights(all, valid) {
 // outdoor air at 80%. "Wetter than outdoors" means people, cooking and
 // showers are adding moisture faster than air exchange removes it; only
 // then does ventilating dry the room.
-function indoorOutdoorRows(all) {
+function indoorOutdoorRows(all, groups = RT_GROUPS) {
   const outside = all.filter(x => x.group.group === 'outside' && x.stats.dewAvg != null);
   if (!outside.length) return null;
   const outDew  = _mean(outside.map(x => x.stats.dewAvg));
   const outTemp = _mean(outside.filter(x => x.stats.tempAvg != null).map(x => x.stats.tempAvg));
   const rows = [];
-  for (const sg of RT_GROUPS[0].subgroups) {
-    const members = all.filter(x => x.group.group === 'house' && x.group.subgroup === sg.key && x.stats.dewAvg != null);
+  // Every room the grouping knows (the user's own rooms included), then the
+  // house sensors that matched no room, so none is left out of the table.
+  for (const sg of [...groups[0].subgroups, { key: null, label: 'House (no room)' }]) {
+    const members = all.filter(x => x.group.group === 'house' && (x.group.subgroup || null) === sg.key && x.stats.dewAvg != null);
     if (!members.length) continue;
     const dew  = _mean(members.map(x => x.stats.dewAvg));
     const temp = _mean(members.filter(x => x.stats.tempAvg != null).map(x => x.stats.tempAvg));
@@ -2780,7 +2840,7 @@ function indoorOutdoorRows(all) {
 }
 
 function renderIndoorOutdoor(all) {
-  const io = indoorOutdoorRows(all);
+  const io = indoorOutdoorRows(all, rtGroups());
   if (!io || !io.rows.length) return '';
   const word = d => d > 2 ? '▲ wetter' : d < -2 ? '▼ drier' : '≈ same';
   const cls  = d => d > 2 ? 'stats-up' : d < -2 ? 'stats-down' : 'stats-flat';
@@ -2793,12 +2853,12 @@ function renderIndoorOutdoor(all) {
     </tr>`).join('');
   return `<div class="an-section"><h2>Indoor vs Outdoor (${_statsRange})</h2>
     <div class="stats-table-wrap"><table class="an-table">
-      <thead><tr><th>Floor</th><th>Temp</th><th>Dew point</th><th>gr/lb</th><th>vs outdoors</th></tr></thead>
+      <thead><tr><th>Room group</th><th>Temp</th><th>Dew point</th><th>gr/lb</th><th>vs outdoors</th></tr></thead>
       <tbody>${rows}
         <tr><td>Outdoors</td><td>${fmtNum(io.outTemp)}°F</td><td>${fmtNum(io.outDew)}°F</td><td><b>${fmtNum(io.outGrains)}</b></td><td></td></tr>
       </tbody>
     </table></div>
-    <div class="stats-footnote">Averages over the range. Moisture is compared as dew point and humidity ratio (grains of water per pound of dry air, at sea-level pressure), not relative humidity, which changes with temperature alone. "Wetter" (more than 2 gr/lb above outdoors) means the rooms are adding moisture faster than air exchange removes it; opening up dries them only then.</div>
+    <div class="stats-footnote">Averages over the range, by the room groups in Settings → Sensor groups. Moisture is compared as dew point and humidity ratio (grains of water per pound of dry air, at sea-level pressure), not relative humidity, which changes with temperature alone. "Wetter" (more than 2 gr/lb above outdoors) means the rooms are adding moisture faster than air exchange removes it; opening up dries them only then.</div>
   </div>`;
 }
 
@@ -2862,9 +2922,9 @@ function renderOutdoorWeatherDelta(all) {
 
 // Sort sensors by classification → subgroup → name. Matches the Live page's
 // ordering so users see the same arrangement on both views.
-const _STATS_GROUP_ORDER = { house: 0, outside: 1, appliance: 2, other: 3 };
+const _STATS_GROUP_ORDER = { house: 0, outside: 1, appliance: 2, mobile: 3, other: 4 };
 const _STATS_SUB_ORDER   = { attic: 0, bedrooms: 1, living: 2, basement: 3, _: 4 };
-const _STATS_GROUP_LABEL = { house: 'House', outside: 'Outside', appliance: 'Appliances', other: 'Other' };
+const _STATS_GROUP_LABEL = { house: 'House', outside: 'Outside', appliance: 'Appliances', mobile: 'Mobile', other: 'Other' };
 const _STATS_SUB_LABEL   = { attic: 'Attic', bedrooms: 'Bedrooms', living: 'Living rooms', basement: 'Basement' };
 
 function _sortStats(a, b) {
@@ -2902,7 +2962,7 @@ function renderStatsTable(all, kind) {
     let groupRow = '';
     if (x.group.group !== lastGroup || (x.group.group === 'house' && x.group.subgroup !== lastSub)) {
       const label = x.group.group === 'house'
-        ? `${_STATS_GROUP_LABEL[x.group.group]} — ${_STATS_SUB_LABEL[x.group.subgroup] || 'Unspecified'}`
+        ? `${_STATS_GROUP_LABEL[x.group.group]} — ${_STATS_SUB_LABEL[x.group.subgroup] || x.group.subgroup || 'Unspecified'}`
         : _STATS_GROUP_LABEL[x.group.group] || 'Other';
       groupRow = `<tr class="stats-group-row${isFirst ? ' first' : ''}"><td colspan="${colCount}">${esc(label)}</td></tr>`;
       lastGroup = x.group.group;
@@ -3647,10 +3707,12 @@ function renderMoldRisk(all) {
   }).filter(d => d.risk && d.risk.level !== 'low');
   if (!data.length) return '';
 
+  // Each tier differs in hue (red-pink, amber, sky), in shape and in word,
+  // so it reads without colour and in grayscale.
   const tier = {
-    high:     { glyph: '⚠', color: 'var(--excl)', label: 'High'     },
-    elevated: { glyph: '◑', color: 'var(--warn)', label: 'Elevated' },
-    moderate: { glyph: '◔', color: 'var(--warn)', label: 'Moderate' },
+    high:     { glyph: '■', color: 'var(--excl)',   label: 'High'     },
+    elevated: { glyph: '▲', color: 'var(--warn)',   label: 'Elevated' },
+    moderate: { glyph: '●', color: 'var(--accent)', label: 'Moderate' },
   };
   const order = { high: 0, elevated: 1, moderate: 2 };
   data.sort((a, b) => order[a.risk.level] - order[b.risk.level]);
@@ -3746,11 +3808,17 @@ function renderHVACActivity(all) {
   // House rooms only: outside sensors have no HVAC, appliances (fridges,
   // coolers) cycle on their own, and "other" is where portable sensors (a
   // backpack, a car) land, whose swings are travel, not heating.
-  const data = all
-    .filter(x => x.group.group === 'house')
+  // Rooms whose equipment is metered elsewhere (Settings → HVAC) are left
+  // to that meter.
+  const metered = _settings.hvac?.meteredGroups || [];
+  const house   = all.filter(x => x.group.group === 'house');
+  const shown   = house.filter(x => !isMeteredGroup(metered, x.group.group, x.group.subgroup));
+  const hidden  = house.length - shown.length;
+  const data = shown
     .map(x => ({ x, hvac: hvacActivity(_statsHistory[x.id] || []) }))
     .filter(d => d.hvac);
-  if (!data.length) return '';
+  if (!data.length) return hidden ? `<div class="an-section"><h2>HVAC activity · inferred from temperature (${_statsRange})</h2>
+    <div class="stats-footnote">Every room's equipment is marked as metered elsewhere (Settings → HVAC), so nothing is inferred here.</div></div>` : '';
 
   data.sort((a, b) => b.hvac.cyclesPerDay - a.hvac.cyclesPerDay);
 
@@ -3773,8 +3841,16 @@ function renderHVACActivity(all) {
       <thead><tr><th>Sensor</th><th>Cycles/day</th><th>Active time</th><th>Pattern</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
-    <div class="stats-footnote">"Cycles/day" counts heating-to-cooling pivots in the hour-to-hour temperature slope — a coasting room rarely flips direction, an actively driven one flips several times a day. "Active time" is hours per day where temperature changed by ≥${HVAC_ACTIVE_SLOPE}°F/hr. Outdoor sensors and appliances are excluded; both have their own dynamics that aren't HVAC. This is a guess from room air, not a measurement: a system that holds a room steady (a mini-split, or AC running all afternoon) barely moves the slope and reads as passive, while sun, cooking and open windows read as cycles. Use a power or thermostat feed for real runtime.</div>
+    <div class="stats-footnote">"Cycles/day" counts heating-to-cooling pivots in the hour-to-hour temperature slope — a coasting room rarely flips direction, an actively driven one flips several times a day. "Active time" is hours per day where temperature changed by ≥${HVAC_ACTIVE_SLOPE}°F/hr. Outdoor sensors and appliances are excluded; both have their own dynamics that aren't HVAC. This is a guess from room air, not a measurement: a system that holds a room steady (a mini-split, or AC running all afternoon) barely moves the slope and reads as passive, while sun, cooking and open windows read as cycles. Use a power or thermostat feed for real runtime.${hidden ? ` ${hidden} sensor${hidden === 1 ? '' : 's'} in groups metered elsewhere ${hidden === 1 ? 'is' : 'are'} not shown.` : ''}</div>
   </div>`;
+}
+
+// Is any of these group / room / zone names in the "metered elsewhere" list?
+// The same rule as groups.js's isMetered (case-insensitive).
+function isMeteredGroup(meteredGroups, ...names) {
+  if (!Array.isArray(meteredGroups) || !meteredGroups.length) return false;
+  const set = new Set(meteredGroups.map(g => String(g).trim().toLowerCase()));
+  return names.some(n => n != null && set.has(String(n).trim().toLowerCase()));
 }
 
 // ── HVAC zone analysis panel (driven by /hvac route) ──────────────────────
@@ -3958,6 +4034,11 @@ function renderHvacPanel() {
   const coolNames = Object.keys(cooling).sort();
 
   if (!heatNames.length && !coolNames.length) {
+    if (info.metered?.zones?.length || info.metered?.sensorIds?.length) {
+      return `<div class="an-section"><h2>HVAC zone analysis · inferred from temperature</h2>
+        <div class="stats-footnote">Every zone's equipment is marked as metered elsewhere (Settings → HVAC), so nothing is inferred here.</div>
+      </div>`;
+    }
     return `<div class="an-section"><h2>HVAC zone analysis · inferred from temperature</h2>
       <div class="stats-footnote">No thermostat-reference sensor configured yet, and no indoor sensor has 24 h of data to auto-select. Set one in Settings → HVAC, or wait for the next poll.</div>
     </div>`;
@@ -3972,6 +4053,10 @@ function renderHvacPanel() {
     ? coolNames.map(name => _renderHvacZoneRow(name, cooling[name], 'cooling', shortThresholdSecs)).join('')
     : `<div class="stats-footnote">No cooling zones configured.</div>`;
 
+  const meteredZones = info.metered?.zones || [];
+  const meteredNote = meteredZones.length || info.metered?.sensorIds?.length
+    ? ` Not shown, because their equipment is metered elsewhere (Settings → HVAC): ${[...meteredZones.map(esc), ...(info.metered?.sensorIds || []).map(id => esc(_sensors[id]?.name || id))].join(', ')}.`
+    : '';
   const anyGated = [...Object.values(heating), ...Object.values(cooling)]
     .some(z => z.analysis?.gated);
   const sourceLabel = info.outdoorSource === 'outside-sensor' ? 'an outside-tagged sensor'
@@ -3986,7 +4071,7 @@ function renderHvacPanel() {
     ${heatingBlocks}
     <div class="hvac-col-title" style="font-size:13px;margin-top:16px"><span style="color:${HVAC_COLOR_COOL}">▼</span> Cooling zones</div>
     ${coolingBlocks}
-    <div class="stats-footnote">Each zone's analysis runs on the <b>mean temperature</b> across its member sensors at 5-min resolution — multi-sensor zones boost signal-to-noise (a furnace cycle that warms 3 of 4 rooms together is more visible in the average than in any single room). Cycle detection uses a Schmitt trigger at ${info.config?.slopeThresholdF ?? 0.5}°F/hr (enter) with a 40% exit threshold to suppress flicker.${gateNote} Short cycles often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Configure heating/cooling zones in Settings → HVAC. Runtime here is inferred from how fast room air warms or cools, not measured: hydronic heat and mini-splits change room temperature slowly and steadily and are mostly missed, and a cycle can be credited to sun or cooking. Treat it as a pattern, not a meter reading.</div>
+    <div class="stats-footnote">Each zone's analysis runs on the <b>mean temperature</b> across its member sensors at 5-min resolution — multi-sensor zones boost signal-to-noise (a furnace cycle that warms 3 of 4 rooms together is more visible in the average than in any single room). Cycle detection uses a Schmitt trigger at ${info.config?.slopeThresholdF ?? 0.5}°F/hr (enter) with a 40% exit threshold to suppress flicker.${gateNote} Short cycles often indicate oversized equipment, stuck thermostats, or a sensor placed in airflow. Configure heating/cooling zones in Settings → HVAC. Runtime here is inferred from how fast room air warms or cools, not measured: hydronic heat and mini-splits change room temperature slowly and steadily and are mostly missed, and a cycle can be credited to sun or cooking. Treat it as a pattern, not a meter reading.${meteredNote}</div>
   </div>`;
 }
 
@@ -4544,7 +4629,7 @@ function renderSidebar() {
 function renderSensorGroups() {
   const el = document.getElementById('sidebar-groups');
   if (!el) return;
-  const groups = sensorGroupFilters(_sensors, classifySensor, RT_GROUPS);
+  const groups = sensorGroupFilters(_sensors, classifySensor, rtGroups());
   el.innerHTML = groups
     .map(g => `<button class="group-btn" onclick="selectGroup('${esc(g.key)}')">${esc(g.label)}</button>`)
     .join('');
@@ -4559,7 +4644,7 @@ function renderSensorChips() {
     const style  = active ? `border-color:${color};color:${color}` : '';
     return `<button class="sensor-chip${active ? ' active' : ''}" style="${style}" data-id="${esc(s.id)}" onclick="toggleSensor('${esc(s.id)}')">${esc(s.name)}</button>`;
   }).join('');
-  const groupBtns = sensorGroupFilters(_sensors, classifySensor, RT_GROUPS)
+  const groupBtns = sensorGroupFilters(_sensors, classifySensor, rtGroups())
     .map(g => `<button class="chip-ctrl" onclick="selectGroup('${esc(g.key)}')">${esc(g.label)}</button>`)
     .join('');
   el.innerHTML =
@@ -4833,6 +4918,9 @@ async function loadSettings() {
       if (resp.settings.notifications !== undefined) {
         _settings.notifications = resp.settings.notifications;
       }
+      if (resp.settings.groups !== undefined) {
+        _settings.groups = resp.settings.groups;
+      }
       return;
     }
   } catch(e) {}
@@ -4860,6 +4948,8 @@ async function saveSettings() {
 async function renderSettings() {
   document.getElementById('ranges-input').value = _settings.ranges.join(' ');
   previewRanges();
+  _groupRulesDraft = null;
+  renderGroupRules();
   renderComfortPresets();
   renderPairsPanel();
   loadAndRenderPairs();
@@ -5123,6 +5213,7 @@ function renderHvacSettings() {
   shortInp.value = cfg.shortCycleMinutes != null ? cfg.shortCycleMinutes : 5;
   slopeInp.value = cfg.slopeThresholdF   != null ? cfg.slopeThresholdF   : 0.5;
   const flags = cfg.sensors || {};
+  renderHvacMetered(cfg);
 
   const order = Object.keys(_sensors).map(id => ({
     id,
@@ -5160,8 +5251,37 @@ function renderHvacSettings() {
   }).join('');
 }
 
+// The choices for "metered elsewhere": the house rooms that have sensors,
+// then every heating/cooling zone name, then anything already saved.
+function hvacMeteredChoices(cfg) {
+  const choices = [];
+  const add = (key, label) => { if (key && !choices.some(c => c.key.toLowerCase() === String(key).toLowerCase())) choices.push({ key: String(key), label }); };
+  const rooms = new Set(Object.values(_sensors).map(s => classifySensor(s.name)).filter(g => g.group === 'house' && g.subgroup).map(g => g.subgroup));
+  for (const sg of rtGroups()[0].subgroups) if (rooms.has(sg.key)) add(sg.key, `${sg.label} (room)`);
+  for (const e of Object.values(cfg.sensors || {})) {
+    if (e?.zone) add(e.zone, `${e.zone} (heating zone)`);
+    if (e?.coolingZone) add(e.coolingZone, `${e.coolingZone} (cooling zone)`);
+  }
+  for (const g of (cfg.meteredGroups || [])) add(g, g);
+  return choices;
+}
+
+function renderHvacMetered(cfg) {
+  const el = document.getElementById('hvac-metered');
+  if (!el) return;
+  const choices = hvacMeteredChoices(cfg);
+  if (!choices.length) { el.innerHTML = `<span class="set-hint">No rooms or zones yet.</span>`; return; }
+  el.innerHTML = choices.map(c => `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2)">
+      <input type="checkbox" class="hvac-metered-input" value="${esc(c.key)}" ${isMeteredGroup(cfg.meteredGroups, c.key) ? 'checked' : ''}>
+      ${esc(c.label)}</label>`).join('');
+}
+
 function _collectHvacFromInputs() {
   const out = { sensors: {} };
+  // Keep settings this form doesn't edit.
+  if (_settings.hvac?.outdoorMarginF != null) out.outdoorMarginF = _settings.hvac.outdoorMarginF;
+  const metered = [...document.querySelectorAll('.hvac-metered-input:checked')].map(i => i.value);
+  if (metered.length) out.meteredGroups = metered;
   const shortMin = parseFloat(document.getElementById('hvac-shortcycle').value);
   const slopeF   = parseFloat(document.getElementById('hvac-slope').value);
   if (isFinite(shortMin) && shortMin > 0) out.shortCycleMinutes = shortMin;
@@ -5214,9 +5334,92 @@ function resetHvacSettings() {
   saveHvacSettings();
 }
 
+// ── Sensor group rules editor ─────────────────────────────────────────────
+let _groupRulesDraft = null;
+
+function renderGroupRules() {
+  const body = document.getElementById('group-rules-body');
+  if (!body) return;
+  if (!_groupRulesDraft) _groupRulesDraft = JSON.parse(JSON.stringify(_settings.groups?.rules || []));
+  const opts = g => RT_GROUPS.map(x => `<option value="${x.key}" ${x.key === g ? 'selected' : ''}>${esc(x.label)}</option>`).join('');
+  body.innerHTML = _groupRulesDraft.length ? _groupRulesDraft.map((r, i) => `<tr>
+      <td><input type="text" class="comfort-input group-rule-match" data-i="${i}" value="${esc(r.match || '')}" placeholder="e.g. glacier|cooler" style="width:200px;text-align:left"></td>
+      <td><select class="comfort-input group-rule-group" data-i="${i}" style="color-scheme:dark;width:120px">${opts(r.group)}</select></td>
+      <td><input type="text" class="comfort-input group-rule-sub" data-i="${i}" value="${esc(r.subgroup || '')}" placeholder="${r.group === 'house' ? 'e.g. Second floor' : '—'}" ${r.group === 'house' ? '' : 'disabled'} style="width:140px"></td>
+      <td><button class="set-btn" onclick="removeGroupRule(${i})" title="Remove rule">✕ Remove</button></td>
+    </tr>`).join('')
+    : `<tr><td colspan="4" style="color:var(--text3)">No rules of your own: the built-in ones apply.</td></tr>`;
+  body.querySelectorAll('input, select').forEach(el => el.addEventListener('change', () => { _readGroupRuleInputs(); renderGroupRules(); }));
+  renderGroupPreview();
+}
+
+function _readGroupRuleInputs() {
+  document.querySelectorAll('.group-rule-match').forEach(el => { _groupRulesDraft[+el.dataset.i].match = el.value.trim(); });
+  document.querySelectorAll('.group-rule-group').forEach(el => { _groupRulesDraft[+el.dataset.i].group = el.value; });
+  document.querySelectorAll('.group-rule-sub').forEach(el => {
+    const r = _groupRulesDraft[+el.dataset.i];
+    const v = el.value.trim();
+    if (r.group === 'house' && v) r.subgroup = v; else delete r.subgroup;
+  });
+}
+
+// Each sensor and where the draft rules put it, with ✗ next to a rule
+// whose regex doesn't compile.
+function renderGroupPreview() {
+  const el = document.getElementById('group-preview');
+  if (!el) return;
+  const bad = _groupRulesDraft.filter(r => { try { new RegExp(r.match, 'i'); return !r.match; } catch { return true; } });
+  const label = g => g.group === 'house'
+    ? `House · ${_STATS_SUB_LABEL[g.subgroup] || g.subgroup || 'no room'}`
+    : (_STATS_GROUP_LABEL[g.group] || g.group);
+  const rows = Object.values(_sensors)
+    .map(s => ({ s, g: classifyByRules(s.name, _groupRulesDraft, _DEFAULT_GROUP_RULES) }))
+    .sort((a, b) => (a.s.name || '').localeCompare(b.s.name || ''))
+    .map(({ s, g }) => `<div>${esc(s.name)} → <b>${esc(label(g))}</b></div>`).join('');
+  el.innerHTML = (bad.length ? `<div style="color:var(--excl)">✗ ${bad.length} rule${bad.length === 1 ? ' has' : 's have'} an empty or invalid regex and will not save.</div>` : '') + (rows || 'No sensors yet.');
+}
+
+function addGroupRule() {
+  _readGroupRuleInputs();
+  _groupRulesDraft.push({ match: '', group: 'house' });
+  renderGroupRules();
+}
+
+function removeGroupRule(i) {
+  _readGroupRuleInputs();
+  _groupRulesDraft.splice(i, 1);
+  renderGroupRules();
+}
+
+async function saveGroupRules() {
+  _readGroupRuleInputs();
+  const rules = _groupRulesDraft.filter(r => r.match);
+  try { rules.forEach(r => new RegExp(r.match, 'i')); }
+  catch (e) { showToast('Invalid regex: ' + e.message); return; }
+  const prev = _settings.groups;
+  _settings.groups = { rules };
+  try {
+    const r = await fetch(`${API_BASE}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_settings),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    _groupRulesDraft = null;
+    showToast('Sensor groups saved ✓');
+    renderGroupRules();
+    renderHvacSettings();
+    renderComfortPresets();
+  } catch (e) {
+    _settings.groups = prev;
+    showToast('Save failed: ' + e.message);
+  }
+}
+
 // ── Comfort presets editor ────────────────────────────────────────────────
 const _COMFORT_GROUP_LABEL = {
-  house: 'House', outside: 'Outside', appliance: 'Appliances', other: 'Other',
+  house: 'House', outside: 'Outside', appliance: 'Appliances', mobile: 'Mobile', other: 'Other',
 };
 
 function _comfortNumInput(value, group, sensorId, field) {

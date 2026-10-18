@@ -30,7 +30,7 @@ Sensor names in the screenshots below are anonymized (`Bedroom A/B/C`); the UI s
 
 ### Live
 
-Real-time cards grouped by zone (House / Outside / Appliances / Other), with trend arrows, feels-like, dewpoint spread, and battery RSSI badges. Anomalous readings for the current hour-of-day get flagged automatically.
+Real-time cards grouped by zone (House with its rooms / Outside / Appliances / Mobile / Other; sensors are grouped by name, and Settings → Sensor Groups adds your own rules), with trend arrows, feels-like, dewpoint spread, and battery RSSI badges. Anomalous readings for the current hour-of-day get flagged automatically.
 
 ![Live tab](docs/screenshots/live.png)
 
@@ -54,7 +54,7 @@ Per-gateway status with uptime % and primary-sensor count, plus a coverage summa
 
 ### Settings
 
-Range-button configuration, per-zone and per-sensor "comfort" presets used by the Stats tab, HVAC thermostat-reference sensor flags, bearer-token controls under Security, notification sinks (webhook + ntfy) with per-condition enable toggles, and a backups panel listing daily SQLite snapshots with one-click restore.
+Range-button configuration, sensor-group rules (a name regex to a group and room), per-zone and per-sensor "comfort" presets used by the Stats tab, HVAC thermostat-reference sensor flags and the rooms or zones whose equipment is metered elsewhere, bearer-token controls under Security, notification sinks (webhook + ntfy) with per-condition enable toggles, and a backups panel listing daily SQLite snapshots with one-click restore.
 
 ![Settings tab](docs/screenshots/settings.png)
 

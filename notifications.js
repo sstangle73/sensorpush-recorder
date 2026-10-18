@@ -25,6 +25,7 @@
 
 import fetch from 'node-fetch';
 import { getNotifState, setNotifState, getHourlyBaseline, dewPointF, logNotification } from './db.js';
+import { classifyByRules, DEFAULT_GROUP_RULES } from './groups.js';
 
 // Same floors the Live tab uses — at very stable baselines a ±2σ trip would
 // fire on natural minute-to-minute jitter, so we floor σ at a value bigger
@@ -289,7 +290,7 @@ export function isOffline(lastTs, thresholdSecs, nowSecs) {
 //
 // Errors per-sensor are caught so one bad config can't break the rest of
 // the run. Returns a summary array for logging/debug.
-export async function runNotifications(db, { sensors, gateways, notifConfig, nowMs = Date.now() } = {}) {
+export async function runNotifications(db, { sensors, gateways, notifConfig, groupRules, nowMs = Date.now() } = {}) {
   if (!notifConfig?.enabled) return [];
   const conditions = notifConfig.conditions || {};
   const results    = [];
@@ -322,7 +323,9 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, now
 
     // Anomaly (hour-of-day baseline) — σ-scaled, dwell-gated, per-sensor skippable
     const anomalyCfg = conditions.anomaly;
-    if (anomalyCfg?.enabled && !(anomalyCfg.excludeSensors || []).includes(s.id)) {
+    // A mobile sensor (groups.js) has no "normal for this hour": it moves.
+    const mobile = classifyByRules(s.name, groupRules, DEFAULT_GROUP_RULES).group === 'mobile';
+    if (anomalyCfg?.enabled && !mobile && !(anomalyCfg.excludeSensors || []).includes(s.id)) {
       try {
         const sigma     = anomalyCfg.sigma     ?? DEFAULT_ANOMALY_SIGMA;
         const dwellSecs = anomalyCfg.dwellSecs ?? DEFAULT_ANOMALY_DWELL_SECS;
