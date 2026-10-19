@@ -9,6 +9,7 @@ Polls the SensorPush cloud every 5 minutes, stores all readings locally in SQLit
 - **Continuous polling** — every 5 min, with 24h lookback to absorb late-published cloud data.
 - **30-day initial backfill** — first run pulls a month of history per sensor.
 - **Full schema** — temperature, humidity, barometric pressure, dewpoint, VPD, battery, RSSI, plus the gateway each sample arrived through.
+- **Absolute humidity** — the water actually in the air, in grains per pound (gr/lb) or g/m³, worked out from each reading's own temperature and RH; see [Absolute humidity](#absolute-humidity).
 - **Gateway tracking** — polls `/devices/gateways` alongside sensors; appends a `gateway_status` row per poll so you can answer "was the gateway online during this gap window?" after the fact.
 - **Gap analysis** — detects missing windows (interior, leading, and trailing), sparse hours, and per-gap gateway-online status. A dead sensor reports as one big trailing gap, not as 100% coverage.
 - **Targeted backfill** — "Fix all gaps" button re-fetches only the windows the local DB shows as missing, instead of broadly re-pulling the whole range.
@@ -42,9 +43,22 @@ Aggregated view over the selected range: per-zone highlights (warmest/coolest/mo
 
 ### Explorer
 
-Multi-sensor chart with togglable series (temperature, humidity, pressure, dewpoint, heat index, VPD) and zoom, an outdoor-weather overlay (when `weather.{lat,lon}` is configured), user-annotated event markers, plus an edit mode for excluding bad readings or whole hourly buckets from aggregates.
+Multi-sensor chart with togglable series (temperature, humidity, absolute humidity, pressure, dewpoint, heat index, VPD) and zoom, an outdoor-weather overlay (when `weather.{lat,lon}` is configured), user-annotated event markers, plus an edit mode for excluding bad readings or whole hourly buckets from aggregates.
 
 ![Explorer tab](docs/screenshots/explorer.png)
+
+#### Absolute humidity
+
+Relative humidity moves with temperature alone: the same air reads 60% in a cool basement and 45% in a warm bedroom. Absolute humidity measures the water itself, so rooms at different temperatures, and indoors against outdoors, can be compared directly. Turn on **Abs. humidity** for a sensor (or for every selected sensor from the *Show* row) and it gets a panel of its own; the outdoor overlay adds Open-Meteo's value when weather is configured. *Abs. humidity in* picks the unit, remembered per browser: **gr/lb** by default, since the recorder reports °F, or **g/m³**. The Stats tab's humidity table shows the range's mean in the same unit, and the CSV export carries both.
+
+Each reading's value comes from its own temperature *T* and relative humidity *RH*:
+
+- Saturation vapour pressure (Magnus, Alduchov-Eskridge constants), *T* in °C: e<sub>s</sub>(T) = 6.1094 · exp(17.625 T / (243.04 + T)) hPa
+- Vapour pressure: e = RH/100 · e<sub>s</sub>(T), the saturation pressure at the dew point
+- **Humidity ratio**, grains of water per pound of dry air: W = 7000 · 0.62198 · e / (p − e) = 4353.6 · e / (p − e), with **p = 1013.25 hPa (sea level)**. At altitude the true ratio is higher: about 4% at 300 m and 13% at 1000 m. Dehumidifier and psychrometric-chart readings assume sea level too.
+- **Absolute humidity**, grams of water per cubic metre of air: ρ<sub>v</sub> = e / (R<sub>v</sub> · T<sub>K</sub>) = 216.68 · e / T<sub>K</sub>, which doesn't depend on pressure.
+
+Raw ranges (`h`) plot each reading's value. Hourly ranges (`d`) plot the hour's mean of those values, and daily ranges (`yr`) the mean of the hours; an hour aggregated before 1.4.0 falls back to its average dew point and temperature, which differs by well under 1%. These agree with ASHRAE's tables to within 1% (70 °F at 50% RH: 54.4 gr/lb, 9.2 g/m³).
 
 ### Analytics
 
@@ -159,9 +173,9 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | GET | `/` | sensors list (JSON) or Explorer UI (HTML); JSON response includes `oldestReadingTs` so the Stats YoY toggle knows whether ≥1y of data exists |
 | GET | `/gateways` | per-gateway status; optional `?range=Xd` adds uptime % + primary-sensor count |
 | GET | `/battery` | per-sensor battery voltage trend + projected days-until-replacement |
-| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `2h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg); optional `endTs` anchors the window for the YoY overlay |
+| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `2h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg); optional `endTs` anchors the window for the YoY overlay. Each sample has `humidityRatio` (gr/lb) and `absHumidity` (g/m³) since 1.4.0 |
 | GET | `/:id/history/all?range=7d` | includes excluded points (data QA) |
-| GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition |
+| GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition; `humidity_ratio_gr_lb` and `abs_humidity_g_m3` are the last two columns (1.4.0) |
 | GET | `/:id/gaps?range=7d` | missing windows + sparse hours + coverage %; each gap annotated with `gatewayOnline: true \| false \| null` |
 | PATCH | `/:id/readings/exclude` | toggle reading exclusion (auto-recomputes hourly bucket) |
 | PATCH | `/:id/hourly/exclude` | toggle hourly bucket exclusion |

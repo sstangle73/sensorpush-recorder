@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import vm from 'node:vm';
 import { createApp, _renderMetrics } from '../server.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings, logNotification } from '../db.js';
+import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings, logNotification, dewPointF, grainsPerLb, absHumidityGm3 } from '../db.js';
 import { vi } from 'vitest';
 
 let server, baseUrl, db;
@@ -1062,7 +1062,7 @@ describe('GET /:id/history.csv', () => {
     const r = await fetch(csvUrl + '/csv1/history.csv?range=24h');
     const text = await r.text();
     const header = text.split('\n')[0];
-    expect(header).toBe('ts,observed_iso,temperature,humidity,baro_pressure,dewpoint,vpd');
+    expect(header).toBe('ts,observed_iso,temperature,humidity,baro_pressure,dewpoint,vpd,humidity_ratio_gr_lb,abs_humidity_g_m3');
     // Two readings → two data rows
     expect(text.trim().split('\n').length).toBe(3);
     // Values from the seeded data should appear
@@ -1074,7 +1074,23 @@ describe('GET /:id/history.csv', () => {
     const r = await fetch(csvUrl + '/csv1/history.csv?range=7d');
     const text = await r.text();
     const header = text.split('\n')[0];
-    expect(header).toBe('ts,observed_iso,temperature,temp_min,temp_max,humidity,hum_min,hum_max,baro_pressure,dewpoint,vpd');
+    expect(header).toBe('ts,observed_iso,temperature,temp_min,temp_max,humidity,hum_min,hum_max,baro_pressure,dewpoint,vpd,humidity_ratio_gr_lb,abs_humidity_g_m3');
+  });
+
+  it('carries each reading\'s absolute humidity, from its own T and RH', async () => {
+    const text = await (await fetch(csvUrl + '/csv1/history.csv?range=24h')).text();
+    const [header, first] = text.trim().split('\n');
+    const row = Object.fromEntries(header.split(',').map((c, i) => [c, first.split(',')[i]]));
+    const dew = dewPointF(70.5, 45.2);
+    expect(+row.humidity_ratio_gr_lb).toBeCloseTo(grainsPerLb(dew), 2);
+    expect(+row.abs_humidity_g_m3).toBeCloseTo(absHumidityGm3(dew, 70.5), 3);
+  });
+
+  it('/history returns humidityRatio and absHumidity per sample', async () => {
+    const body = await (await fetch(csvUrl + '/csv1/history?range=24h')).json();
+    expect(body.samples[0].humidityRatio).toBeCloseTo(grainsPerLb(dewPointF(70.5, 45.2)), 2);
+    expect(body.samples[0].absHumidity).toBeGreaterThan(8);
+    expect(body.samples[0].absHumidity).toBeLessThan(9);
   });
 
   it('returns 404 for unknown sensor', async () => {

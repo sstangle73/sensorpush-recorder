@@ -111,7 +111,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v27';
+const CACHE='sensorpush-v28';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -687,10 +687,13 @@ export function createApp(db, config = null, onSwap = null) {
     const samples = getHistory(db, sensorId, range);
     const unit    = rangeUnit(range);
     // Column set varies by resolution: raw has dewpoint/vpd per sample,
-    // hourly/daily aggregates expose min/max bands.
+    // hourly/daily aggregates expose min/max bands. Absolute humidity (1.4.0)
+    // goes last in both units, so a sheet that reads columns by position
+    // still finds the older ones where they were.
+    const ah = ['humidity_ratio_gr_lb', 'abs_humidity_g_m3'];
     const cols = unit === 'h'
-      ? ['ts', 'observed_iso', 'temperature', 'humidity', 'baro_pressure', 'dewpoint', 'vpd']
-      : ['ts', 'observed_iso', 'temperature', 'temp_min', 'temp_max', 'humidity', 'hum_min', 'hum_max', 'baro_pressure', 'dewpoint', 'vpd'];
+      ? ['ts', 'observed_iso', 'temperature', 'humidity', 'baro_pressure', 'dewpoint', 'vpd', ...ah]
+      : ['ts', 'observed_iso', 'temperature', 'temp_min', 'temp_max', 'humidity', 'hum_min', 'hum_max', 'baro_pressure', 'dewpoint', 'vpd', ...ah];
 
     const fmt = v => v == null ? '' : (typeof v === 'number' ? v.toString() : String(v));
     const rows = samples.map(s => cols.map(c => {
@@ -702,6 +705,8 @@ export function createApp(db, config = null, onSwap = null) {
         case 'temp_max':      return fmt(s.tempMax);
         case 'hum_min':       return fmt(s.humMin);
         case 'hum_max':       return fmt(s.humMax);
+        case 'humidity_ratio_gr_lb': return fmt(s.humidityRatio);
+        case 'abs_humidity_g_m3':    return fmt(s.absHumidity);
         default:              return fmt(s[c]);
       }
     }).join(','));

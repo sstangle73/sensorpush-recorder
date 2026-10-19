@@ -1,4 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   openDb, upsertSensors, getLatestTs, insertReadings,
   recomputeHourlyAgg, getSensors, getHistory, getHistoryAll,
@@ -9,6 +13,7 @@ import {
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
   insertOutdoorReadings, getLatestOutdoorTs, getOutdoorHistory, getLatestOutdoorReading,
+  dewPointF, grainsPerLb, absHumidityGm3,
 } from '../db.js';
 
 function makeDb() {
@@ -798,6 +803,87 @@ describe('per-sample gateway + dewpoint/vpd capture', () => {
     const row = db.prepare('SELECT dewpoint_avg, vpd_avg FROM hourly_agg WHERE sensor_id=? AND hour_ts=?').get('s2', hour);
     expect(row.dewpoint_avg).toBeCloseTo(51);
     expect(row.vpd_avg).toBeCloseTo(1.05);
+  });
+
+  describe('absolute humidity (1.4.0)', () => {
+    const NOW = Math.floor(Date.now() / 1000);
+    const hour = NOW - (NOW % 3600) - 3600;
+    const ahOf = (t, rh) => {
+      const d = dewPointF(t, rh);
+      return { gr: grainsPerLb(d), gm3: absHumidityGm3(d, t) };
+    };
+
+    function seed() {
+      const db = makeDb();
+      upsertSensors(db, [{ id: 'a1', name: 'Bedroom', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+      insertReadings(db, 'a1', [
+        { observed: new Date((hour + 60) * 1000).toISOString(),  temperature: 70, humidity: 50 },
+        { observed: new Date((hour + 120) * 1000).toISOString(), temperature: 64, humidity: 70 },
+      ]);
+      recomputeHourlyAgg(db, 'a1', hour);
+      return db;
+    }
+
+    it('the hourly row stores the mean of each reading\'s own value', () => {
+      const db = seed();
+      const row = db.prepare('SELECT hr_avg, ah_avg FROM hourly_agg WHERE sensor_id=? AND hour_ts=?').get('a1', hour);
+      const a = ahOf(70, 50), b = ahOf(64, 70);
+      expect(row.hr_avg).toBeCloseTo((a.gr + b.gr) / 2, 9);
+      expect(row.ah_avg).toBeCloseTo((a.gm3 + b.gm3) / 2, 9);
+      // Not the value of the averaged T and RH, which RH's dependence on T skews.
+      expect(Math.abs(row.hr_avg - ahOf(67, 60).gr)).toBeGreaterThan(0.1);
+    });
+
+    it('raw history carries each reading\'s humidityRatio and absHumidity', () => {
+      const rows = getHistory(seed(), 'a1', '24h');
+      expect(rows).toHaveLength(2);
+      expect(rows[0].humidityRatio).toBeCloseTo(ahOf(70, 50).gr, 2);
+      expect(rows[0].absHumidity).toBeCloseTo(ahOf(70, 50).gm3, 3);
+    });
+
+    it('hourly and daily history read the stored means', () => {
+      const db = seed();
+      const row = db.prepare('SELECT hr_avg, ah_avg FROM hourly_agg WHERE sensor_id=?').get('a1');
+      for (const range of ['7d', '1yr']) {
+        const [h] = getHistory(db, 'a1', range);
+        expect(h.humidityRatio).toBeCloseTo(row.hr_avg, 2);
+        expect(h.absHumidity).toBeCloseTo(row.ah_avg, 3);
+      }
+      const [all] = getHistoryAll(db, 'a1', '7d');
+      expect(all.humidityRatio).toBeCloseTo(row.hr_avg, 2);
+    });
+
+    it('an hour aggregated before 1.4.0 falls back to its average dew point', () => {
+      const db = seed();
+      db.prepare('UPDATE hourly_agg SET hr_avg = NULL, ah_avg = NULL, dewpoint_avg = 50').run();
+      const [h] = getHistory(db, 'a1', '7d');
+      expect(h.humidityRatio).toBeCloseTo(grainsPerLb(50), 2);
+      expect(h.absHumidity).toBeCloseTo(absHumidityGm3(50, h.temperature), 3);
+    });
+
+    it('a reading without RH has no absolute humidity', () => {
+      const db = makeDb();
+      upsertSensors(db, [{ id: 'a2', name: 'X', type: 'HT1', active: true, batteryVoltage: 2.9 }]);
+      insertReadings(db, 'a2', [{ observed: new Date((hour + 60) * 1000).toISOString(), temperature: 70, humidity: null }]);
+      recomputeHourlyAgg(db, 'a2', hour);
+      expect(getHistory(db, 'a2', '24h')[0].humidityRatio).toBeNull();
+      expect(db.prepare('SELECT hr_avg FROM hourly_agg WHERE sensor_id=?').get('a2').hr_avg).toBeNull();
+    });
+
+    it('openDb adds the columns to a database from before 1.4.0', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'sp-ah-'));
+      const path = join(dir, 'old.db');
+      const old = new DatabaseSync(path);
+      old.exec(`CREATE TABLE hourly_agg (sensor_id TEXT NOT NULL, hour_ts INTEGER NOT NULL, temp_avg REAL,
+        temp_min REAL, temp_max REAL, hum_avg REAL, hum_min REAL, hum_max REAL, baro_avg REAL,
+        sample_count INTEGER, PRIMARY KEY (sensor_id, hour_ts))`);
+      old.close();
+      const db = openDb(path);
+      const cols = db.prepare('PRAGMA table_info(hourly_agg)').all().map(r => r.name);
+      expect(cols).toEqual(expect.arrayContaining(['hr_avg', 'ah_avg']));
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
   });
 
   describe('getSensorPrimaryGateway', () => {

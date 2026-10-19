@@ -186,6 +186,11 @@ export function openDb(path) {
     const cols = db.prepare(`PRAGMA table_info(hourly_agg)`).all().map(r => r.name);
     if (!cols.includes('dewpoint_avg')) db.exec(`ALTER TABLE hourly_agg ADD COLUMN dewpoint_avg REAL`);
     if (!cols.includes('vpd_avg'))      db.exec(`ALTER TABLE hourly_agg ADD COLUMN vpd_avg      REAL`);
+    // Absolute humidity (1.4.0): the hour's mean of each reading's own value.
+    // Hours aggregated before 1.4.0 stay NULL; withAbsHumidity() fills those
+    // from the hour's average dew point and temperature on read.
+    if (!cols.includes('hr_avg'))       db.exec(`ALTER TABLE hourly_agg ADD COLUMN hr_avg       REAL`);
+    if (!cols.includes('ah_avg'))       db.exec(`ALTER TABLE hourly_agg ADD COLUMN ah_avg       REAL`);
   }
   // Migrate: pending_since on notification_state (added with anomaly dwell-time gating).
   {
@@ -429,10 +434,13 @@ export function recomputeHourlyAgg(db, sensorId, hourTs) {
   // rather than INSERT OR REPLACE-ing it with all-NULL aggregates and
   // sample_count = 0 — such "zombie" rows would show up in sparseHours
   // (sample_count < 20) on every gap query and trigger pointless backfills.
-  const { n } = db.prepare(`
-    SELECT COUNT(*) AS n FROM readings
+  // The readings' temperature and RH also give the hour's mean absolute
+  // humidity, which SQL can't compute (no exp() in every SQLite build).
+  const th = db.prepare(`
+    SELECT temperature AS t, humidity AS h FROM readings
     WHERE sensor_id = ? AND ts >= ? AND ts < ? AND excluded = 0
-  `).get(sensorId, hourTs, hourTs + 3600);
+  `).all(sensorId, hourTs, hourTs + 3600);
+  const n = th.length;
 
   if (n === 0) {
     db.prepare(`DELETE FROM hourly_agg WHERE sensor_id = ? AND hour_ts = ?`).run(sensorId, hourTs);
@@ -445,20 +453,29 @@ export function recomputeHourlyAgg(db, sensorId, hourTs) {
   const existing = db.prepare(`SELECT excluded FROM hourly_agg WHERE sensor_id = ? AND hour_ts = ?`).get(sensorId, hourTs);
   const excluded = existing?.excluded ?? 0;
 
+  let hrSum = 0, ahSum = 0, ahN = 0;
+  for (const { t, h } of th) {
+    const dew = dewPointF(t, h);
+    if (dew == null) continue;
+    hrSum += grainsPerLb(dew); ahSum += absHumidityGm3(dew, t); ahN++;
+  }
+
   db.prepare(`
     INSERT OR REPLACE INTO hourly_agg
-      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, sample_count, excluded)
+      (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, baro_avg, dewpoint_avg, vpd_avg, hr_avg, ah_avg, sample_count, excluded)
     SELECT ?, ?,
       AVG(temperature), MIN(temperature), MAX(temperature),
       AVG(humidity),    MIN(humidity),    MAX(humidity),
       AVG(baro_pressure),
       AVG(dewpoint),
       AVG(vpd),
+      ?, ?,
       COUNT(*),
       ?
     FROM readings
     WHERE sensor_id = ? AND ts >= ? AND ts < ? AND excluded = 0
-  `).run(sensorId, hourTs, excluded, sensorId, hourTs, hourTs + 3600);
+  `).run(sensorId, hourTs, ahN ? hrSum / ahN : null, ahN ? ahSum / ahN : null, excluded,
+         sensorId, hourTs, hourTs + 3600);
 }
 
 // Retention: delete raw readings older than cutoffTs in bounded, yielding
@@ -637,33 +654,34 @@ export function getHistory(db, sensorId, range, endTs = null) {
   const unit  = rangeUnit(range) ?? 'h';
 
   if (unit === 'h') {
-    return db.prepare(`
+    return withAbsHumidity(db.prepare(`
       SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax
       FROM readings WHERE sensor_id = ? AND ts >= ? AND ts <= ? AND excluded = 0
       ORDER BY ts
-    `).all(sensorId, since, end);
+    `).all(sensorId, since, end), true);
   }
   if (unit === 'd') {
-    return db.prepare(`
+    return withAbsHumidity(db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
-             dewpoint_avg AS dewpoint, vpd_avg AS vpd,
+             dewpoint_avg AS dewpoint, vpd_avg AS vpd, hr_avg AS humidityRatio, ah_avg AS absHumidity,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax
       FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
       ORDER BY hour_ts
-    `).all(sensorId, since, end);
+    `).all(sensorId, since, end), false);
   }
   // yr → daily aggregates computed from hourly_agg (no schema change needed)
-  return db.prepare(`
+  return withAbsHumidity(db.prepare(`
     SELECT (hour_ts / 86400 * 86400) AS ts,
            AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
            AVG(baro_avg) AS baroPressure,
-           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd
+           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd,
+           AVG(hr_avg) AS humidityRatio, AVG(ah_avg) AS absHumidity
     FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
-  `).all(sensorId, since, end);
+  `).all(sensorId, since, end), false);
 }
 
 // Oldest non-excluded reading ts across all sensors, or null when the DB is
@@ -692,33 +710,34 @@ export function getHistoryAll(db, sensorId, range) {
   const unit  = rangeUnit(range) ?? 'h';
 
   if (unit === 'h') {
-    return db.prepare(`
+    return withAbsHumidity(db.prepare(`
       SELECT ts, temperature, humidity, baro_pressure AS baroPressure, dewpoint, vpd,
              NULL AS tempMin, NULL AS tempMax, NULL AS humMin, NULL AS humMax, excluded
       FROM readings WHERE sensor_id = ? AND ts >= ?
       ORDER BY ts
-    `).all(sensorId, since);
+    `).all(sensorId, since), true);
   }
   if (unit === 'd') {
-    return db.prepare(`
+    return withAbsHumidity(db.prepare(`
       SELECT hour_ts AS ts, temp_avg AS temperature, hum_avg AS humidity, baro_avg AS baroPressure,
-             dewpoint_avg AS dewpoint, vpd_avg AS vpd,
+             dewpoint_avg AS dewpoint, vpd_avg AS vpd, hr_avg AS humidityRatio, ah_avg AS absHumidity,
              temp_min AS tempMin, temp_max AS tempMax, hum_min AS humMin, hum_max AS humMax, excluded
       FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ?
       ORDER BY hour_ts
-    `).all(sensorId, since);
+    `).all(sensorId, since), false);
   }
   // yr → daily; exclusion not meaningful at this granularity (excluded always 0)
-  return db.prepare(`
+  return withAbsHumidity(db.prepare(`
     SELECT (hour_ts / 86400 * 86400) AS ts,
            AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
            AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
            AVG(baro_avg) AS baroPressure,
-           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd, 0 AS excluded
+           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd,
+           AVG(hr_avg) AS humidityRatio, AVG(ah_avg) AS absHumidity, 0 AS excluded
     FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
     GROUP BY (hour_ts / 86400 * 86400)
     ORDER BY ts
-  `).all(sensorId, since);
+  `).all(sensorId, since), false);
 }
 
 export function setReadingExcluded(db, sensorId, ts, excluded) {
@@ -1030,6 +1049,49 @@ export function dewPointF(tF, rh) {
   const tc = (tF - 32) * 5 / 9;
   const g  = Math.log(Math.min(rh, 100) / 100) + 17.625 * tc / (243.04 + tc);
   return (243.04 * g / (17.625 - g)) * 9 / 5 + 32;
+}
+
+// ── Absolute humidity ──────────────────────────────────────────────────────
+// Both measures of the water actually in the air, from the dew point (which
+// carries the reading's own temperature and RH). Same Magnus constants as
+// dewPointF, sea-level pressure (1013.25 hPa) for the humidity ratio, as
+// dehumidifiers display grains. These match the UI's grainsPerLb() and
+// absHumidityGm3() (tests/ui-psychro.test.js keeps them equal).
+function satVaporHpa(tF) {
+  const tc = (tF - 32) * 5 / 9;
+  return 6.1094 * Math.exp(17.625 * tc / (243.04 + tc));
+}
+
+// Humidity ratio, grains of water per pound of dry air: 7000 × 0.62198 ×
+// e / (p − e), with e the vapour pressure at the dew point.
+export function grainsPerLb(dewF) {
+  if (dewF == null || !Number.isFinite(dewF)) return null;
+  const pw = satVaporHpa(dewF);
+  return 4353.6 * pw / (1013.25 - pw);
+}
+
+// Absolute humidity, grams of water per cubic metre of air: e / (Rv × T)
+// = 216.68 × e[hPa] / T[K]. Needs the air temperature as well as the dew
+// point, and doesn't depend on pressure.
+export function absHumidityGm3(dewF, tF) {
+  if (dewF == null || tF == null || !Number.isFinite(dewF) || !Number.isFinite(tF)) return null;
+  return 216.68 * satVaporHpa(dewF) / ((tF - 32) * 5 / 9 + 273.15);
+}
+
+const round = (v, places) => v == null ? null : Math.round(v * 10 ** places) / 10 ** places;
+
+// Adds humidityRatio (gr/lb) and absHumidity (g/m³) to history rows. Raw
+// readings get theirs from their own temperature and RH; aggregate rows
+// carry the hour's mean (hr_avg / ah_avg), and an hour aggregated before
+// those columns existed falls back to its average dew point and temperature.
+export function withAbsHumidity(rows, raw) {
+  for (const r of rows) {
+    const dew = raw ? dewPointF(r.temperature, r.humidity)
+                    : r.dewpoint ?? dewPointF(r.temperature, r.humidity);
+    r.humidityRatio = round(r.humidityRatio ?? grainsPerLb(dew), 2);
+    r.absHumidity   = round(r.absHumidity   ?? absHumidityGm3(dew, r.temperature), 3);
+  }
+  return rows;
 }
 
 export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {
