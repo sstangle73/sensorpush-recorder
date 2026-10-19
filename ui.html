@@ -204,10 +204,11 @@ header .spacer { flex: 1; }
 .series-toggle.all  { color: var(--accent); border-color: var(--accent); }
 .series-toggle.some { color: var(--warn);   border-color: var(--warn); }
 .series-toggle .stg { font-family: monospace; font-size: 13px; line-height: 1; }
-#series-toggles-label {
+#series-toggles-label, #ah-unit-label {
   font-size: 11px; color: var(--text3);
   margin-right: 2px; user-select: none;
 }
+#ah-unit-label { margin-left: 8px; }
 
 /* ── Legend ── */
 #legend {
@@ -219,6 +220,11 @@ header .spacer { flex: 1; }
 .leg-dash {
   width: 18px; height: 2px; background: currentColor;
   background: repeating-linear-gradient(90deg,currentColor 0,currentColor 5px,transparent 5px,transparent 8px);
+}
+/* Dash-dot, as the absolute-humidity line is drawn (8,3,2,3). */
+.leg-dash.leg-dashdot {
+  width: 24px;
+  background: repeating-linear-gradient(90deg,currentColor 0,currentColor 8px,transparent 8px,transparent 11px,currentColor 11px,currentColor 13px,transparent 13px,transparent 16px);
 }
 
 /* ── Empty ── */
@@ -1366,6 +1372,32 @@ function grainsPerLb(dewF) {
   const pw = _satVaporHpa(dewF);
   return 4353.6 * pw / (1013.25 - pw);
 }
+// Absolute humidity in grams of water per cubic metre of air: e / (Rv × T)
+// = 216.68 × e[hPa] / T[K], e being the vapour pressure at the dew point.
+function absHumidityGm3(dewF, tF) {
+  if (dewF == null || tF == null || !isFinite(dewF) || !isFinite(tF)) return null;
+  return 216.68 * _satVaporHpa(dewF) / ((tF - 32) / 1.8 + 273.15);
+}
+
+// The Explorer's absolute-humidity metric, in either unit. gr/lb is the
+// humidity ratio (what dehumidifiers and US psychrometric charts use);
+// g/m³ is the metric convention. The default follows the temperature unit.
+const AH_UNITS = {
+  grlb: { label: 'gr/lb', digits: 1, minSpan: 5 },
+  gm3:  { label: 'g/m³',  digits: 2, minSpan: 0.5 },
+};
+function defaultAhUnit(tempUnit) { return tempUnit === 'C' ? 'gm3' : 'grlb'; }
+// A history sample carries the server's humidityRatio / absHumidity (from
+// each reading's own T and RH, or the hour's mean of them); anything else
+// (a live sample, the outdoor series) is computed here from T and RH, then
+// from its dew point when RH is missing.
+function ahValue(s, unit) {
+  if (!s) return null;
+  const stored = unit === 'gm3' ? s.absHumidity : s.humidityRatio;
+  if (stored != null) return stored;
+  const dew = dewPointF(s.temperature, s.humidity) ?? s.dewpoint ?? null;
+  return unit === 'gm3' ? absHumidityGm3(dew, s.temperature) : grainsPerLb(dew);
+}
 // RH the air would have against a surface at surfaceF: what mold on a cold
 // wall or crawl space responds to (≥80% sustained), and ≥100% is condensation.
 function surfaceRh(dewF, surfaceF) {
@@ -1528,8 +1560,16 @@ const VGAP = 16; // gap between panels
 
 let _sensors   = {};
 let _selected  = new Set();
-// Which series per sensor are active: 'temp' | 'humidity' | 'pressure'
+// Which series per sensor are active: 'temp' | 'humidity' | 'pressure' |
+// 'dewpoint' | 'heatindex' | 'vpd' | 'absHumidity'
 let _series    = {};   // id → Set of active series names
+// The recorder reports °F, so absolute humidity defaults to gr/lb; the
+// viewer's pick is kept per browser.
+const TEMP_UNIT = 'F';
+let _ahUnit = (() => {
+  try { const v = localStorage.getItem('ahUnit'); if (AH_UNITS[v]) return v; } catch {}
+  return defaultAhUnit(TEMP_UNIT);
+})();
 let _range     = '24h';
 let _colorMap  = {};
 let _chartData = {};   // id → { name, color, samples, resolution }
@@ -2519,6 +2559,7 @@ function computeSensorStats(samples, comfort) {
   const tempVals  = samples.map(s => s.temperature).filter(v => v != null);
   const humVals   = samples.map(s => s.humidity).filter(v => v != null);
   const dewVals   = samples.map(s => s.dewpoint ?? dewPointF(s.temperature, s.humidity)).filter(v => v != null);
+  const ahOf      = unit => _mean(samples.map(s => ahValue(s, unit)).filter(v => v != null));
   const tempRange = _extremeRange(samples, 'temperature', 'tempMin', 'tempMax');
   const humRange  = _extremeRange(samples, 'humidity',    'humMin',  'humMax');
   // Comfort %: only meaningful when bounds are configured for this sensor.
@@ -2544,6 +2585,7 @@ function computeSensorStats(samples, comfort) {
     humComfortPct:  humC ? _inRangePct(samples, 'humidity', humC.lo ?? -Infinity, humC.hi ?? Infinity) : null,
     humSlope:       _slopePerDay(samples, 'humidity'),
     dewAvg:         _mean(dewVals),
+    ahAvg:          { grlb: ahOf('grlb'), gm3: ahOf('gm3') },
     dewComfortPct:  dewC && dewVals.length ? inDew / dewVals.length : null,
   };
 }
@@ -2948,7 +2990,7 @@ function renderStatsTable(all, kind) {
 
   const headers = isTemp
     ? `<tr><th>Sensor</th><th>Avg</th><th>Min–Max</th><th>σ</th><th>Swing/day</th><th>In comfort</th>${showAlert ? '<th>In alert</th>' : ''}<th>Trend</th></tr>`
-    : `<tr><th>Sensor</th><th>Avg RH</th><th>Min–Max</th><th>σ</th><th>Dew point</th><th>gr/lb</th><th>RH in comfort</th><th>Dew in comfort</th>${showAlert ? '<th>In alert</th>' : ''}</tr>`;
+    : `<tr><th>Sensor</th><th>Avg RH</th><th>Min–Max</th><th>σ</th><th>Dew point</th><th>${AH_UNITS[_ahUnit].label}</th><th>RH in comfort</th><th>Dew in comfort</th>${showAlert ? '<th>In alert</th>' : ''}</tr>`;
 
   // Insert group rows between sensor rows so the user can see classification
   // boundaries without a separate legend.
@@ -3005,7 +3047,7 @@ function renderStatsTable(all, kind) {
       <td>${s.humMin != null ? `${Math.round(s.humMin)}–${Math.round(s.humMax)}%` : '—'}</td>
       <td>${fmtNum(s.humStddev, 2)}</td>
       <td>${s.dewAvg != null ? fmtNum(s.dewAvg) + '°F' : '—'}</td>
-      <td>${s.dewAvg != null ? fmtNum(grainsPerLb(s.dewAvg)) : '—'}</td>
+      <td>${s.ahAvg?.[_ahUnit] != null ? fmtNum(s.ahAvg[_ahUnit], AH_UNITS[_ahUnit].digits) : '—'}</td>
       <td>${humComfortCell}</td>
       <td>${dewComfortCell}</td>
       ${alertCell}
@@ -4592,6 +4634,9 @@ function renderSidebar() {
         <label class="series-row">
           <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="humidity" ${ser.has('humidity')?'checked':''} onchange="toggleSeries(this)"> Humidity
         </label>
+        <label class="series-row">
+          <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="absHumidity" ${ser.has('absHumidity')?'checked':''} onchange="toggleSeries(this)"> Abs. humidity
+        </label>
         ${hasBaro ? `<label class="series-row">
           <input type="checkbox" class="series-check" data-id="${esc(s.id)}" data-ser="pressure" ${ser.has('pressure')?'checked':''} onchange="toggleSeries(this)"> Pressure
         </label>` : ''}
@@ -4697,6 +4742,9 @@ function seriesAvailable(seriesType) {
   if (seriesType === 'vpd') {
     return ids.some(id => (_chartData[id]?.samples || []).some(s => s.vpd != null));
   }
+  if (seriesType === 'absHumidity') {
+    return ids.some(id => (_chartData[id]?.samples || []).some(s => ahValue(s, _ahUnit) != null));
+  }
   return false;
 }
 
@@ -4722,6 +4770,7 @@ function renderSeriesToggles() {
   const types = [
     { key: 'temp',      label: 'Temperature' },
     { key: 'humidity',  label: 'Humidity' },
+    { key: 'absHumidity', label: 'Abs. humidity' },
     { key: 'pressure',  label: 'Pressure' },
     { key: 'dewpoint',  label: 'Dew point' },
     { key: 'heatindex', label: 'Heat index' },
@@ -4735,9 +4784,25 @@ function renderSeriesToggles() {
       : `Show ${t.label} on all selected sensors`;
     return `<button class="series-toggle ${state}" onclick="toggleAllSeries('${t.key}')" title="${title}"><span class="stg">${glyph}</span>${t.label}</button>`;
   });
+  // Unit picker for absolute humidity, shown once any selected sensor plots it.
+  if (seriesState('absHumidity') !== 'none') {
+    items.push(`<span id="ah-unit-label">Abs. humidity in</span>` +
+      Object.entries(AH_UNITS).map(([k, u]) =>
+        `<button class="series-toggle ah-unit ${k === _ahUnit ? 'all' : 'none'}" onclick="setAhUnit('${k}')" title="Show absolute humidity in ${u.label}" aria-pressed="${k === _ahUnit}"><span class="stg">${k === _ahUnit ? '●' : '○'}</span>${u.label}</button>`
+      ).join(''));
+  }
   el.innerHTML = items.length
     ? `<span id="series-toggles-label">Show:</span>` + items.join('')
     : '';
+}
+
+function setAhUnit(unit) {
+  if (!AH_UNITS[unit] || unit === _ahUnit) return;
+  _ahUnit = unit;
+  try { localStorage.setItem('ahUnit', unit); } catch {}
+  renderSeriesToggles();
+  renderChart();
+  if (_currentView === 'stats' && typeof renderStats === 'function') renderStats();
 }
 
 async function toggleSensor(id) {
@@ -5878,11 +5943,14 @@ function toggleEditMode() {
 // against the common temp+humidity layout; normalizing at the end means any
 // other subset (humidity alone, humidity+VPD, …) still fills the whole
 // canvas instead of drawing at 42% height with dead space underneath.
-function panelFractions({ temp, hum, baro, vpd }) {
-  const extras = (baro ? 1 : 0) + (vpd ? 1 : 0);
+// Panel order is temp, hum, ah (absolute humidity), baro, vpd: the same
+// order renderChart() pushes panelTypes in.
+function panelFractions({ temp, hum, ah, baro, vpd }) {
+  const extras = (ah ? 1 : 0) + (baro ? 1 : 0) + (vpd ? 1 : 0);
   const fracs = [];
   if (temp) fracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : hum ? 0.58 : 1.0);
   if (hum)  fracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
+  if (ah)   fracs.push(hum ? 0.24 : 0.32);
   if (baro) fracs.push(vpd ? 0.15 : 0.18);
   if (vpd)  fracs.push(baro ? 0.15 : 0.18);
   const sum = fracs.reduce((a, b) => a + b, 0);
@@ -5892,11 +5960,12 @@ function panelFractions({ temp, hum, baro, vpd }) {
 // Value a tooltip row is ranked by: the metric plotted on the topmost panel,
 // and only when that sensor actually draws it. A sensor that isn't showing
 // the ranking metric sorts last rather than borrowing an unplotted value.
-function tooltipSortValue(sample, panelType, series) {
+function tooltipSortValue(sample, panelType, series, ahUnit = 'grlb') {
   if (!sample) return null;
   const has = s => !series || series.has(s);
   switch (panelType) {
     case 'hum':  return has('humidity') ? (sample.humidity     ?? null) : null;
+    case 'ah':   return has('absHumidity') ? ahValue(sample, ahUnit) : null;
     case 'baro': return has('pressure') ? (sample.baroPressure ?? null) : null;
     case 'vpd':  return has('vpd')      ? (sample.vpd          ?? null) : null;
     default:
@@ -5904,6 +5973,12 @@ function tooltipSortValue(sample, panelType, series) {
       if (has('dewpoint') && sample.dewpoint    != null) return sample.dewpoint;
       return null;
   }
+}
+
+// Open-Meteo samples name temperature `temp`; shim them into the sensors'
+// shape so the same helpers (tooltip ranking, absolute humidity) read them.
+function outdoorAsSample(s) {
+  return s ? { ...s, temperature: s.temp } : s;
 }
 
 // Highest value first so the reading you're hunting for is at the top of the
@@ -5957,12 +6032,16 @@ function renderChart() {
     (_chartData[id]?.samples||[]).some(s => s.temperature != null && s.humidity != null));
   const showVPD   = entries.some(([id]) => (_series[id]||new Set()).has('vpd') &&
     (_chartData[id]?.samples||[]).some(s => s.vpd != null));
+  const ahU       = _ahUnit, ahMeta = AH_UNITS[ahU];
+  const ahOf      = s => ahValue(s, ahU);
+  const showAH    = entries.some(([id]) => (_series[id]||new Set()).has('absHumidity') &&
+    (_chartData[id]?.samples||[]).some(s => ahOf(s) != null));
   // showTempPanel = anything that lives on the temp axis (including dewpoint/HI overlays)
   const showTempPanel = showTemp || showDew || showHI;
 
   // Active panels and their (normalized) share of the canvas height
   const panelFracs = panelFractions({
-    temp: showTempPanel, hum: showHum, baro: showBaro, vpd: showVPD,
+    temp: showTempPanel, hum: showHum, ah: showAH, baro: showBaro, vpd: showVPD,
   });
   const panels = panelFracs.length || 1;
 
@@ -5999,6 +6078,7 @@ function renderChart() {
   const panelTypes = [];
   if (showTempPanel) panelTypes.push('temp');
   if (showHum)       panelTypes.push('hum');
+  if (showAH)        panelTypes.push('ah');
   if (showBaro)      panelTypes.push('baro');
   if (showVPD)       panelTypes.push('vpd');
 
@@ -6017,7 +6097,7 @@ function renderChart() {
     return { min: lo, max: hi };
   }
 
-  let yTFn, yHFn, yBFn, yVFn;
+  let yTFn, yHFn, yAFn, yBFn, yVFn;
 
   // Outdoor overlay can contribute to the temp/hum axes even when no sensor is
   // currently visible on those axes. We collect outdoor temp samples here so
@@ -6085,6 +6165,27 @@ function renderChart() {
     yHFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
     yHFn.sc = sc;
   }
+  if (showAH) {
+    const allA = [];
+    for (const [id, { samples }] of entries) {
+      if (!(_series[id] || new Set()).has('absHumidity')) continue;
+      for (const s of samples) {
+        if (s.excluded || !inView(s)) continue;
+        const v = ahOf(s);
+        if (v != null) allA.push(v);
+      }
+    }
+    if (outdoorOn) {
+      for (const s of outdoorInView) {
+        const v = ahOf(outdoorAsSample(s));
+        if (v != null) allA.push(v);
+      }
+    }
+    const sc = makeYScale(allA, 0.12, ahMeta.minSpan);
+    const top = panelTop('ah'), ht = panelHeight('ah');
+    yAFn = v => top + ht - (v - sc.min) / (sc.max - sc.min) * ht;
+    yAFn.sc = sc;
+  }
   if (showBaro) {
     const allB = inclInView.map(s => s.baroPressure).filter(v => v != null);
     const sc = makeYScale(allB, 0.12, 0.05);
@@ -6125,6 +6226,13 @@ function renderChart() {
     const span = yHFn.sc.max - yHFn.sc.min;
     addGrid(yHFn, span <= 20 ? 5 : 10, v => Math.round(v) + '%', 'right');
   }
+  if (yAFn) {
+    const span = yAFn.sc.max - yAFn.sc.min;
+    const step = ahU === 'gm3'
+      ? (span <= 2 ? 0.25 : span <= 5 ? 0.5 : span <= 12 ? 1 : 2)
+      : (span <= 12 ? 2 : span <= 30 ? 5 : span <= 60 ? 10 : 20);
+    addGrid(yAFn, step, v => step < 1 ? v.toFixed(step < 0.5 ? 2 : 1) : String(Math.round(v)), 'right');
+  }
   if (yBFn) {
     const span = yBFn.sc.max - yBFn.sc.min;
     const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
@@ -6140,7 +6248,9 @@ function renderChart() {
   let axesSvg = '';
   panelTypes.forEach((type, i) => {
     const top = panelTops[i], ht = panelHeights[i];
-    const label = type === 'temp' ? 'TEMPERATURE' : type === 'hum' ? 'HUMIDITY' : type === 'baro' ? 'PRESSURE (inHg)' : 'VPD (kPa)';
+    const label = type === 'temp' ? 'TEMPERATURE' : type === 'hum' ? 'HUMIDITY'
+      : type === 'ah' ? `ABSOLUTE HUMIDITY (${ahMeta.label})`
+      : type === 'baro' ? 'PRESSURE (inHg)' : 'VPD (kPa)';
     axesSvg +=
       `<line x1="${PL}" y1="${top}" x2="${PL}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
       `<line x1="${PL}" y1="${top+ht}" x2="${PL+cW}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
@@ -6253,6 +6363,14 @@ function renderChart() {
       if (hp) dataSvg += `<path d="${hp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="5,3" opacity=".65"/>`;
     }
 
+    // Absolute humidity has its own panel; a dash-dot line marks it as
+    // derived (from T and RH), on top of the sensor's colour.
+    if (showAH && ser.has('absHumidity') && yAFn) {
+      const ap = incl.map(s => [s, ahOf(s)]).filter(([, v]) => v != null)
+        .map(([s, v], i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yAFn(v).toFixed(1)}`).join('');
+      if (ap) dataSvg += `<path d="${ap}" fill="none" stroke="${color}" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8,3,2,3" opacity=".85" class="ah-path"/>`;
+    }
+
     if (showBaro && ser.has('pressure') && yBFn) {
       const bp = incl.filter(s => s.baroPressure != null)
         .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yBFn(s.baroPressure).toFixed(1)}`).join('');
@@ -6343,6 +6461,11 @@ function renderChart() {
         .map((s,i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yHFn(s.humidity).toFixed(1)}`).join('');
       if (hp) dataSvg += `<path d="${hp}" fill="none" stroke="${OUTDOOR_COLOR}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".75"/>`;
     }
+    if (showAH && yAFn) {
+      const ap = outdoorInView.map(s => [s, ahOf(outdoorAsSample(s))]).filter(([, v]) => v != null)
+        .map(([s, v], i) => `${i?'L':'M'}${xp(s.ts*1000).toFixed(1)},${yAFn(v).toFixed(1)}`).join('');
+      if (ap) dataSvg += `<path d="${ap}" fill="none" stroke="${OUTDOOR_COLOR}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity=".85" class="ah-path-outdoor"/>`;
+    }
   }
 
   // Selection rectangle (updated dynamically on drag)
@@ -6377,6 +6500,8 @@ function renderChart() {
       legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} dewpoint</div>`);
     if (showHI && ser.has('heatindex') && (samples || []).some(s => s.temperature != null && s.humidity != null))
       legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} heat idx</div>`);
+    if (showAH && ser.has('absHumidity'))
+      legItems.push(`<div class="leg-item" style="color:${color};opacity:.85"><div class="leg-dash leg-dashdot"></div>${esc(name)} abs. humidity</div>`);
     if (showVPD && ser.has('vpd') && hasV)
       legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} VPD</div>`);
   });
@@ -6387,6 +6512,8 @@ function renderChart() {
       legItems.push(`<div class="leg-item" style="opacity:.75"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor humidity</div>`);
     if (showDew && showTempPanel)
       legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor dewpoint</div>`);
+    if (showAH)
+      legItems.push(`<div class="leg-item" style="opacity:.85"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor abs. humidity</div>`);
   }
   document.getElementById('legend').innerHTML = legItems.join('');
 
@@ -6431,17 +6558,20 @@ function renderChart() {
       const hi_  = ser.has('heatindex') ? heatIndex(near.temperature, near.humidity) : null;
       const hi   = hi_ != null ? 'hi ' + hi_.toFixed(1) + '°' : null;
       const vpd  = near.vpd          != null ? 'vpd ' + near.vpd.toFixed(2) : null;
+      const ahV  = ahOf(near);
+      const ah   = ahV != null ? ahV.toFixed(ahMeta.digits) + ' ' + ahMeta.label : null;
       const exTag = near.excluded ? '<span class="tt-excl">excl</span>' : '';
       const vals = [
         ser.has('temp')      && temp,
         ser.has('humidity')  && hum,
+        ser.has('absHumidity') && ah,
         ser.has('pressure')  && baro,
         ser.has('dewpoint')  && dp,
         ser.has('heatindex') && hi,
         ser.has('vpd')       && vpd,
       ].filter(Boolean).join(' · ') || '—';
       rows.push({
-        sortVal: tooltipSortValue(near, sortPanel, ser),
+        sortVal: tooltipSortValue(near, sortPanel, ser, ahU),
         html: `<div class="tt-row">
         <div class="tt-dot" style="background:${color}"></div>
         <span class="tt-name">${esc(name)}${exTag}</span>
@@ -6456,11 +6586,13 @@ function renderChart() {
       const t  = near.temp     != null ? near.temp.toFixed(1)     + '°F' : null;
       const h  = near.humidity != null ? Math.round(near.humidity) + '%' : null;
       const d  = near.dewpoint != null ? 'dp ' + near.dewpoint.toFixed(1) + '°' : null;
-      const vals = [t, h, d].filter(Boolean).join(' · ') || '—';
-      // Outdoor's sample uses `temp`, not `temperature` — shim it so the
-      // outdoor row ranks alongside the sensors instead of sinking to the end.
+      const aV = showAH ? ahOf(outdoorAsSample(near)) : null;
+      const a  = aV != null ? aV.toFixed(ahMeta.digits) + ' ' + ahMeta.label : null;
+      const vals = [t, h, a, d].filter(Boolean).join(' · ') || '—';
+      // Outdoor's sample uses `temp`, not `temperature`: outdoorAsSample shims
+      // it so the outdoor row ranks alongside the sensors instead of sinking.
       rows.push({
-        sortVal: tooltipSortValue({ ...near, temperature: near.temp }, sortPanel, null),
+        sortVal: tooltipSortValue(outdoorAsSample(near), sortPanel, null, ahU),
         html: `<div class="tt-row">
         <div class="tt-dot" style="background:${OUTDOOR_COLOR}"></div>
         <span class="tt-name">Outdoor</span>

@@ -3,6 +3,7 @@
 // If the implementations change in ui.html, update these copies.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 function timeAgo(iso) {
   if (!iso) return 'never';
@@ -657,32 +658,27 @@ describe('computeOutdoorDelta', () => {
   });
 });
 
-// ── Chart layout / tooltip helpers (copies of ui.html) ─────────────────────
+// ── Chart layout / tooltip helpers ─────────────────────────────────────────
 
-function panelFractions({ temp, hum, baro, vpd }) {
-  const extras = (baro ? 1 : 0) + (vpd ? 1 : 0);
-  const fracs = [];
-  if (temp) fracs.push(extras >= 2 ? 0.42 : extras === 1 ? 0.50 : hum ? 0.58 : 1.0);
-  if (hum)  fracs.push(extras >= 2 ? 0.28 : extras === 1 ? 0.32 : 0.42);
-  if (baro) fracs.push(vpd ? 0.15 : 0.18);
-  if (vpd)  fracs.push(baro ? 0.15 : 0.18);
-  const total = fracs.reduce((a, b) => a + b, 0);
-  return total > 0 ? fracs.map(f => f / total) : fracs;
-}
-
-function tooltipSortValue(sample, panelType, series) {
-  if (!sample) return null;
-  const has = s => !series || series.has(s);
-  switch (panelType) {
-    case 'hum':  return has('humidity') ? (sample.humidity     ?? null) : null;
-    case 'baro': return has('pressure') ? (sample.baroPressure ?? null) : null;
-    case 'vpd':  return has('vpd')      ? (sample.vpd          ?? null) : null;
-    default:
-      if (has('temp')     && sample.temperature != null) return sample.temperature;
-      if (has('dewpoint') && sample.dewpoint    != null) return sample.dewpoint;
-      return null;
-  }
-}
+// panelFractions and tooltipSortValue are read from ui.html itself (since
+// 1.4.0 added the absolute-humidity panel), not copied, so they can't drift.
+const { panelFractions, tooltipSortValue } = (() => {
+  const UI = readFileSync(new URL('../ui.html', import.meta.url), 'utf8');
+  const names = ['_satVaporHpa', 'dewPointF', 'grainsPerLb', 'absHumidityGm3', 'ahValue',
+                 'panelFractions', 'tooltipSortValue'];
+  const src = names.map(name => {
+    const start = UI.indexOf(`\nfunction ${name}(`);
+    if (start < 0) throw new Error(`function ${name} not found in ui.html`);
+    const open = UI.indexOf('{', UI.indexOf(')', start));
+    let depth = 0, i = open;
+    for (; i < UI.length; i++) {
+      if (UI[i] === '{') depth++;
+      else if (UI[i] === '}' && --depth === 0) break;
+    }
+    return UI.slice(start, i + 1);
+  }).join('\n');
+  return new Function(`${src}\nreturn { panelFractions, tooltipSortValue };`)();
+})();
 
 function sortTooltipRows(rows) {
   return rows.slice().sort((a, b) => {
