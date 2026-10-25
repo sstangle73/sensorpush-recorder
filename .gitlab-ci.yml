@@ -1,6 +1,9 @@
 # Pinned to the same Node major as the Dockerfile (22-alpine) so anything
 # the runtime catches surfaces here too. node:sqlite is stable on 22+.
-image: node:22-alpine
+# Images come from ECR Public's copy of the Docker Official Images (the same
+# names, tags and digests as Docker Hub's), which Docker Hub's anonymous pull
+# limit doesn't apply to.
+image: public.ecr.aws/docker/library/node:22-alpine
 
 stages:
   - test
@@ -46,9 +49,12 @@ test:
 # for Fly to pull anonymously.
 publish-image:
   stage: publish
-  image: docker:27
+  image: public.ecr.aws/docker/library/docker:29
   services:
-    - docker:27-dind
+    # The alias keeps the service's host name `docker`, which the client image's
+    # entrypoint points DOCKER_HOST at; a long image name would change it.
+    - name: public.ecr.aws/docker/library/docker:29-dind
+      alias: docker
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_BUILDKIT: "1"

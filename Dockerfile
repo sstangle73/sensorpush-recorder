@@ -1,4 +1,6 @@
-FROM node:22-alpine
+# ECR Public's copy of the Docker Official Image: the same tag and digest as
+# Docker Hub's node:22-alpine, without Docker Hub's anonymous pull limit.
+FROM public.ecr.aws/docker/library/node:22-alpine
 
 WORKDIR /app
 
