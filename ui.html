@@ -1216,6 +1216,14 @@ header .spacer { flex: 1; }
         <div id="notif-anomaly-exclude" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:4px"></div>
       </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
+        <input type="checkbox" id="notif-cond-mold"> Mold risk
+        <span style="color:var(--text3);font-size:11px">— house sensors at</span>
+        <input type="number" id="notif-cond-mold-rh" min="50" max="100" step="1" value="80" style="width:54px" class="set-text-input">
+        <span style="color:var(--text3);font-size:11px">% RH or above on their cold surface (the room's air if none is set) for</span>
+        <input type="number" id="notif-cond-mold-hours" min="1" max="48" step="1" value="24" style="width:54px" class="set-text-input">
+        <span style="color:var(--text3);font-size:11px">of the last 48 h</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;flex-wrap:wrap">
         <input type="checkbox" id="notif-cond-sensor-offline"> Sensor offline
         <span style="color:var(--text3);font-size:11px">— no reading in</span>
         <input type="number" id="notif-cond-sensor-offline-mins" min="5" step="5" value="30" style="width:60px" class="set-text-input"> <span style="color:var(--text3);font-size:11px">min</span>
@@ -5073,6 +5081,9 @@ function renderNotifications() {
   if (c.sensorOffline?.thresholdSecs)  document.getElementById('notif-cond-sensor-offline-mins').value  = Math.round(c.sensorOffline.thresholdSecs / 60);
   if (c.gatewayOffline?.thresholdSecs) document.getElementById('notif-cond-gateway-offline-mins').value = Math.round(c.gatewayOffline.thresholdSecs / 60);
   document.getElementById('notif-cond-anomaly-sigma').value = c.anomaly?.sigma ?? 3;
+  document.getElementById('notif-cond-mold').checked       = !!c.mold?.enabled;
+  document.getElementById('notif-cond-mold-rh').value      = c.mold?.rhPct ?? 80;
+  document.getElementById('notif-cond-mold-hours').value   = c.mold?.hours ?? 24;
   if (c.anomaly?.dwellSecs != null) document.getElementById('notif-cond-anomaly-dwell-mins').value = Math.round(c.anomaly.dwellSecs / 60);
   // Build the exclude-from-anomaly checkbox list from the known sensors.
   const excl = new Set(c.anomaly?.excludeSensors || []);
@@ -5090,6 +5101,8 @@ function _collectNotifications() {
   const anomalyDwellMins = parseInt(document.getElementById('notif-cond-anomaly-dwell-mins').value, 10);
   const excludeSensors = Array.from(document.querySelectorAll('.notif-anomaly-excl'))
     .filter(cb => cb.checked).map(cb => cb.value);
+  const moldRh    = parseFloat(document.getElementById('notif-cond-mold-rh').value);
+  const moldHours = parseFloat(document.getElementById('notif-cond-mold-hours').value);
   return {
     enabled: document.getElementById('notif-master-enabled').checked,
     webhook: {
@@ -5108,6 +5121,11 @@ function _collectNotifications() {
         sigma:          anomalySigma,
         dwellSecs:      (Number.isFinite(anomalyDwellMins) ? anomalyDwellMins : 30) * 60,
         excludeSensors,
+      },
+      mold:           {
+        enabled: document.getElementById('notif-cond-mold').checked,
+        rhPct:   moldRh >= 50 && moldRh <= 100 ? moldRh : 80,
+        hours:   moldHours > 0 && moldHours <= 48 ? moldHours : 24,
       },
       sensorOffline:  { enabled: document.getElementById('notif-cond-sensor-offline').checked,  thresholdSecs: sensorMins  * 60 },
       gatewayOffline: { enabled: document.getElementById('notif-cond-gateway-offline').checked, thresholdSecs: gatewayMins * 60 },

@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { dewPointF as serverDewPointF, grainsPerLb as serverGrainsPerLb, absHumidityGm3 as serverAbsHumidityGm3 } from '../db.js';
+import { dewPointF as serverDewPointF, surfaceRh as serverSurfaceRh, grainsPerLb as serverGrainsPerLb, absHumidityGm3 as serverAbsHumidityGm3 } from '../db.js';
 
 const UI = readFileSync(new URL('../ui.html', import.meta.url), 'utf8');
 
@@ -42,6 +42,14 @@ describe('psychrometrics', () => {
     for (const [t, rh] of [[70, 50], [56, 80], [38, 95], [85, 30]]) {
       expect(serverDewPointF(t, rh)).toBeCloseTo(dewPointF(t, rh), 9);
     }
+  });
+
+  it('the server and the page compute the same surface RH', () => {
+    for (const [dew, surface] of [[50.2, 56], [53, 56], [40, 70], [60, 60]]) {
+      expect(serverSurfaceRh(dew, surface)).toBeCloseTo(surfaceRh(dew, surface), 9);
+    }
+    expect(serverSurfaceRh(null, 56)).toBeNull();
+    expect(serverSurfaceRh(50, null)).toBeNull();
   });
 
   it('returns null for missing or zero RH', () => {

@@ -15,6 +15,8 @@
 //   - anomaly:{sensorId}       — hour-of-day baseline ±Nσ (N configurable, default 3),
 //                                dwell-gated (must stay anomalous for dwellSecs before firing),
 //                                and skippable per sensor via excludeSensors
+//   - mold:{sensorId}          — house sensors whose coldest surface has stayed damp
+//                                for most of the last two days
 //   - sensor-offline:{sensorId} — last reading older than thresholdSecs
 //   - gateway-offline:{gwId}   — last_seen older than thresholdSecs
 //
@@ -24,7 +26,7 @@
 // fires on the next transition, not the current static state).
 
 import fetch from 'node-fetch';
-import { getNotifState, setNotifState, getHourlyBaseline, dewPointF, logNotification } from './db.js';
+import { getNotifState, setNotifState, getHourlyBaseline, getHourlyMoisture, dewPointF, grainsPerLb, surfaceRh, logNotification } from './db.js';
 import { classifyByRules, DEFAULT_GROUP_RULES } from './groups.js';
 
 // Same floors the Live tab uses — at very stable baselines a ±2σ trip would
@@ -50,6 +52,16 @@ export const DEFAULT_ANOMALY_DWELL_SECS = 30 * 60;
 // a genuine sustained excursion (a failing fridge) still fires after the dwell.
 // Recovery is unchanged: the moment the reading returns in-bounds we clear.
 export const DEFAULT_THRESHOLD_DWELL_SECS = 15 * 60;
+
+// Mold answers to a surface held damp for days, not to a damp afternoon, so this
+// counts hours in a window instead of using a dwell: one dry sample would disarm
+// a dwell, and a damp crawl space that dips below the line each morning would
+// never fire. 80% on the surface is the Stats panel's active mold zone.
+export const DEFAULT_MOLD_RH_PCT = 80;
+export const DEFAULT_MOLD_HOURS  = 24;
+export const MOLD_WINDOW_HOURS   = 48;
+// A dead sensor's damp hours age out of the window. That isn't a recovery.
+const MOLD_STALE_SECS = 2 * 3600;
 
 export const DEFAULT_SENSOR_OFFLINE_SECS  = 30 * 60;
 export const DEFAULT_GATEWAY_OFFLINE_SECS = 15 * 60;
@@ -276,6 +288,32 @@ export function evaluateAnomaly(db, sensor, { nowMs = Date.now(), sigma = DEFAUL
   return out;
 }
 
+// Hours in the window at or above rhPct on the sensor's coldest surface (the
+// room's air when it has none set), with the numbers an alert should name.
+// Moisture is reported in dew point and gr/lb; RH is only ever on that surface.
+export function evaluateMold(db, sensor, { surfaceF = null, rhPct = DEFAULT_MOLD_RH_PCT, nowMs = Date.now() } = {}) {
+  const hourNow = Math.floor(nowMs / 3600000) * 3600;
+  const rows = getHourlyMoisture(db, sensor.id, hourNow - (MOLD_WINDOW_HOURS - 1) * 3600);
+  let hoursAbove = 0;
+  let dewF = null;
+  for (const r of rows) {
+    const dew = r.d ?? dewPointF(r.t, r.h);
+    if (dew == null) continue;
+    dewF = dew;
+    const onSurface = surfaceRh(dew, surfaceF ?? r.t);
+    if (onSurface != null && onSurface >= rhPct) hoursAbove++;
+  }
+  return { hoursAbove, dewF, limitDewF: surfaceF != null ? dewPointF(surfaceF, rhPct) : null };
+}
+
+function _moldDetail({ hoursAbove, dewF, limitDewF }, { surfaceF, rhPct }) {
+  const where = surfaceF != null ? `on its ${surfaceF}°F surface` : 'in the room air';
+  const lines = [`${hoursAbove} of the last ${MOLD_WINDOW_HOURS} h at ${rhPct}% RH or above ${where}.`];
+  if (dewF != null) lines.push(`Dew point now ${dewF.toFixed(1)}°F, ${grainsPerLb(dewF).toFixed(1)} gr/lb.`);
+  if (limitDewF != null) lines.push(`Limit ${limitDewF.toFixed(1)}°F, ${grainsPerLb(limitDewF).toFixed(1)} gr/lb.`);
+  return lines.join('\n');
+}
+
 // True when `lastTs` is null or older than thresholdSecs ago.
 export function isOffline(lastTs, thresholdSecs, nowSecs) {
   if (lastTs == null) return true;
@@ -290,7 +328,7 @@ export function isOffline(lastTs, thresholdSecs, nowSecs) {
 //
 // Errors per-sensor are caught so one bad config can't break the rest of
 // the run. Returns a summary array for logging/debug.
-export async function runNotifications(db, { sensors, gateways, notifConfig, groupRules, nowMs = Date.now() } = {}) {
+export async function runNotifications(db, { sensors, gateways, notifConfig, groupRules, comfort, nowMs = Date.now() } = {}) {
   if (!notifConfig?.enabled) return [];
   const conditions = notifConfig.conditions || {};
   const results    = [];
@@ -347,6 +385,37 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, gro
         );
         results.push({ kind: 'anomaly', sensorId: s.id, ...r });
       } catch (e) { console.error('[notif] anomaly error', s.id, e?.message); }
+    }
+
+    // Mold risk: damp hours in a window, on the house sensors the Stats panel scores
+    const moldCfg = conditions.mold;
+    const staleForMold = s.lastTs == null || nowSecs - s.lastTs > MOLD_STALE_SECS;
+    if (moldCfg?.enabled && !staleForMold && classifyByRules(s.name, groupRules, DEFAULT_GROUP_RULES).group === 'house') {
+      try {
+        const rhPct    = moldCfg.rhPct ?? DEFAULT_MOLD_RH_PCT;
+        const hours    = moldCfg.hours ?? DEFAULT_MOLD_HOURS;
+        const surfaceF = comfort?.sensors?.[s.id]?.surfaceF ?? comfort?.groups?.house?.surfaceF ?? null;
+        const key      = `mold:${s.id}`;
+        const mold     = evaluateMold(db, s, { surfaceF, rhPct, nowMs });
+        // Clears at half the hours that raised it, so a room hovering at the
+        // line doesn't send a fire and a recovery every hour.
+        const active   = mold.hoursAbove >= (getNotifState(db, key)?.active ? hours / 2 : hours);
+        const r = await evaluateAndNotify(
+          db,
+          key,
+          active,
+          (transition) => {
+            const detail = { sensorId: s.id, sensorName: s.name, surfaceF, rhPct, ...mold };
+            const text   = _moldDetail(mold, { surfaceF, rhPct });
+            return transition === 'fire'
+              ? { title: `[Mold risk] ${s.name}`, message: `${s.name} has stayed damp.\n${text}`, detail }
+              : { title: `[Recovered] ${s.name} drying out`, message: `${s.name} is drying out.\n${text}`, detail };
+          },
+          notifConfig,
+          { nowMs },
+        );
+        results.push({ kind: 'mold', sensorId: s.id, ...r });
+      } catch (e) { console.error('[notif] mold error', s.id, e?.message); }
     }
 
     // Sensor offline (last reading too old)
@@ -409,6 +478,7 @@ export async function runNotifications(db, { sensors, gateways, notifConfig, gro
 //     conditions: {
 //       threshold:       { enabled: bool },
 //       anomaly:         { enabled: bool, sigma?: number>0, dwellSecs?: number>=0, excludeSensors?: string[] },
+//       mold:            { enabled: bool, rhPct?: 50..100, hours?: 0<h<=48 },
 //       sensorOffline:   { enabled: bool, thresholdSecs: number },
 //       gatewayOffline:  { enabled: bool, thresholdSecs: number },
 //     },
@@ -442,13 +512,14 @@ export function validateNotifConfig(c) {
   if (c.conditions !== undefined && c.conditions !== null) {
     if (!_isPlainObject(c.conditions)) return false;
     for (const k of Object.keys(c.conditions)) {
-      if (!['threshold', 'anomaly', 'sensorOffline', 'gatewayOffline'].includes(k)) return false;
+      if (!['threshold', 'anomaly', 'mold', 'sensorOffline', 'gatewayOffline'].includes(k)) return false;
       const v = c.conditions[k];
       if (v == null) continue;
       if (!_isPlainObject(v)) return false;
       const allowed =
         k === 'anomaly'   ? ['enabled', 'sigma', 'dwellSecs', 'excludeSensors'] :
         k === 'threshold' ? ['enabled', 'dwellSecs'] :
+        k === 'mold'      ? ['enabled', 'rhPct', 'hours'] :
                             ['enabled', 'thresholdSecs'];
       for (const k2 of Object.keys(v)) {
         if (!allowed.includes(k2)) return false;
@@ -460,6 +531,10 @@ export function validateNotifConfig(c) {
         if (!_isStrArray(v.excludeSensors))  return false;
       } else if (k === 'threshold') {
         if (!_isNonNegNum(v.dwellSecs))      return false; // null = default; 0 = fire immediately
+      } else if (k === 'mold') {
+        if (!_isPosNum(v.rhPct) || !_isPosNum(v.hours)) return false; // null = default
+        if (v.rhPct != null && (v.rhPct < 50 || v.rhPct > 100)) return false;
+        if (v.hours != null && v.hours > MOLD_WINDOW_HOURS)     return false;
       } else if (!_isPosNum(v.thresholdSecs)) {
         return false;
       }

@@ -15,7 +15,7 @@ vi.mock('../weather.js', () => ({
 import http from 'node:http';
 import { getToken, fetchSensors, fetchSamples, fetchGateways } from '../sensorpush.js';
 import { fetchCurrentWeather, fetchHourlyWeather } from '../weather.js';
-import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs, setLastPollTime } from '../db.js';
+import { openDb, setUiSettings, listNotificationLog, upsertSensors, insertReadings, recomputeHourlyAgg, getLatestOutdoorTs, setLastPollTime } from '../db.js';
 import { triggerPoll, getPollStatus, triggerBackfill, triggerGapBackfill, getBackfillStatus, _resetPollerState, _snapshotDb, _pruneReadings, triggerWeatherPoll, startPoller, loadStoredPollTime } from '../poller.js';
 import { createApp, _renderMetrics } from '../server.js';
 
@@ -732,5 +732,32 @@ describe('poll status across a restart', () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+});
+
+describe('triggerPoll — mold alert', () => {
+  it('judges a house sensor on the cold surface from its comfort settings', async () => {
+    const db = makeDb();
+    setUiSettings(db, {
+      ranges: ['1h'],
+      comfort: { sensors: { s1: { surfaceF: 56 } } },
+      notifications: { enabled: true, conditions: { mold: { enabled: true } } },
+    });
+    const hourNow = Math.floor(Date.now() / 3600000) * 3600;
+    const stmt = db.prepare(`
+      INSERT INTO hourly_agg (sensor_id, hour_ts, temp_avg, hum_avg, dewpoint_avg, sample_count)
+      VALUES ('s1', ?, 72, 45, 53, 12)
+    `);
+    for (let ago = 2; ago < 40; ago++) stmt.run(hourNow - ago * 3600);
+
+    getToken.mockResolvedValue('tok');
+    fetchSensors.mockResolvedValue([{ ...sensor(), name: 'Crawl Space' }]);
+    fetchSamples.mockResolvedValueOnce([sample(60)]).mockResolvedValue([]);
+
+    await triggerPoll(db, CREDS);
+
+    const [entry] = listNotificationLog(db, { key: 'mold:s1' });
+    expect(entry.transition).toBe('fire');
+    expect(entry.message).toContain('on its 56°F surface');
   });
 });
