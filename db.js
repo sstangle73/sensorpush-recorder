@@ -1062,6 +1062,13 @@ function satVaporHpa(tF) {
   return 6.1094 * Math.exp(17.625 * tc / (243.04 + tc));
 }
 
+// RH the air would have against a surface at surfaceF. Matches the UI's
+// surfaceRh().
+export function surfaceRh(dewF, surfaceF) {
+  if (dewF == null || surfaceF == null) return null;
+  return 100 * satVaporHpa(dewF) / satVaporHpa(surfaceF);
+}
+
 // Humidity ratio, grains of water per pound of dry air: 7000 × 0.62198 ×
 // e / (p − e), with e the vapour pressure at the dew point.
 export function grainsPerLb(dewF) {
@@ -1092,6 +1099,15 @@ export function withAbsHumidity(rows, raw) {
     r.absHumidity   = round(r.absHumidity   ?? absHumidityGm3(dew, r.temperature), 3);
   }
   return rows;
+}
+
+export function getHourlyMoisture(db, sensorId, sinceTs) {
+  return db.prepare(`
+    SELECT hour_ts AS hourTs, temp_avg AS t, hum_avg AS h, dewpoint_avg AS d
+    FROM hourly_agg
+    WHERE sensor_id = ? AND excluded = 0 AND hour_ts >= ?
+    ORDER BY hour_ts
+  `).all(sensorId, sinceTs);
 }
 
 export function getHourlyBaseline(db, sensorId, hourOfDay, lookbackDays = 14) {

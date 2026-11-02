@@ -353,6 +353,7 @@ async function _runNotifications(db) {
     gateways:    gatewayRows,
     notifConfig,
     groupRules:  settings?.groups?.rules,
+    comfort:     settings?.comfort,
     nowMs:       Date.now(),
   });
 }
