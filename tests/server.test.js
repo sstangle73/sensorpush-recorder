@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import vm from 'node:vm';
-import { createApp, _renderMetrics } from '../server.js';
+import { createApp, _renderMetrics, UI_HASH } from '../server.js';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { openDb, upsertSensors, insertReadings, recomputeHourlyAgg, upsertGateways, recordGatewayStatus, insertOutdoorReadings, logNotification, dewPointF, grainsPerLb, absHumidityGm3 } from '../db.js';
 import { vi } from 'vitest';
 
@@ -204,6 +206,36 @@ describe('GET /:id/history', () => {
     const yoy = await get(`/yoy1/history?range=24h&endTs=${yearAgo}`);
     expect(yoy.body.samples.some(s => s.temperature === 42)).toBe(true);
     expect(yoy.body.samples.some(s => s.temperature === 72)).toBe(false);
+  });
+
+  it('groups the daily (1yr) points by the tz given', async () => {
+    // 01:00 and 23:00 New York time on one day: one day there, two in UTC.
+    upsertSensors(db, [{ id: 'tz1', name: 'Tz', type: 'HT1', active: true, batteryVoltage: null }]);
+    const now = Math.floor(Date.now() / 1000);
+    const nyMidnight = (() => {
+      const d = new Date((now - 3 * 86400) * 1000);
+      const ymd = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
+      // New York is UTC-4 or UTC-5; try both and keep the one that is midnight there.
+      for (const off of [4, 5]) {
+        const t = Date.parse(`${ymd}T00:00:00Z`) / 1000 + off * 3600;
+        const hh = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hourCycle: 'h23' }).format(new Date(t * 1000));
+        if (+hh === 0) return t;
+      }
+    })();
+    const ins = db.prepare(`INSERT INTO hourly_agg (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, sample_count)
+      VALUES ('tz1', ?, ?, ?, ?, 50, 50, 50, 12)`);
+    ins.run(nyMidnight + 3600, 60, 60, 60);
+    ins.run(nyMidnight + 23 * 3600, 70, 70, 70);
+    const ny = await get('/tz1/history?range=1yr&tz=America/New_York');
+    expect(ny.body.resolution).toBe('daily');
+    expect(ny.body.samples.map(s => [s.ts, s.temperature])).toEqual([[nyMidnight, 65]]);
+    const all = await get('/tz1/history/all?range=1yr&tz=America/New_York');
+    expect(all.body.samples.map(s => s.ts)).toEqual([nyMidnight]);
+    expect((await get('/tz1/history?range=1yr')).body.samples).toHaveLength(2);
+    // A value that isn't a zone name is ignored (UTC days), not an error.
+    const junk = await get('/tz1/history?range=1yr&tz=%3Cscript%3E');
+    expect(junk.status).toBe(200);
+    expect(junk.body.samples).toHaveLength(2);
   });
 
   it('returns 400 when endTs is not a positive integer', async () => {
@@ -1160,6 +1192,13 @@ describe('icon + manifest + sw routes', () => {
     // '/' says Vary: Accept; without ignoreVary the copy cached at install
     // (Accept: text/html) never matches a navigation, so offline gets nothing.
     expect(text).toContain('caches.match(e.request,{ignoreVary:true})');
+  });
+
+  it('names its cache after a hash of ui.html, so a UI change ships a new sw.js', async () => {
+    const text = await (await fetch(baseUrl + '/sw.js')).text();
+    const ui = readFileSync(new URL('../ui.html', import.meta.url), 'utf8');
+    expect(UI_HASH).toBe(createHash('sha256').update(ui).digest('hex').slice(0, 12));
+    expect(text).toContain(`const CACHE='sensorpush-${UI_HASH}';`);
   });
 });
 

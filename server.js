@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { openDb, getSensors, getHistory, getHistoryAll, getGaps, setReadingExcluded, setHourlyExcluded, rangeToSeconds, rangeUnit, getUiSettings, setUiSettings, getGateways, gatewayOnlineDuringWindow, getSensorPrimaryGateway, getGatewayUptime, countSensorsByPrimaryGateway, getBatteryHistory, computeBatteryForecast, listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly, createEvent, listEvents, updateEvent, deleteEvent, getEventById, listNotifStates, listNotificationLog, getOldestReadingTs, getOutdoorHistory, getLatestOutdoorReading } from './db.js';
 import { computeDriftStats } from './drift.js';
 import { startPoller, getPollStatus, triggerPoll, triggerBackfill, triggerGapBackfill, getBackfillStatus, triggerWeatherPoll } from './poller.js';
@@ -16,6 +17,11 @@ import { classifySensor, validGroupsConfig, isMetered } from './groups.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_HTML = readFileSync(join(__dirname, 'ui.html'), 'utf8');
+// The service worker's cache is named after the page's content, so every
+// change to ui.html ships a byte-different sw.js: the browser installs it and
+// its activate step drops the old cache. A hand-bumped version number was
+// easy to forget, leaving an installed PWA on the old page.
+export const UI_HASH = createHash('sha256').update(UI_HTML).digest('hex').slice(0, 12);
 
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" rx="108" fill="#1a1a1a"/>
@@ -111,7 +117,7 @@ const ICON_PNG_192 = makePNG(192);
 const ICON_PNG_512 = makePNG(512);
 
 const SW_JS = `'use strict';
-const CACHE='sensorpush-v29';
+const CACHE='sensorpush-${UI_HASH}';
 // Pre-cache the root so the UI is offline-available on first nav.
 // Server now defaults '/' to HTML (only returns JSON when Accept includes
 // application/json), so we no longer need to set Accept: text/html here —
@@ -347,6 +353,14 @@ function _tzOffsetSecs(epochMs, tz) {
   } catch {
     return 0;
   }
+}
+
+// The browser's IANA zone from ?tz=, for grouping by calendar day (the
+// container runs in UTC). Anything that isn't a plausible zone name is
+// ignored; an unknown zone falls back to UTC in localDayStartFn.
+function queryTz(req) {
+  const tz = typeof req.query.tz === 'string' ? req.query.tz : '';
+  return /^[A-Za-z_]+(\/[A-Za-z0-9_+-]+)*$/.test(tz) && tz.length <= 64 ? tz : null;
 }
 
 // Format a UTC epoch-seconds value as a YYYY-MM-DD string in the given tz.
@@ -668,7 +682,7 @@ export function createApp(db, config = null, onSwap = null) {
     }
     const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).json({ ok: false, error: 'Sensor not found' });
-    const samples = getHistory(db, sensorId, range, endTs);
+    const samples = getHistory(db, sensorId, range, endTs, queryTz(req));
     res.json({ ok: true, sensorId, range, resolution: rangeUnit(range) === 'h' ? 'raw' : rangeUnit(range) === 'd' ? 'hourly' : 'daily', samples });
   });
 
@@ -684,7 +698,7 @@ export function createApp(db, config = null, onSwap = null) {
     const sensor = db.prepare('SELECT id, name FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).type('text/plain').send('Sensor not found');
 
-    const samples = getHistory(db, sensorId, range);
+    const samples = getHistory(db, sensorId, range, null, queryTz(req));
     const unit    = rangeUnit(range);
     // Column set varies by resolution: raw has dewpoint/vpd per sample,
     // hourly/daily aggregates expose min/max bands. Absolute humidity (1.4.0)
@@ -725,7 +739,7 @@ export function createApp(db, config = null, onSwap = null) {
     if (!rangeSecs) return res.status(400).json({ ok: false, error: 'Invalid range. Use e.g. 2h, 24h, 7d, 30d, 1yr.' });
     const sensor = db.prepare('SELECT id FROM sensors WHERE id = ?').get(sensorId);
     if (!sensor) return res.status(404).json({ ok: false, error: 'Sensor not found' });
-    const samples = getHistoryAll(db, sensorId, range);
+    const samples = getHistoryAll(db, sensorId, range, queryTz(req));
     res.json({ ok: true, sensorId, range, resolution: rangeUnit(range) === 'h' ? 'raw' : rangeUnit(range) === 'd' ? 'hourly' : 'daily', samples });
   });
 
