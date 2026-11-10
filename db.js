@@ -647,7 +647,9 @@ export function rangeUnit(range) {
 // Optional `endTs` anchors the window at an arbitrary epoch (seconds) — used
 // by the Stats YoY overlay to fetch the same `range` ending one calendar
 // year ago. Omitted/null = anchor at "now" (the original behavior).
-export function getHistory(db, sensorId, range, endTs = null) {
+// Optional `tz` (IANA zone, e.g. America/New_York) sets the calendar day the
+// daily (yr) resolution groups by; omitted = UTC days.
+export function getHistory(db, sensorId, range, endTs = null, tz = null) {
   const rangeSeconds = rangeToSeconds(range) ?? 86400;
   const end   = endTs != null ? endTs : Math.floor(Date.now() / 1000);
   const since = end - rangeSeconds;
@@ -670,18 +672,93 @@ export function getHistory(db, sensorId, range, endTs = null) {
       ORDER BY hour_ts
     `).all(sensorId, since, end), false);
   }
-  // yr → daily aggregates computed from hourly_agg (no schema change needed)
-  return withAbsHumidity(db.prepare(`
-    SELECT (hour_ts / 86400 * 86400) AS ts,
-           AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
-           AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
-           AVG(baro_avg) AS baroPressure,
-           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd,
-           AVG(hr_avg) AS humidityRatio, AVG(ah_avg) AS absHumidity
-    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
-    GROUP BY (hour_ts / 86400 * 86400)
-    ORDER BY ts
-  `).all(sensorId, since, end), false);
+  // yr → daily aggregates computed from hourly_agg (no schema change needed),
+  // one per calendar day in `tz` (see dailyFromHourly).
+  return withAbsHumidity(dailyFromHourly(db.prepare(`
+    SELECT ${HOURLY_FOR_DAILY} FROM hourly_agg
+    WHERE sensor_id = ? AND hour_ts >= ? AND hour_ts <= ? AND excluded = 0
+    ORDER BY hour_ts
+  `).all(sensorId, since, end), tz), false);
+}
+
+// Columns dailyFromHourly reads from hourly_agg.
+const HOURLY_FOR_DAILY = `hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max,
+  baro_avg, dewpoint_avg, vpd_avg, hr_avg, ah_avg`;
+
+const _mod = (a, n) => ((a % n) + n) % n;
+
+// localDayStartFn(tz) → (epochSecs → epoch seconds of the local midnight that
+// starts its calendar day in IANA zone `tz`). The container runs in UTC, so a
+// day grouped as hour_ts / 86400 runs 7 PM to 7 PM in New York and is plotted
+// at 7 PM the evening before; the browser sends its zone instead. A missing or
+// unknown zone falls back to UTC days. Offsets are looked up once per UTC day
+// (per hour only on a day the offset changes), since Intl is slow.
+export function localDayStartFn(tz) {
+  let fmt = null;
+  if (tz && tz !== 'UTC') {
+    try {
+      fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric',
+        hour: 'numeric', minute: 'numeric', second: 'numeric',
+      });
+    } catch { fmt = null; }
+  }
+  if (!fmt) return ts => ts - _mod(ts, 86400);
+  const offsetAt = ts => {
+    const parts = fmt.formatToParts(new Date(ts * 1000));
+    const get = t => +parts.find(p => p.type === t).value;
+    return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second')) / 1000 - ts;
+  };
+  const byDay = new Map();
+  const offset = ts => {
+    const d = Math.floor(ts / 86400);
+    let o = byDay.get(d);
+    if (o === undefined) {
+      const a = offsetAt(d * 86400), b = offsetAt(d * 86400 + 86400);
+      o = a === b ? a : null;
+      byDay.set(d, o);
+    }
+    return o ?? offsetAt(ts);
+  };
+  return ts => {
+    const off = offset(ts);
+    const midnightWall = ts + off - _mod(ts + off, 86400);
+    return midnightWall - offset(midnightWall - off);
+  };
+}
+
+// One row per local calendar day from hourly_agg rows (HOURLY_FOR_DAILY),
+// ts = that day's local midnight. Means and extremes skip NULLs, as SQL's
+// AVG/MIN/MAX do.
+export function dailyFromHourly(rows, tz) {
+  const dayStart = localDayStartFn(tz);
+  const MEANS = ['temp_avg', 'hum_avg', 'baro_avg', 'dewpoint_avg', 'vpd_avg', 'hr_avg', 'ah_avg'];
+  const days = new Map();
+  for (const r of rows) {
+    const ts = dayStart(r.hour_ts);
+    let acc = days.get(ts);
+    if (!acc) {
+      acc = { ts, tMin: null, tMax: null, hMin: null, hMax: null, sum: {}, n: {} };
+      for (const k of MEANS) { acc.sum[k] = 0; acc.n[k] = 0; }
+      days.set(ts, acc);
+    }
+    for (const k of MEANS) if (r[k] != null) { acc.sum[k] += r[k]; acc.n[k]++; }
+    if (r.temp_min != null && (acc.tMin == null || r.temp_min < acc.tMin)) acc.tMin = r.temp_min;
+    if (r.temp_max != null && (acc.tMax == null || r.temp_max > acc.tMax)) acc.tMax = r.temp_max;
+    if (r.hum_min  != null && (acc.hMin == null || r.hum_min  < acc.hMin)) acc.hMin = r.hum_min;
+    if (r.hum_max  != null && (acc.hMax == null || r.hum_max  > acc.hMax)) acc.hMax = r.hum_max;
+  }
+  return [...days.values()].sort((a, b) => a.ts - b.ts).map(a => {
+    const mean = k => a.n[k] ? a.sum[k] / a.n[k] : null;
+    return {
+      ts: a.ts,
+      temperature: mean('temp_avg'), tempMin: a.tMin, tempMax: a.tMax,
+      humidity: mean('hum_avg'), humMin: a.hMin, humMax: a.hMax,
+      baroPressure: mean('baro_avg'),
+      dewpoint: mean('dewpoint_avg'), vpd: mean('vpd_avg'),
+      humidityRatio: mean('hr_avg'), absHumidity: mean('ah_avg'),
+    };
+  });
 }
 
 // Oldest non-excluded reading ts across all sensors, or null when the DB is
@@ -704,7 +781,7 @@ export function getOldestReadingTs(db) {
 }
 
 // Returns all readings including excluded ones — used by the data explorer UI.
-export function getHistoryAll(db, sensorId, range) {
+export function getHistoryAll(db, sensorId, range, tz = null) {
   const rangeSeconds = rangeToSeconds(range) ?? 86400;
   const since = Math.floor(Date.now() / 1000) - rangeSeconds;
   const unit  = rangeUnit(range) ?? 'h';
@@ -727,17 +804,11 @@ export function getHistoryAll(db, sensorId, range) {
     `).all(sensorId, since), false);
   }
   // yr → daily; exclusion not meaningful at this granularity (excluded always 0)
-  return withAbsHumidity(db.prepare(`
-    SELECT (hour_ts / 86400 * 86400) AS ts,
-           AVG(temp_avg) AS temperature, MIN(temp_min) AS tempMin, MAX(temp_max) AS tempMax,
-           AVG(hum_avg)  AS humidity,    MIN(hum_min)  AS humMin,  MAX(hum_max)  AS humMax,
-           AVG(baro_avg) AS baroPressure,
-           AVG(dewpoint_avg) AS dewpoint, AVG(vpd_avg) AS vpd,
-           AVG(hr_avg) AS humidityRatio, AVG(ah_avg) AS absHumidity, 0 AS excluded
-    FROM hourly_agg WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
-    GROUP BY (hour_ts / 86400 * 86400)
-    ORDER BY ts
-  `).all(sensorId, since), false);
+  return withAbsHumidity(dailyFromHourly(db.prepare(`
+    SELECT ${HOURLY_FOR_DAILY} FROM hourly_agg
+    WHERE sensor_id = ? AND hour_ts >= ? AND excluded = 0
+    ORDER BY hour_ts
+  `).all(sensorId, since), tz).map(d => ({ ...d, excluded: 0 })), false);
 }
 
 export function setReadingExcluded(db, sensorId, ts, excluded) {

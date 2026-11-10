@@ -13,7 +13,7 @@ import {
   listSensorPairs, getSensorPair, createSensorPair, deleteSensorPair, getPairAlignedHourly,
   createEvent, listEvents, getEventById, updateEvent, deleteEvent,
   insertOutdoorReadings, getLatestOutdoorTs, getOutdoorHistory, getLatestOutdoorReading,
-  dewPointF, grainsPerLb, absHumidityGm3,
+  dewPointF, grainsPerLb, absHumidityGm3, localDayStartFn, dailyFromHourly,
 } from '../db.js';
 
 function makeDb() {
@@ -257,6 +257,65 @@ describe('getHistory — extended ranges', () => {
     const rows = getHistory(db, 's1', '24h');
     expect(rows.every(r => r.temperature !== 999)).toBe(true);
     expect(rows.length).toBe(1);
+  });
+});
+
+describe('daily history follows the browser\'s calendar day', () => {
+  const NY = 'America/New_York';
+  const at = iso => Date.parse(iso) / 1000;
+
+  it('localDayStartFn gives local midnight, across a DST change', () => {
+    const start = localDayStartFn(NY);
+    // 10 PM EST on Nov 9 is still Nov 9 in New York (03:00 UTC Nov 10).
+    expect(start(at('2026-11-10T03:00:00Z'))).toBe(at('2026-11-09T05:00:00Z'));
+    // The day clocks fall back (Nov 1, 2026) starts at EDT midnight, 04:00 UTC.
+    expect(start(at('2026-11-01T20:00:00Z'))).toBe(at('2026-11-01T04:00:00Z'));
+    // The day they spring forward (Mar 8, 2026) starts at EST midnight.
+    expect(start(at('2026-03-08T12:00:00Z'))).toBe(at('2026-03-08T05:00:00Z'));
+  });
+
+  it('localDayStartFn falls back to UTC days without a usable zone', () => {
+    const ts = at('2026-11-10T03:00:00Z');
+    for (const tz of [null, '', 'UTC', 'Not/AZone']) {
+      expect(localDayStartFn(tz)(ts)).toBe(at('2026-11-10T00:00:00Z'));
+    }
+  });
+
+  it('dailyFromHourly averages each local day and skips NULLs', () => {
+    const h = (iso, t, extra = {}) => ({ hour_ts: at(iso), temp_avg: t, temp_min: t - 1, temp_max: t + 1,
+      hum_avg: 50, hum_min: 48, hum_max: 52, baro_avg: null, dewpoint_avg: 40, vpd_avg: 1, hr_avg: 40, ah_avg: 6, ...extra });
+    const rows = [
+      h('2026-11-09T05:00:00Z', 60),                    // 00:00 EST Nov 9
+      h('2026-11-10T03:00:00Z', 70, { temp_min: 50 }), // 22:00 EST Nov 9 (UTC Nov 10)
+      h('2026-11-10T05:00:00Z', 80, { dewpoint_avg: null }), // 00:00 EST Nov 10
+    ];
+    const days = dailyFromHourly(rows, NY);
+    expect(days.map(d => d.ts)).toEqual([at('2026-11-09T05:00:00Z'), at('2026-11-10T05:00:00Z')]);
+    expect(days[0].temperature).toBe(65);
+    expect(days[0].tempMin).toBe(50);
+    expect(days[0].tempMax).toBe(71);
+    expect(days[0].baroPressure).toBeNull();
+    expect(days[1].dewpoint).toBeNull();
+    // In UTC the 22:00 EST hour belongs to the next day instead.
+    expect(dailyFromHourly(rows, 'UTC').map(d => d.temperature)).toEqual([60, 75]);
+  });
+
+  it('getHistory and getHistoryAll group the 1yr range by the tz given', () => {
+    const db = makeDb();
+    upsertSensors(db, [{ id: 's1', name: 'R', type: 'HT1', active: true, batteryVoltage: null }]);
+    const now = Math.floor(Date.now() / 1000);
+    const midnight = localDayStartFn(NY)(now - 3 * 86400);
+    const ins = db.prepare(`INSERT INTO hourly_agg (sensor_id, hour_ts, temp_avg, temp_min, temp_max, hum_avg, hum_min, hum_max, sample_count)
+      VALUES ('s1', ?, ?, ?, ?, 50, 50, 50, 12)`);
+    // 01:00 and 23:00 local on the same New York day: two UTC days.
+    ins.run(midnight + 3600, 60, 60, 60);
+    ins.run(midnight + 23 * 3600, 70, 70, 70);
+    const ny = getHistory(db, 's1', '1yr', null, NY);
+    expect(ny).toHaveLength(1);
+    expect(ny[0].ts).toBe(midnight);
+    expect(ny[0].temperature).toBe(65);
+    expect(getHistoryAll(db, 's1', '1yr', NY)).toMatchObject([{ ts: midnight, temperature: 65, excluded: 0 }]);
+    expect(getHistory(db, 's1', '1yr')).toHaveLength(2);
   });
 });
 

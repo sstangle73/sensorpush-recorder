@@ -111,7 +111,7 @@ header .spacer { flex: 1; }
 .sensor-row:hover { background: var(--bg3); }
 .sensor-row.active { background: var(--bg3); border-color: var(--border); }
 .sensor-color {
-  width: 10px; height: 10px; border-radius: 50%;
+  width: 10px; height: 10px; display: flex;
   margin-top: 3px; flex-shrink: 0; transition: opacity .15s;
 }
 .sensor-row:not(.active) .sensor-color { opacity: .25; }
@@ -295,11 +295,15 @@ header .spacer { flex: 1; }
 .an-table tbody tr.clickable { cursor: pointer; }
 .an-table tbody tr.clickable:hover { background: var(--bg3); }
 .an-table tbody tr.selected { background: var(--bg3); outline: 1px solid var(--accent); outline-offset: -1px; }
-.cov-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: var(--bg4); gap: 1px; }
-.cov-slot { flex: 1; min-width: 0; }
-.cov-ok     { background: var(--green); opacity: 0.75; }
-.cov-sparse { background: var(--warn);  opacity: 0.85; }
-.cov-gap    { background: transparent; }
+/* Coverage runs: blue = good, amber = sparse, hatched = missing (hue- and
+   pattern-distinct; green against amber was not). One element per run, so a
+   phone doesn't get 120 hairline slots with gaps between them. */
+.cov-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: var(--bg4); }
+.cov-slot { min-width: 0; }
+.cov-ok     { background: var(--accent); opacity: 0.8; }
+.cov-sparse { background: var(--warn); }
+.cov-gap    { background: repeating-linear-gradient(45deg, var(--bg4), var(--bg4) 3px, #5a5a5a 3px, #5a5a5a 5px); }
+.cov-sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; }
 .cov-row    { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .cov-label  { width: 120px; font-size: 11px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
 
@@ -558,7 +562,7 @@ header .spacer { flex: 1; }
 }
 .stats-h-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .stats-dot {
-  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
   margin-right: 6px; vertical-align: middle;
 }
 .stats-up   { color: var(--warn); }     /* rising — orange */
@@ -635,7 +639,8 @@ header .spacer { flex: 1; }
   flex: 0 0 140px; display: flex; align-items: center; gap: 6px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.hod-label .stats-dot { margin-right: 0; }
+.hod-label .stats-dot { margin-right: 0; flex-shrink: 0; }
+.hod-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .hod-cells {
   flex: 1; display: grid; grid-template-columns: repeat(24, 1fr);
   gap: 1px; border-radius: 3px; overflow: hidden;
@@ -958,6 +963,72 @@ header .spacer { flex: 1; }
   #view-analytics { padding: 8px; gap: 10px; }
   .an-range-row { padding: 8px 8px 0 !important; }
 }
+
+/* Explorer legend: a key to the line styles, then one entry per sensor. */
+.leg-key { display: flex; flex-wrap: wrap; gap: 4px 14px; width: 100%; color: var(--text2); }
+.leg-key svg { flex-shrink: 0; }
+
+/* Correlation matrix: the row names stay put while the matrix scrolls. */
+.corr-table td:first-child, .corr-table th:first-child {
+  position: sticky; left: 0; z-index: 1; background: var(--bg2);
+}
+
+/* ── Phone ── */
+@media (max-width: 640px) {
+  /* Header on one line: the title, the update time and Refresh used to wrap
+     to two lines each. */
+  header { gap: 8px; padding: 8px 10px; }
+  header h1 { font-size: 14px; white-space: nowrap; }
+  #poll-status { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .hdr-btn { white-space: nowrap; min-height: 34px; }
+
+  /* The Explorer scrolls as a page: the chart keeps a usable height and the
+     controls and legend sit above and below it, instead of squeezing it to a
+     strip. */
+  #chart-area { overflow-y: auto; }
+  #chart-wrap { flex: none; height: max(320px, 58vh); }
+  #legend { padding-bottom: 8px; }
+  #tooltip { max-width: calc(100% - 8px); }
+
+  /* Touch targets at least ~32 px tall. */
+  .an-range-btn { padding: 7px 10px; min-height: 34px; font-size: 12px; }
+  .stats-subtab-btn { min-height: 38px; }
+  .series-toggle { min-height: 34px; }
+  #add-event-btn, #custom-range-btn { min-height: 36px; }
+  .set-btn { min-height: 36px; }
+  .rt-events-title .set-btn { min-height: 32px; }
+  .rt-event-del { min-width: 36px; min-height: 36px; font-size: 18px; }
+  #view-settings input[type="checkbox"], #view-stats input[type="checkbox"] { width: 22px; height: 22px; }
+  .comfort-input { min-height: 34px; }
+  /* iOS zooms the page into any field under 16 px when it takes focus. */
+  input:not([type="checkbox"]):not([type="radio"]), select, textarea { font-size: 16px !important; }
+  #view-settings label > input[type="number"].set-text-input { flex: 0 0 auto; }
+  #view-settings { padding: 8px; }
+  .set-section { padding: 12px; }
+
+  /* Tables of more than three columns become one card per row: the first
+     cell is the card's title, the rest show under their column's name
+     (data-label, from labelStackTables), two to a line. */
+  table.stack, table.stack tbody { display: block; width: 100%; min-width: 0 !important; }
+  table.stack thead { display: none; }
+  table.stack tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  table.stack tbody tr:last-child { border-bottom: none; }
+  table.stack td { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 0 !important; border: 0 !important; text-align: left !important; min-width: 0; white-space: normal !important; }
+  table.stack td[data-label]::before {
+    /* Not uppercased: that turns "σ" into "Σ". */
+    content: attr(data-label); font-size: 11px; font-weight: 500; color: var(--text3);
+  }
+  table.stack td:first-child { grid-column: 1 / -1; flex-direction: row; align-items: center; flex-wrap: wrap; font-weight: 600; font-size: 13px; }
+  table.stack td:first-child::before { content: none; }
+  table.stack td.stack-wide { grid-column: 1 / -1; }
+  table.stack td:empty { display: none; }
+  table.stack tr.stats-group-row { display: block; padding: 12px 0 0; border-bottom: none; }
+  table.stack tr.stats-group-row td { display: block; }
+  table.stack input:not([type="checkbox"]), table.stack select { max-width: 100%; }
+  table.stack .comfort-input { width: 100%; max-width: 160px; }
+  table.stack .comfort-input.group-rule-match, table.stack .comfort-input.group-rule-sub { max-width: none; }
+  #view-stats table.an-table.stack { min-width: 0; }
+}
 </style>
 </head>
 <body>
@@ -1076,7 +1147,7 @@ header .spacer { flex: 1; }
   <div class="set-section">
     <h2>Sensor Groups</h2>
     <p class="set-hint" style="margin-bottom:10px">Sensors are grouped by name: House (with rooms), Outside, Appliances, Mobile and Other. Your rules are checked first, top to bottom, then the built-in ones; the first match wins. <b>Match</b> is a case-insensitive regular expression on the sensor's name. <b>Room</b> (House only) is any label, e.g. "Second floor"; Indoor vs Outdoor compares moisture by room. Mobile sensors (a backpack, a car) are left out of anomaly alerts and the HVAC panels; mold and indoor-vs-outdoor look at House sensors only.</p>
-    <table class="comfort-table"><thead>
+    <table class="comfort-table stack"><thead>
       <tr><th>Match (regex)</th><th>Group</th><th>Room</th><th></th></tr>
     </thead><tbody id="group-rules-body"></tbody></table>
     <div style="display:flex;gap:8px;margin-top:12px">
@@ -1091,12 +1162,12 @@ header .spacer { flex: 1; }
     <h2>Comfort Presets</h2>
     <p class="set-hint" style="margin-bottom:10px">Sets the temperature/humidity range counted as "in comfort" on the Stats tab. Sensors inherit their group's defaults; per-sensor entries override the group. Blank = no comfort metric.</p>
     <div class="set-subheader">Group defaults</div>
-    <table class="comfort-table"><thead>
+    <table class="comfort-table stack"><thead>
       <tr><th>Group</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th><th>Dew min °F</th><th>Dew max °F</th></tr>
     </thead><tbody id="comfort-groups-body"></tbody></table>
     <div class="set-subheader">Per-sensor overrides</div>
     <p class="set-hint" style="margin:-2px 0 6px">Blank = use group default. Useful for fridges, freezers, wine cellars, etc. <b>Cold surface °F</b> is the temperature of the coldest surface the room's air reaches (a crawl space, a stone wall, a slab): the Mold panel then judges relative humidity on that surface, where mold actually grows, instead of in the air.</p>
-    <table class="comfort-table"><thead>
+    <table class="comfort-table stack"><thead>
       <tr><th>Sensor</th><th>T min °F</th><th>T max °F</th><th>RH min %</th><th>RH max %</th><th>Dew min °F</th><th>Dew max °F</th><th>Cold surface °F</th></tr>
     </thead><tbody id="comfort-sensors-body"></tbody></table>
     <div style="display:flex;gap:8px;margin-top:12px">
@@ -1146,7 +1217,7 @@ header .spacer { flex: 1; }
       </label>
     </div>
     <div class="set-subheader">Thermostat-reference sensors</div>
-    <table class="comfort-table"><thead>
+    <table class="comfort-table stack"><thead>
       <tr><th>Sensor</th><th style="width:90px">Thermostat</th><th>Heating zone</th><th>Cooling zone</th></tr>
     </thead><tbody id="hvac-sensors-body"></tbody></table>
     <div class="set-subheader" style="margin-top:14px">Metered elsewhere</div>
@@ -1321,6 +1392,28 @@ header .spacer { flex: 1; }
 
 // Wong 2011 colorblind-safe palette
 const COLORS = ['#56B4E9','#E69F00','#009E73','#CC79A7','#D55E00','#0072B2','#F0E442'];
+// The browser's time zone, so daily figures start at local midnight (the
+// recorder's container runs in UTC).
+// Twelve sensors share seven colours, so a sensor also gets a shape: circle
+// for the first seven, then square, then triangle. The Explorer marks each
+// line's end with it and uses it in the legend and tooltip, so two sky-blue
+// lines can still be told apart, colour vision or not.
+const SENSOR_SHAPES = ['circle', 'square', 'triangle'];
+function sensorShape(id) {
+  const i = Math.max(0, Object.keys(_sensors).indexOf(id));
+  return SENSOR_SHAPES[Math.floor(i / COLORS.length) % SENSOR_SHAPES.length];
+}
+function shapeSvg(shape, cx, cy, r, color, stroke = '#161616') {
+  const f = n => n.toFixed(1);
+  const paint = `fill="${color}" stroke="${stroke}" stroke-width="1.5"`;
+  if (shape === 'square') return `<rect x="${f(cx - r)}" y="${f(cy - r)}" width="${f(2 * r)}" height="${f(2 * r)}" ${paint}/>`;
+  if (shape === 'triangle') return `<polygon points="${f(cx)},${f(cy - r * 1.2)} ${f(cx + r * 1.15)},${f(cy + r * 0.9)} ${f(cx - r * 1.15)},${f(cy + r * 0.9)}" ${paint}/>`;
+  return `<circle cx="${f(cx)}" cy="${f(cy)}" r="${r}" ${paint}/>`;
+}
+function shapeIcon(shape, color, size = 10) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 10 10" aria-hidden="true" style="flex-shrink:0">${shapeSvg(shape, 5, 5.3, 3.8, color, 'none')}</svg>`;
+}
+const TZ_PARAM = encodeURIComponent((() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } })());
 
 function timeAgo(iso) {
   if (!iso) return 'never';
@@ -1561,9 +1654,13 @@ async function ensureSignedIn() {
   return true;
 }
 
-// Fixed SVG logical canvas
-const W = 1000, H = 640;
-const PL = 52, PR = 58, PT = 18, PB = 34;
+// Explorer canvas, in CSS pixels. renderChart() sets W and H to the chart's
+// real size before drawing (and narrows the side gutters on a phone): the
+// fixed 1000×640 viewBox it used to stretch with preserveAspectRatio="none"
+// squashed every label to a third of its width on a 375 px screen.
+let W = 1000, H = 640;
+let PL = 52, PR = 58;
+const PT = 18, PB = 34;
 const VGAP = 16; // gap between panels
 
 let _sensors   = {};
@@ -1675,6 +1772,8 @@ function setAnalyticsRange(r) {
 
 async function loadAnalytics() {
   const ids = [..._selected];
+  const content = document.getElementById('analytics-content');
+  if (content && !content.innerHTML.trim()) content.innerHTML = '<div class="rt-empty">Loading…</div>';
   // Gateways load regardless of selection — the panel is always useful.
   // Pass ?range to get uptime % and per-gateway sensor counts.
   try {
@@ -1704,6 +1803,16 @@ function buildSlots(startTs, endTs, gaps, sparseHours, N = 120) {
     if (i >= 0 && i < N && slots[i] !== 'gap') slots[i] = 'sparse';
   }
   return slots;
+}
+
+// Consecutive equal slots as runs: [{ state, n }].
+function slotRuns(slots) {
+  const runs = [];
+  for (const st of slots) {
+    if (runs.length && runs[runs.length - 1].state === st) runs[runs.length - 1].n++;
+    else runs.push({ state: st, n: 1 });
+  }
+  return runs;
 }
 
 function selectAnalyticsSensor(id) {
@@ -1748,7 +1857,7 @@ function renderGatewaysPanel() {
     : `<th>Name</th><th>Status</th><th>Last seen</th><th>Version</th>`;
   return `<div class="an-section">
     <h2>Gateways</h2>
-    <table class="an-table">
+    <table class="an-table stack">
       <thead><tr>${headers}</tr></thead>
       <tbody>${rows}</tbody>
     </table>
@@ -1790,14 +1899,14 @@ function renderAnalytics() {
     const slots = buildSlots(d.rangeStartTs, d.rangeEndTs, d.gaps, d.sparseHours);
     return `<div class="cov-row">
       <div class="cov-label" title="${esc(s?.name||id)}">${esc(s?.name||id)}</div>
-      <div class="cov-bar" style="flex:1">${slots.map(st=>`<div class="cov-slot cov-${st}"></div>`).join('')}</div>
+      <div class="cov-bar" style="flex:1">${slotRuns(slots).map(r => `<div class="cov-slot cov-${r.state}" style="flex:${r.n}"></div>`).join('')}</div>
     </div>`;
   }).join('');
 
-  const legend = `<div style="display:flex;gap:14px;margin-top:8px;font-size:11px;color:var(--text2)">
-    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--green);opacity:0.75"></span>Good</span>
-    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--warn)"></span>Sparse</span>
-    <span style="display:flex;align-items:center;gap:4px"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--bg4)"></span>Missing</span>
+  const legend = `<div style="display:flex;gap:14px;margin-top:8px;font-size:11px;color:var(--text2);flex-wrap:wrap">
+    <span style="display:flex;align-items:center;gap:4px"><span class="cov-sw cov-ok"></span>Good</span>
+    <span style="display:flex;align-items:center;gap:4px"><span class="cov-sw cov-sparse"></span>Sparse</span>
+    <span style="display:flex;align-items:center;gap:4px"><span class="cov-sw cov-gap"></span>Missing</span>
   </div>`;
 
   // Gap detail for selected sensor
@@ -1810,23 +1919,25 @@ function renderAnalytics() {
         <div style="color:var(--text2);font-size:12px">No gaps or sparse hours detected.</div></div>`;
     } else {
       const gwLabel = d.primaryGatewayName ? esc(d.primaryGatewayName) : 'gw';
+      // Gaps and sparse hours in one list, oldest first.
       const gRows = d.gaps.map(g => {
         const gw = g.gatewayOnline === true  ? `<span style="color:var(--warn)" title="${gwLabel} was online during this gap — sensor likely lost radio contact (weak RSSI, range, interference)">${gwLabel} online</span>`
                 : g.gatewayOnline === false ? `<span style="color:var(--excl)" title="${gwLabel} was offline during this gap — data is genuinely missing upstream and won't backfill">${gwLabel} offline</span>`
                 :                             `<span style="color:var(--text2)" title="No gateway poll data covers this window — predates tracking">${gwLabel} ?</span>`;
-        return `<tr>
+        return { ts: g.startTs, html: `<tr>
           <td>${fmtTs(g.startTs*1000)}</td><td>${fmtTs(g.endTs*1000)}</td>
           <td>${fmtDuration(g.durationSecs)}</td>
-          <td style="color:var(--excl)">missing · ${gw}</td></tr>`;
-      }).join('');
-      const sRows = (d.sparseHours||[]).slice(0,30).map(sh => `<tr>
+          <td style="color:var(--excl)">missing · ${gw}</td></tr>` };
+      });
+      const sRows = (d.sparseHours||[]).slice().sort((a, b) => a.hourTs - b.hourTs).slice(-30).map(sh => ({ ts: sh.hourTs, html: `<tr>
         <td>${fmtTs(sh.hourTs*1000)}</td><td>—</td>
         <td>1 hr</td>
-        <td style="color:var(--warn)">${sh.sampleCount} readings</td></tr>`).join('');
+        <td style="color:var(--warn)">sparse · ${sh.sampleCount} reading${sh.sampleCount === 1 ? '' : 's'}</td></tr>` }));
+      const detailRows = gRows.concat(sRows).sort((a, b) => a.ts - b.ts).map(r => r.html).join('');
       gapDetail = `<div class="an-section"><h2>Gaps — ${name}</h2>
-        <table class="an-table">
+        <table class="an-table stack">
           <thead><tr><th>Start</th><th>End</th><th>Duration</th><th>Type</th></tr></thead>
-          <tbody>${gRows}${sRows}</tbody>
+          <tbody>${detailRows}</tbody>
         </table></div>`;
     }
   }
@@ -1835,7 +1946,7 @@ function renderAnalytics() {
     ${gatewayPanel}
     <div class="an-section">
       <h2>Coverage Summary</h2>
-      <table class="an-table">
+      <table class="an-table stack">
         <thead><tr><th>Sensor</th><th>Coverage</th><th>Longest Gap</th><th>Sparse Hrs</th><th>Last Seen</th></tr></thead>
         <tbody>${summaryRows}</tbody>
       </table>
@@ -1880,7 +1991,7 @@ function computeTrend(samples, field, lookbackMin = 30) {
 
 // Thresholds below which a trend is "flat" — picked to be larger than typical
 // 30-min sensor noise but smaller than a real environmental shift.
-const RT_FLAT = { temperature: 0.15, humidity: 0.4, baroPressure: 0.08 };
+const RT_FLAT = { temperature: 0.15, humidity: 0.4, baroPressure: 0.02 };  // baro in inHg/hr
 
 function trendPill(trend, field, unit) {
   if (!trend) return `<span class="rt-trend flat" title="Not enough recent data"><span class="rt-trend-arrow">—</span></span>`;
@@ -2193,7 +2304,9 @@ function renderRtCard(id) {
 
   const tempStr = s.temperature != null ? s.temperature.toFixed(1) : '—';
   const humStr  = s.humidity    != null ? Math.round(s.humidity)  : '—';
-  const baroStr = s.baroPressure != null ? s.baroPressure.toFixed(1) : null;
+  // SensorPush reports pressure in inHg (29.92 at sea level), as the
+  // Explorer's pressure panel says; this card used to call it hPa.
+  const baroStr = s.baroPressure != null ? s.baroPressure.toFixed(2) : null;
 
   const hasBaro = s.baroPressure != null ||
     hist.some(x => x.baroPressure != null);
@@ -2251,8 +2364,8 @@ function renderRtCard(id) {
       </div>
       ${hasBaro ? `<div class="rt-row">
         <span class="rt-row-label">P</span>
-        <span class="rt-row-val">${baroStr ?? '—'}<span class="rt-row-unit">hPa</span></span>
-        ${trendPill(tB, 'baroPressure', 'hPa')}
+        <span class="rt-row-val">${baroStr ?? '—'}<span class="rt-row-unit">inHg</span></span>
+        ${trendPill(tB, 'baroPressure', 'inHg')}
       </div>` : ''}
     </div>
     ${sparkline(hist, 'temperature', color)}
@@ -2626,21 +2739,21 @@ async function loadStats() {
 
     const pending = [
       Promise.all(ids.map(id =>
-        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}`)
+        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}&tz=${TZ_PARAM}`)
           .then(r => r.json()).catch(() => null)
       )),
       fetch(`${API_BASE}/battery`).then(r => r.json()).catch(() => null),
       fetch(`${API_BASE}/sensor-pairs`).then(r => r.json()).catch(() => null),
       // HVAC analysis always uses 24h for the "today" gauge — independent of
       // _statsRange. The route's daily breakdown covers the last 7 days.
-      fetch(`${API_BASE}/hvac?range=24h&tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC')}`).then(r => r.json()).catch(() => null),
+      fetch(`${API_BASE}/hvac?range=24h&tz=${TZ_PARAM}`).then(r => r.json()).catch(() => null),
       // Stats only needs the latest outdoor reading for the "current delta"
       // panel; range=24h is just to satisfy the API contract.
       _outdoorConfigured ? fetch(`${API_BASE}/weather?range=24h`).then(r => r.json()).catch(() => null) : null,
     ];
     if (wantYoY) {
       pending.push(Promise.all(ids.map(id =>
-        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}&endTs=${yoyEndTs}`)
+        fetch(`${API_BASE}/${encodeURIComponent(id)}/history?range=${_statsRange}&endTs=${yoyEndTs}&tz=${TZ_PARAM}`)
           .then(r => r.json()).catch(() => null)
       )));
     }
@@ -2732,6 +2845,10 @@ function setStatsTab(name) {
 function _restoreStatsTabUI() {
   document.querySelectorAll('.stats-subtab-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.subtab === _statsTab));
+  // The year-ago toggle only acts on Patterns; hide it elsewhere from the
+  // start, not just once the data has loaded.
+  const yoy = document.getElementById('stats-yoy-toggle');
+  if (yoy) yoy.style.display = _statsTab === 'patterns' ? '' : 'none';
 }
 
 function setStatsRange(r) {
@@ -2757,6 +2874,13 @@ function renderStatsRangeBtns() {
 }
 
 // ── formatting helpers ────────────────────────────────────────────────────
+// "lo–hi" with whole numbers, or one decimal when whole numbers would read
+// as the same value ("69–69").
+function fmtSpan(lo, hi) {
+  const d = Math.round(lo) === Math.round(hi) ? 1 : 0;
+  return `${lo.toFixed(d)}–${hi.toFixed(d)}`;
+}
+
 function fmtNum(v, decimals = 1) {
   if (v == null || !isFinite(v)) return '—';
   return v.toFixed(decimals);
@@ -2902,7 +3026,7 @@ function renderIndoorOutdoor(all) {
       <td class="${cls(r.dGrains)}">${word(r.dGrains)} ${r.dGrains >= 0 ? '+' : '−'}${Math.abs(r.dGrains).toFixed(1)}</td>
     </tr>`).join('');
   return `<div class="an-section"><h2>Indoor vs Outdoor (${_statsRange})</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr><th>Room group</th><th>Temp</th><th>Dew point</th><th>gr/lb</th><th>vs outdoors</th></tr></thead>
       <tbody>${rows}
         <tr><td>Outdoors</td><td>${fmtNum(io.outTemp)}°F</td><td>${fmtNum(io.outDew)}°F</td><td><b>${fmtNum(io.outGrains)}</b></td><td></td></tr>
@@ -3067,7 +3191,7 @@ function renderStatsTable(all, kind) {
     : `<div class="stats-footnote">Comfort ranges are set per group (and optionally per sensor) in Settings → Comfort Presets. Relative humidity rises and falls with temperature alone, so compare rooms, and indoors with outdoors, by dew point or gr/lb (grains of water per pound of dry air): a dew-point range is the better comfort measure.</div>`;
 
   return `<div class="an-section"><h2>${title}</h2>
-    <div class="stats-table-wrap"><table class="an-table"><thead>${headers}</thead><tbody>${rows}</tbody></table></div>
+    <div class="stats-table-wrap"><table class="an-table stack"><thead>${headers}</thead><tbody>${rows}</tbody></table></div>
     ${footnote}
   </div>`;
 }
@@ -3129,7 +3253,6 @@ function renderHourOfDay(all) {
   const rangeSecs = rangeToSeconds(_statsRange);
   const subDay    = rangeSecs > 0 && rangeSecs < 86400;
   const nCells    = subDay ? 60 : 24;
-  const lastIdx   = nCells - 1;
   const meansFn   = subDay ? minuteOfHourMeans : hourOfDayMeans;
   const cellLabel = subDay
     ? (i, v) => `:${String(i).padStart(2, '0')} — avg ${v.toFixed(1)}°F`
@@ -3159,16 +3282,16 @@ function renderHourOfDay(all) {
     }).join('');
 
     return `<div class="hod-row">
-      <div class="hod-label" title="${esc(x.sensor.name)}"><span class="stats-dot" style="background:${color}"></span>${esc(x.sensor.name)}</div>
+      <div class="hod-label" title="${esc(x.sensor.name)}"><span class="stats-dot" style="background:${color}"></span><span class="hod-name">${esc(x.sensor.name)}</span></div>
       <div class="hod-cells" style="grid-template-columns: repeat(${nCells}, 1fr)">${cells}</div>
-      <div class="hod-range">${lo.toFixed(0)}–${hi.toFixed(0)}°F</div>
+      <div class="hod-range">${fmtSpan(lo, hi)}°F</div>
     </div>`;
   }).filter(Boolean).join('');
 
   if (!rows) return '';
 
   const xLabels = xLabelStops.map(h =>
-    `<div class="hod-tick" style="left:${(h / lastIdx) * 100}%">${xLabelText(h)}</div>`
+    `<div class="hod-tick" style="left:${((h + 0.5) / nCells) * 100}%">${xLabelText(h)}</div>`
   ).join('');
 
   const title    = subDay ? 'Minute-of-hour temperature pattern' : 'Hour-of-day temperature pattern';
@@ -3408,7 +3531,7 @@ function renderCalibration() {
   }).join('');
 
   return `<div class="an-section"><h2>Calibration drift</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr>
         <th>Pair</th>
         <th>Mean ΔT (7d)</th>
@@ -3464,7 +3587,7 @@ function renderBatteryHealth(all) {
   }).join('');
 
   return `<div class="an-section"><h2>Battery health</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr>
         <th>Sensor</th><th>Voltage</th><th>Trend</th><th>Status</th><th>Replace by</th><th>Fit</th>
       </tr></thead>
@@ -3670,7 +3793,7 @@ function renderLagLead(all) {
     : '';
 
   return `<div class="an-section"><h2>Lag &amp; lead (${_statsRange})</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr><th>Leader</th><th></th><th>Follower</th><th>Peak r</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
@@ -3785,7 +3908,7 @@ function renderMoldRisk(all) {
   }).join('');
 
   return `<div class="an-section"><h2>Mold &amp; condensation risk (${_statsRange})</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr><th>Sensor</th><th>Risk</th><th>Time ≥70% RH</th><th>Close to dew</th><th>Condensing</th><th>Longest humid run</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
@@ -3887,7 +4010,7 @@ function renderHVACActivity(all) {
   }).join('');
 
   return `<div class="an-section"><h2>HVAC activity · inferred from temperature (${_statsRange})</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr><th>Sensor</th><th>Cycles/day</th><th>Active time</th><th>Pattern</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
@@ -3935,42 +4058,6 @@ const HVAC_COLOR_HEAT = '#e69f00'; // amber
 const HVAC_COLOR_COOL = '#4db8ff'; // sky-blue
 const HVAC_COLOR_IDLE = '#3a3a3a'; // dim grey
 
-function _hvacRuntimeBar(heatPct, coolPct) {
-  const h = Math.max(0, Math.min(1, heatPct || 0));
-  const c = Math.max(0, Math.min(1, coolPct || 0));
-  const idle = Math.max(0, 1 - h - c);
-  return `<div class="hvac-bar" title="Heating ${_fmtPct(h)} · Cooling ${_fmtPct(c)} · Idle ${_fmtPct(idle)}">
-    <div class="hvac-bar-seg" style="width:${(h * 100).toFixed(1)}%;background:${HVAC_COLOR_HEAT}"></div>
-    <div class="hvac-bar-seg" style="width:${(c * 100).toFixed(1)}%;background:${HVAC_COLOR_COOL}"></div>
-    <div class="hvac-bar-seg" style="width:${(idle * 100).toFixed(1)}%;background:${HVAC_COLOR_IDLE}"></div>
-  </div>`;
-}
-
-function _hvacDailyBars(daily) {
-  if (!Array.isArray(daily) || !daily.length) return '';
-  const maxPct = daily.reduce((m, d) =>
-    Math.max(m, (d.heatingRuntimePct || 0) + (d.coolingRuntimePct || 0)), 0) || 1;
-  // Day labels: short weekday from the YYYY-MM-DD ISO date.
-  const cells = daily.map(d => {
-    const date  = new Date(d.date + 'T00:00:00Z');
-    const label = date.toLocaleDateString(undefined, { weekday: 'short' });
-    if (d.heatingRuntimePct == null && d.coolingRuntimePct == null) {
-      return `<div class="hvac-day"><div class="hvac-day-bar hvac-day-empty"></div><div class="hvac-day-label">${label}</div></div>`;
-    }
-    const h = (d.heatingRuntimePct || 0) / maxPct;
-    const c = (d.coolingRuntimePct || 0) / maxPct;
-    const total = (d.heatingRuntimePct || 0) + (d.coolingRuntimePct || 0);
-    return `<div class="hvac-day" title="${d.date} · Heating ${_fmtPct(d.heatingRuntimePct)} · Cooling ${_fmtPct(d.coolingRuntimePct)} · ${d.cycleCount} cycles">
-      <div class="hvac-day-bar">
-        <div class="hvac-day-seg" style="height:${(h * 100).toFixed(1)}%;background:${HVAC_COLOR_HEAT}"></div>
-        <div class="hvac-day-seg" style="height:${(c * 100).toFixed(1)}%;background:${HVAC_COLOR_COOL}"></div>
-      </div>
-      <div class="hvac-day-label">${label}<div class="hvac-day-pct">${_fmtPct(total)}</div></div>
-    </div>`;
-  }).join('');
-  return `<div class="hvac-days">${cells}</div>`;
-}
-
 function _hvacShortCycleList(shorts, shortCycleSecs) {
   if (!shorts?.length) return `<div class="hvac-short-empty">No short cycles detected (threshold: ${_fmtMinSec(shortCycleSecs)}).</div>`;
   // Worst-first by shortest duration; cap at 10 to keep the panel readable.
@@ -3985,7 +4072,7 @@ function _hvacShortCycleList(shorts, shortCycleSecs) {
       <td>${_fmtMinSec(c.durationSecs)}</td>
     </tr>`;
   }).join('');
-  return `<div class="stats-table-wrap"><table class="an-table">
+  return `<div class="stats-table-wrap"><table class="an-table stack">
     <thead><tr><th>Kind</th><th>Started</th><th>Duration</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
@@ -4058,7 +4145,7 @@ function _renderHvacZoneRow(zoneName, zone, direction, shortThresholdSecs) {
     </div>
     <div class="hvac-row">
       <div class="hvac-col">
-        <div class="hvac-col-title">Today (24 h)</div>
+        <div class="hvac-col-title">Last 24 h</div>
         ${_hvacRuntimeBarSingle(pct, color)}
         <div class="hvac-stat-row">
           <span><span style="color:${color}">${glyph}</span> ${verb} runtime <b>${_fmtPct(pct)}</b></span>
@@ -4169,7 +4256,7 @@ function renderRecords(all) {
   }).filter(Boolean).join('');
   if (!rows) return '';
   return `<div class="an-section"><h2>Records (${_statsRange})</h2>
-    <div class="stats-table-wrap"><table class="an-table">
+    <div class="stats-table-wrap"><table class="an-table stack">
       <thead><tr><th>Sensor</th><th>Hottest</th><th>Coldest</th><th>Wettest</th><th>Driest</th></tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
@@ -4287,7 +4374,7 @@ function _renderYoYCard(x) {
       ${curLine}
     </svg>
     <div class="stats-yoy-legend">
-      <span class="stats-yoy-legend-item"><svg viewBox="0 0 20 4" width="22" height="4" aria-hidden="true"><line x1="1" y1="2" x2="19" y2="2" stroke="${color}" stroke-width="2"/></svg> Now (${lo.toFixed(0)}–${hi.toFixed(0)}°F)</span>
+      <span class="stats-yoy-legend-item"><svg viewBox="0 0 20 4" width="22" height="4" aria-hidden="true"><line x1="1" y1="2" x2="19" y2="2" stroke="${color}" stroke-width="2"/></svg> Now (${fmtSpan(lo, hi)}°F)</span>
       <span class="stats-yoy-legend-item"><svg viewBox="0 0 20 4" width="22" height="4" aria-hidden="true"><line x1="1" y1="2" x2="19" y2="2" stroke="${color}" stroke-width="2" stroke-dasharray="5 3"/></svg> 1 yr ago</span>
     </div>
     ${emptyNote}
@@ -4356,7 +4443,7 @@ function renderStats() {
 // ── Fetch ──────────────────────────────────────────────────────────────────
 
 function updateLastUpdatedLabel() {
-  const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const t = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   document.getElementById('poll-status').textContent = 'Updated ' + t;
 }
 
@@ -4376,7 +4463,7 @@ async function autoRefreshTick() {
       if (!s) return;
       const temp = s.temperature  != null ? s.temperature.toFixed(1)  + '°F'   : '—';
       const hum  = s.humidity     != null ? Math.round(s.humidity)    + '%'    : '—';
-      const baro = s.baroPressure != null ? s.baroPressure.toFixed(1) + ' hPa' : null;
+      const baro = s.baroPressure != null ? s.baroPressure.toFixed(2) + ' inHg' : null;
       const vals = row.querySelector('.sensor-vals');
       if (vals) vals.textContent = temp + ' · ' + hum + (baro ? ' · ' + baro : '');
       const seen = row.querySelector('.sensor-seen');
@@ -4593,7 +4680,7 @@ async function refreshChart({ force = false } = {}) {
   if (needFetch.length === 0) return;
 
   const results = await Promise.all(needFetch.map(id =>
-    fetch(`${API_BASE}/${encodeURIComponent(id)}/history/all?range=${_range}`)
+    fetch(`${API_BASE}/${encodeURIComponent(id)}/history/all?range=${_range}&tz=${TZ_PARAM}`)
       .then(r => r.json()).catch(() => null)
   ));
 
@@ -4627,7 +4714,7 @@ function renderSidebar() {
       const color  = _colorMap[s.id] || '#888';
       const temp   = s.temperature  != null ? s.temperature.toFixed(1)  + '°F'  : '—';
       const hum    = s.humidity     != null ? Math.round(s.humidity)    + '%'   : '—';
-      const baro   = s.baroPressure != null ? s.baroPressure.toFixed(1) + ' hPa' : null;
+      const baro   = s.baroPressure != null ? s.baroPressure.toFixed(2) + ' inHg' : null;
       const hasBaro = s.baroPressure != null ||
         (_chartData[s.id]?.samples || []).some(x => x.baroPressure != null);
       const hasDerived = (_chartData[s.id]?.samples || []).some(x => x.dewpoint != null || x.vpd != null);
@@ -4665,7 +4752,7 @@ function renderSidebar() {
       const rssi = rssiBadge(s.rssi);
       const batt = batteryBadge(s.batteryVoltage);
       return `<div class="sensor-row${active ? ' active' : ''}" data-id="${esc(s.id)}" onclick="toggleSensor(this.dataset.id)">
-        <div class="sensor-color" style="background:${color}"></div>
+        <div class="sensor-color">${shapeIcon(sensorShape(s.id), color)}</div>
         <div class="sensor-meta">
           <div class="sensor-name" title="${esc(s.name)}">${esc(s.name)}</div>
           <div class="sensor-vals">${temp} · ${hum}${baro ? ' · ' + baro : ''}${rssi}${batt}</div>
@@ -4894,6 +4981,51 @@ document.getElementById('stats-range-btns').addEventListener('click', e => {
   setStatsRange(btn.dataset.range);
 });
 
+// table.stack becomes one card per row on a phone (CSS below 640 px); each
+// cell shows its column's name from data-label, copied here from the header.
+function labelStackTables(root = document) {
+  for (const t of root.querySelectorAll('table.stack')) {
+    const heads = [...(t.tHead?.rows[0]?.cells || [])].map(c => c.textContent.trim());
+    for (const body of t.tBodies) {
+      for (const row of body.rows) {
+        let col = 0;
+        for (const cell of row.cells) {
+          if (heads[col] && !cell.hasAttribute('data-label')) cell.setAttribute('data-label', heads[col]);
+          col += cell.colSpan || 1;
+        }
+      }
+    }
+  }
+}
+(() => {
+  let raf = 0;
+  const mo = new MutationObserver(() => {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => labelStackTables());
+  });
+  for (const id of ['view-stats', 'view-analytics', 'view-settings', 'view-realtime']) {
+    const el = document.getElementById(id);
+    if (el) mo.observe(el, { childList: true, subtree: true });
+  }
+  labelStackTables();
+})();
+
+// Redraw the Explorer at its new size after a rotate or a window resize.
+(() => {
+  const el = document.getElementById('chart-wrap');
+  if (!el || typeof ResizeObserver === 'undefined') return;
+  let raf = 0;
+  new ResizeObserver(() => {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => {
+      const r = el.getBoundingClientRect();
+      if (_currentView !== 'explorer' || r.width < 1 || r.height < 1) return;
+      if (Math.round(r.width) === W && Math.round(r.height) === H) return;
+      if (Object.keys(_chartData).length) renderChart();
+    });
+  }).observe(el);
+})();
+
 function resetZoom() {
   _zoomTs = null;
   document.getElementById('zoom-reset').style.display = 'none';
@@ -4927,16 +5059,24 @@ function applyCustomRange() {
   document.getElementById('custom-range-panel').style.display = 'none';
   document.querySelectorAll('#range-btns [data-range]').forEach(b => b.classList.remove('active'));
   document.getElementById('custom-range-btn').classList.add('active');
-  // Pick the smallest configured range that covers the span, or fall back
-  const spanSecs = (endMs - startMs) / 1000;
-  const covering = _settings.ranges
-    .map(r => ({ r, secs: rangeToSeconds(r) }))
-    .filter(x => x.secs >= spanSecs)
-    .sort((a, b) => a.secs - b.secs)[0];
-  _range  = covering ? covering.r : _settings.ranges[_settings.ranges.length - 1] || '365d';
+  _range  = customRangeFetch(_settings.ranges, startMs, Date.now());
   _zoomTs = { min: startMs, max: endMs };
   document.getElementById('zoom-reset').style.display = '';
   refreshChart();
+}
+
+// The configured range to fetch for a custom window starting at startMs. The
+// server's windows all end now, so the range must reach back to the start,
+// not merely be as long as the window: a 2-day window last January needs the
+// year range, and fetching 48 h showed "No data in selected zoom range".
+// The smallest range that reaches back wins (finest resolution); if none
+// does, the longest one, or 365d when none are configured.
+function customRangeFetch(ranges, startMs, nowMs) {
+  const backSecs = (nowMs - startMs) / 1000;
+  const sized = (ranges || []).map(r => ({ r, secs: rangeToSeconds(r) })).filter(x => x.secs > 0);
+  const reach = sized.filter(x => x.secs >= backSecs).sort((a, b) => a.secs - b.secs)[0];
+  if (reach) return reach.r;
+  return sized.sort((a, b) => b.secs - a.secs)[0]?.r || '365d';
 }
 
 // Client-side mirror of server's rangeToSeconds for applyCustomRange
@@ -5055,11 +5195,11 @@ async function loadNotificationLog() {
     return `<tr>
       <td style="white-space:nowrap">${esc(new Date(e.ts * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}</td>
       <td style="white-space:nowrap">${fired ? '▲ Fired' : '✓ Recovered'}</td>
-      <td><b>${esc(e.title || e.key)}</b>${e.message ? `<div class="rt-dim">${esc(e.message)}</div>` : ''}</td>
+      <td class="stack-wide"><b>${esc(e.title || e.key)}</b>${e.message ? `<div class="rt-dim">${esc(e.message)}</div>` : ''}</td>
       <td>${sinks}</td>
     </tr>`;
   }).join('');
-  el.innerHTML = `<div class="stats-table-wrap"><table class="an-table">
+  el.innerHTML = `<div class="stats-table-wrap"><table class="an-table stack">
     <thead><tr><th>When</th><th></th><th>Alert</th><th>Delivered</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
@@ -5748,7 +5888,7 @@ async function renderBackupsSection() {
       return;
     }
     el.innerHTML = `
-      <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <table class="stack" style="width:100%;border-collapse:collapse;font-size:12px">
         <thead>
           <tr style="text-align:left;color:var(--text3)">
             <th style="padding:6px 8px;border-bottom:1px solid var(--border)">Filename</th>
@@ -6022,9 +6162,98 @@ function sensorGroupFilters(sensors, classify, groups) {
 
 // ── Chart rendering ────────────────────────────────────────────────────────
 
+// Show the chart tooltip beside the pointer, flipped to its other side and
+// clamped so all of it stays inside the chart (it used to run off the left
+// edge of a phone, past a fixed 280 px guess at its width).
+function placeTooltip(tooltip, wrapEl, clientX, clientY) {
+  tooltip.style.display = 'block';
+  const wr = wrapEl.getBoundingClientRect();
+  const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+  const x = clientX - wr.left, y = clientY - wr.top;
+  let left = x + 14;
+  if (left + tw > wr.width - 4) left = x - tw - 14;
+  left = Math.max(4, Math.min(left, wr.width - tw - 4));
+  let top = y - 28;
+  top = Math.max(4, Math.min(top, wr.height - th - 4));
+  tooltip.style.left = left + 'px';
+  tooltip.style.top  = top + 'px';
+}
+
+// Smallest step from `steps` that puts at most `maxTicks` gridlines across
+// `span` (the largest step if none does).
+function axisStep(span, maxTicks, steps) {
+  return steps.find(s => span / s <= maxTicks) ?? steps[steps.length - 1];
+}
+
+// Decimals a step's labels need: 0.25 → 2, 0.5 → 1, 2 → 0.
+function axisDecimals(step) {
+  return (String(step).split('.')[1] || '').length;
+}
+
+// Time-axis ticks between xMin and xMax (ms), at most `maxTicks`, on round
+// steps of the browser's local clock: minutes, hours, days, then months.
+// Returns [{ t, label, major }]: a tick at local midnight (or a month start)
+// is major and carries the date; the others carry the time. Labels never
+// repeat, so a phone can't get "9:58 PM 9:58 PM".
+function timeAxisTicks(xMin, xMax, maxTicks) {
+  const MIN = 60e3, HR = 3600e3, DAY = 86400e3;
+  const span = xMax - xMin;
+  if (!(span > 0) || maxTicks < 1) return [];
+  const steps = [MIN, 2*MIN, 5*MIN, 10*MIN, 15*MIN, 30*MIN, HR, 2*HR, 3*HR, 6*HR, 12*HR, DAY, 2*DAY, 7*DAY, 14*DAY];
+  const step = steps.find(s => span / s <= maxTicks);
+  const dateLabel = d => d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  const ticks = [];
+  const push = (d, label, major) => {
+    const t = d.getTime();
+    if (t < xMin || t > xMax) return;
+    if (ticks.length && ticks[ticks.length - 1].label === label) return;
+    ticks.push({ t, label, major });
+  };
+  if (step && step < DAY) {
+    const stepMin = step / MIN;
+    const d = new Date(xMin);
+    d.setSeconds(0, 0);
+    d.setHours(0, Math.ceil((d.getHours() * 60 + d.getMinutes()) / stepMin) * stepMin, 0, 0);
+    for (let guard = 0; d.getTime() <= xMax && guard < 1000; guard++) {
+      const midnight = d.getHours() === 0 && d.getMinutes() === 0;
+      push(new Date(d), midnight ? dateLabel(d)
+        : d.toLocaleTimeString([], { hour: 'numeric', minute: step < HR ? '2-digit' : undefined }), midnight);
+      // Step on the wall clock, re-aligned each time so a DST change can't
+      // leave the ticks off the round hour.
+      const next = d.getHours() * 60 + d.getMinutes() + stepMin;
+      d.setHours(0, next, 0, 0);
+    }
+  } else if (step) {
+    const days = step / DAY;
+    const d = new Date(xMin);
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() < xMin) d.setDate(d.getDate() + 1);
+    for (let guard = 0; d.getTime() <= xMax && guard < 1000; guard++) {
+      push(new Date(d), dateLabel(d), true);
+      d.setDate(d.getDate() + days);
+    }
+  } else {
+    const months = [1, 2, 3, 6, 12].find(m => span / (m * 30.44 * DAY) <= maxTicks) ?? 12;
+    const s = new Date(xMin);
+    const d = new Date(s.getFullYear(), Math.ceil((s.getMonth() + (s.getDate() > 1 || s.getHours() > 0 ? 1 : 0)) / months) * months, 1);
+    for (let guard = 0; d.getTime() <= xMax && guard < 1000; guard++) {
+      push(new Date(d), d.getMonth() === 0 ? String(d.getFullYear()) : d.toLocaleDateString([], { month: 'short' }), true);
+      d.setMonth(d.getMonth() + months);
+    }
+  }
+  return ticks;
+}
+
 function renderChart() {
   const entries = Object.entries(_chartData).filter(([, d]) => d.samples.length > 0);
   const wrap    = document.getElementById('chart-svg-wrap');
+
+  // Draw at the chart's real pixel size (the ResizeObserver below redraws on
+  // a rotate or a window resize). A hidden chart keeps the last size.
+  const box = document.getElementById('chart-wrap').getBoundingClientRect();
+  if (box.width >= 1 && box.height >= 1) { W = Math.round(box.width); H = Math.round(box.height); }
+  PL = W < 520 ? 40 : 52;
+  PR = W < 520 ? 44 : 58;
 
   if (!entries.length) {
     wrap.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text3)">No data for selected range</div>`;
@@ -6223,44 +6452,26 @@ function renderChart() {
   let gridSvg = '', labelSvg = '';
   const chartBottom = panelTops[panelTops.length - 1] + panelHeights[panelHeights.length - 1];
 
-  function addGrid(fn, step, fmt, side) {
+  // Gridlines at a round step chosen from the panel's height in pixels, so a
+  // short panel on a phone gets fewer labels instead of overlapping ones.
+  function addGrid(fn, ht, steps, unit, side) {
     const { min, max } = fn.sc;
-    for (let v = Math.ceil(min / step) * step; v <= max; v += step) {
+    const step = axisStep(max - min, Math.max(2, Math.floor(ht / 20)), steps);
+    const dec = axisDecimals(step);
+    for (let i = Math.ceil(min / step); i * step <= max; i++) {
+      const v = i * step;
       const y = fn(v).toFixed(1);
-      gridSvg += `<line x1="${PL}" y1="${y}" x2="${PL+cW}" y2="${y}" stroke="#222" stroke-width="1"/>`;
-      if (side === 'left')
-        labelSvg += `<text x="${PL-5}" y="${(+y+4).toFixed(1)}" text-anchor="end" font-size="10" fill="#555">${fmt(v)}</text>`;
-      else
-        labelSvg += `<text x="${PL+cW+5}" y="${(+y+4).toFixed(1)}" text-anchor="start" font-size="10" fill="#555">${fmt(v)}</text>`;
+      gridSvg += `<line x1="${PL}" y1="${y}" x2="${PL+cW}" y2="${y}" stroke="#262626" stroke-width="1"/>`;
+      const x = side === 'left' ? PL - 5 : PL + cW + 5;
+      labelSvg += `<text x="${x}" y="${(+y+4).toFixed(1)}" text-anchor="${side === 'left' ? 'end' : 'start'}" font-size="10" fill="#8a8a8a">${v.toFixed(dec)}${unit}</text>`;
     }
   }
 
-  if (yTFn) {
-    const span = yTFn.sc.max - yTFn.sc.min;
-    const step = span <= 8 ? 1 : span <= 25 ? 2 : 5;
-    addGrid(yTFn, step, v => v + '°', 'left');
-  }
-  if (yHFn) {
-    const span = yHFn.sc.max - yHFn.sc.min;
-    addGrid(yHFn, span <= 20 ? 5 : 10, v => Math.round(v) + '%', 'right');
-  }
-  if (yAFn) {
-    const span = yAFn.sc.max - yAFn.sc.min;
-    const step = ahU === 'gm3'
-      ? (span <= 2 ? 0.25 : span <= 5 ? 0.5 : span <= 12 ? 1 : 2)
-      : (span <= 12 ? 2 : span <= 30 ? 5 : span <= 60 ? 10 : 20);
-    addGrid(yAFn, step, v => step < 1 ? v.toFixed(step < 0.5 ? 2 : 1) : String(Math.round(v)), 'right');
-  }
-  if (yBFn) {
-    const span = yBFn.sc.max - yBFn.sc.min;
-    const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
-    addGrid(yBFn, step, v => v.toFixed(2), 'right');
-  }
-  if (yVFn) {
-    const span = yVFn.sc.max - yVFn.sc.min;
-    const step = span <= 0.5 ? 0.1 : span <= 2 ? 0.25 : 0.5;
-    addGrid(yVFn, step, v => v.toFixed(2), 'right');
-  }
+  if (yTFn) addGrid(yTFn, panelHeight('temp'), [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50], '°', 'left');
+  if (yHFn) addGrid(yHFn, panelHeight('hum'),  [1, 2, 5, 10, 20, 25, 50], '%', 'right');
+  if (yAFn) addGrid(yAFn, panelHeight('ah'),   [0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 20, 50], '', 'right');
+  if (yBFn) addGrid(yBFn, panelHeight('baro'), [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1], '', 'right');
+  if (yVFn) addGrid(yVFn, panelHeight('vpd'),  [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2], '', 'right');
 
   // Panel borders and labels
   let axesSvg = '';
@@ -6272,36 +6483,21 @@ function renderChart() {
     axesSvg +=
       `<line x1="${PL}" y1="${top}" x2="${PL}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
       `<line x1="${PL}" y1="${top+ht}" x2="${PL+cW}" y2="${top+ht}" stroke="#333" stroke-width="1"/>` +
-      `<text x="${PL+4}" y="${top+11}" font-size="9" fill="#444" font-weight="600" letter-spacing=".05em">${label}</text>`;
+      `<text x="${PL+4}" y="${top+11}" font-size="9" fill="#7a7a7a" font-weight="600" letter-spacing=".05em">${label}</text>`;
     if (i > 0) {
       // dashed separator above each panel except first
       axesSvg += `<line x1="${PL}" y1="${top-VGAP/2}" x2="${PL+cW}" y2="${top-VGAP/2}" stroke="#222" stroke-width="0.5" stroke-dasharray="2,6"/>`;
     }
   });
 
-  // X-axis labels & day lines
-  const isLong = (xMax - xMin) > 2 * 86400 * 1000;
+  // X-axis ticks: round local-clock steps at least ~64 px apart, each with
+  // a faint gridline. Dates mark local midnights; long ranges tick months.
   let xLabels = '';
   const xLabelY = H - PB + 14;
-  if (isLong) {
-    const dayMs = 86400 * 1000;
-    const d0 = new Date(xMin);
-    const midnight0 = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() + 1).getTime();
-    const bounds = [];
-    for (let dt = midnight0; dt <= xMax; dt += dayMs) bounds.push(dt);
-    const everyN = Math.max(1, Math.ceil(bounds.length / 8));
-    bounds.forEach((dt, i) => {
-      const lx = xp(dt).toFixed(1);
-      gridSvg += `<line x1="${lx}" y1="${PT}" x2="${lx}" y2="${chartBottom}" stroke="#1e1e1e" stroke-width="1" stroke-dasharray="2,6"/>`;
-      if (i % everyN === 0)
-        xLabels += `<text x="${lx}" y="${xLabelY}" text-anchor="middle" font-size="10" fill="#555">${new Date(dt).toLocaleDateString([],{month:'short',day:'numeric'})}</text>`;
-    });
-  } else {
-    const nT = Math.min(7, Math.floor(cW / 100));
-    for (let i = 0; i <= nT; i++) {
-      const tt = xMin + i / nT * (xMax - xMin);
-      xLabels += `<text x="${xp(tt).toFixed(1)}" y="${xLabelY}" text-anchor="middle" font-size="10" fill="#555">${new Date(tt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</text>`;
-    }
+  for (const tk of timeAxisTicks(xMin, xMax, Math.max(2, Math.floor(cW / 64)))) {
+    const lx = xp(tk.t).toFixed(1);
+    gridSvg += `<line x1="${lx}" y1="${PT}" x2="${lx}" y2="${chartBottom}" stroke="${tk.major ? '#2c2c2c' : '#202020'}" stroke-width="1" stroke-dasharray="2,6"/>`;
+    xLabels += `<text x="${lx}" y="${xLabelY}" text-anchor="middle" font-size="10" fill="${tk.major ? '#a0a0a0' : '#8a8a8a'}">${esc(tk.label)}</text>`;
   }
 
   // ── Threshold zones + lines (drawn behind data) ──
@@ -6351,7 +6547,7 @@ function renderChart() {
   }
 
   // ── Data paths ──
-  let dataSvg = '';
+  let dataSvg = '', endMarks = '';
   const clickTargets = []; // { id, ts, cx, panelCys: {temp,hum,baro}, excluded, resolution }
 
   for (const [id, { color, samples, resolution }] of entries) {
@@ -6412,6 +6608,21 @@ function renderChart() {
       if (vp) dataSvg += `<path d="${vp}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity=".7"/>`;
     }
 
+    // The sensor's shape at the end of each of its main lines.
+    const shape = sensorShape(id);
+    const endMark = (yFn, val) => {
+      if (!yFn) return;
+      for (let i = incl.length - 1; i >= 0; i--) {
+        const v = val(incl[i]);
+        if (v != null) { endMarks += shapeSvg(shape, xp(incl[i].ts * 1000), yFn(v), 4, color); return; }
+      }
+    };
+    if (showTemp && ser.has('temp'))           endMark(yTFn, s => s.temperature);
+    if (showHum && ser.has('humidity'))        endMark(yHFn, s => s.humidity);
+    if (showAH && ser.has('absHumidity'))      endMark(yAFn, s => ahOf(s));
+    if (showBaro && ser.has('pressure'))       endMark(yBFn, s => s.baroPressure);
+    if (showVPD && ser.has('vpd'))             endMark(yVFn, s => s.vpd);
+
     // Excluded markers (✕) — always visible so you can see what was excluded
     for (const s of exclPts) {
       const cx = xp(s.ts*1000).toFixed(1);
@@ -6455,7 +6666,9 @@ function renderChart() {
     const cxStr = cx.toFixed(1);
     eventSvg +=
       `<line x1="${cxStr}" y1="${PT}" x2="${cxStr}" y2="${chartBottom}" stroke="#f0b942" stroke-width="1" stroke-dasharray="2,3" opacity=".55" class="ev-marker-line"/>` +
-      `<polygon points="${cxStr},${PT - 2} ${(+cxStr - 6).toFixed(1)},${PT - 12} ${(+cxStr + 6).toFixed(1)},${PT - 12}" fill="#f0b942" class="ev-marker-hit" data-evid="${ev.id}"/>`;
+      `<polygon points="${cxStr},${PT - 2} ${(+cxStr - 6).toFixed(1)},${PT - 12} ${(+cxStr + 6).toFixed(1)},${PT - 12}" fill="#f0b942" class="ev-marker-hit" data-evid="${ev.id}"/>` +
+      // A finger-sized, invisible target over the 12 px triangle.
+      `<rect x="${(+cxStr - 14).toFixed(1)}" y="0" width="28" height="${PT + 6}" fill="transparent" class="ev-marker-hit" data-evid="${ev.id}"/>`;
     eventHits.push({ id: ev.id, cx, top: PT });
   }
 
@@ -6497,43 +6710,33 @@ function renderChart() {
 
   const chartCursor = _editMode ? 'crosshair' : 'crosshair';
 
-  wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" id="chart">
-    ${gridSvg}${axesSvg}${labelSvg}${xLabels}${thresholdSvg}${dataSvg}${eventSvg}${hitSvg}
+  wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" id="chart">
+    ${gridSvg}${axesSvg}${labelSvg}${xLabels}${thresholdSvg}${dataSvg}${endMarks}${eventSvg}${hitSvg}
   </svg>`;
 
   // ── Legend ──
-  const legItems = [];
-  entries.forEach(([id, { name, color, samples }]) => {
-    const ser = _series[id] || new Set(['temp','humidity','pressure']);
-    const hasBaro = (samples || []).some(s => s.baroPressure != null);
-    const hasDP   = (samples || []).some(s => s.dewpoint != null);
-    const hasV    = (samples || []).some(s => s.vpd != null);
-    if (showTemp && ser.has('temp'))
-      legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${color}"></div>${esc(name)} temp</div>`);
-    if (showHum && ser.has('humidity'))
-      legItems.push(`<div class="leg-item" style="color:${color};opacity:.65"><div class="leg-dash"></div>${esc(name)} humidity</div>`);
-    if (showBaro && ser.has('pressure') && hasBaro)
-      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} pressure</div>`);
-    if (showDew && ser.has('dewpoint') && hasDP)
-      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${color}"></div>${esc(name)} dewpoint</div>`);
-    if (showHI && ser.has('heatindex') && (samples || []).some(s => s.temperature != null && s.humidity != null))
-      legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} heat idx</div>`);
-    if (showAH && ser.has('absHumidity'))
-      legItems.push(`<div class="leg-item" style="color:${color};opacity:.85"><div class="leg-dash leg-dashdot"></div>${esc(name)} abs. humidity</div>`);
-    if (showVPD && ser.has('vpd') && hasV)
-      legItems.push(`<div class="leg-item" style="opacity:.7"><div class="leg-dot" style="background:${color}"></div>${esc(name)} VPD</div>`);
-  });
-  if (outdoorOn && outdoorInView.length >= 2) {
-    if (showTempPanel)
-      legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor temp</div>`);
-    if (showHum)
-      legItems.push(`<div class="leg-item" style="opacity:.75"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor humidity</div>`);
-    if (showDew && showTempPanel)
-      legItems.push(`<div class="leg-item" style="opacity:.55"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor dewpoint</div>`);
-    if (showAH)
-      legItems.push(`<div class="leg-item" style="opacity:.85"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor abs. humidity</div>`);
-  }
-  document.getElementById('legend').innerHTML = legItems.join('');
+  // One entry per sensor (its colour and name) plus a key to the line styles
+  // in use, instead of an entry per sensor per series: twelve sensors with
+  // three series filled half a phone screen.
+  const styleKey = [];
+  const keyLine = (dash, w = 2, op = 1) =>
+    `<svg width="24" height="8" aria-hidden="true"><line x1="1" y1="4" x2="23" y2="4" stroke="currentColor" stroke-width="${w}" opacity="${op}"${dash ? ` stroke-dasharray="${dash}"` : ''}/></svg>`;
+  const anyOn = (ser, extra = () => true) => entries.some(([id, { samples }]) =>
+    (_series[id] || new Set(['temp','humidity','pressure'])).has(ser) && extra(samples || []));
+  if (showTemp && anyOn('temp'))           styleKey.push(`${keyLine('')} temperature`);
+  if (showDew && anyOn('dewpoint'))        styleKey.push(`${keyLine('3,3', 1.5)} dew point`);
+  if (showHI && anyOn('heatindex'))        styleKey.push(`${keyLine('1,3', 1.5)} heat index`);
+  if (showHum && anyOn('humidity'))        styleKey.push(`${keyLine('5,3', 1.5, .65)} humidity`);
+  if (showAH && anyOn('absHumidity'))      styleKey.push(`${keyLine('8,3,2,3', 1.75)} abs. humidity`);
+  if (showBaro && anyOn('pressure', s => s.some(x => x.baroPressure != null))) styleKey.push(`${keyLine('', 1.5, .55)} pressure`);
+  if (showVPD && anyOn('vpd'))             styleKey.push(`${keyLine('', 1.5, .7)} VPD`);
+  const legItems = entries.map(([id, { name, color }]) =>
+    `<div class="leg-item">${shapeIcon(sensorShape(id), color)}${esc(name)}</div>`);
+  if (outdoorOn && outdoorInView.length >= 2)
+    legItems.push(`<div class="leg-item"><div class="leg-dot" style="background:${OUTDOOR_COLOR}"></div>Outdoor</div>`);
+  document.getElementById('legend').innerHTML =
+    (styleKey.length > 1 ? `<div class="leg-key">${styleKey.map(k => `<span class="leg-item">${k}</span>`).join('')}</div>` : '') +
+    legItems.join('');
 
   // ── Mouse interaction ──
   const svgEl   = wrap.querySelector('#chart');
@@ -6562,6 +6765,7 @@ function renderChart() {
   function showTooltip(svgX, clientX, clientY) {
     const hoverMs = xMin + (svgX - PL) / cW * (xMax - xMin);
     const rows = [];
+    let headTs = null, headRes = 'raw';  // the sample nearest the pointer
 
     for (const [id, { name, color, samples }] of entries) {
       const ser = _series[id] || new Set(['temp','humidity','pressure']);
@@ -6569,6 +6773,9 @@ function renderChart() {
       if (!pts.length) continue;
       const near = pts.reduce((a, b) =>
         Math.abs(b.ts * 1000 - hoverMs) < Math.abs(a.ts * 1000 - hoverMs) ? b : a);
+      if (headTs == null || Math.abs(near.ts * 1000 - hoverMs) < Math.abs(headTs - hoverMs)) {
+        headTs = near.ts * 1000; headRes = _chartData[id]?.resolution || 'raw';
+      }
       const temp = near.temperature  != null ? near.temperature.toFixed(1) + '°F' : null;
       const hum  = near.humidity     != null ? Math.round(near.humidity)   + '%'  : null;
       const baro = near.baroPressure != null ? near.baroPressure.toFixed(2) + '"' : null;
@@ -6591,7 +6798,7 @@ function renderChart() {
       rows.push({
         sortVal: tooltipSortValue(near, sortPanel, ser, ahU),
         html: `<div class="tt-row">
-        <div class="tt-dot" style="background:${color}"></div>
+        ${shapeIcon(sensorShape(id), color, 9)}
         <span class="tt-name">${esc(name)}${exTag}</span>
         <span class="tt-vals">${vals}</span>
       </div>`,
@@ -6619,17 +6826,9 @@ function renderChart() {
       });
     }
 
-    tooltip.innerHTML = `<div class="tt-time">${fmtTs(hoverMs)}</div>` +
+    tooltip.innerHTML = `<div class="tt-time">${esc(tooltipHeading(headTs ?? hoverMs, headTs == null ? 'raw' : headRes))}</div>` +
       sortTooltipRows(rows).map(r => r.html).join('');
-    tooltip.style.display = 'block';
-    const wr = wrapEl.getBoundingClientRect();
-    let left = clientX - wr.left + 14;
-    let top  = clientY - wr.top  - 28;
-    if (left + 270 > wr.width)  left = clientX - wr.left - 280;
-    if (top  < 0)               top  = 4;
-    if (top + 160 > wr.height)  top  = wr.height - 164;
-    tooltip.style.left = left + 'px';
-    tooltip.style.top  = top  + 'px';
+    placeTooltip(tooltip, wrapEl, clientX, clientY);
   }
 
   hitEl.addEventListener('mousemove', e => {
@@ -6728,7 +6927,6 @@ function renderChart() {
     const id = parseInt(ev.dataset.evid, 10);
     const found = _events.find(x => x.id === id);
     if (!found) return;
-    const wr  = wrapEl.getBoundingClientRect();
     const rect = ev.getBoundingClientRect();
     const scopeName = found.sensorId
       ? (_sensors[found.sensorId]?.name || found.sensorId)
@@ -6737,9 +6935,7 @@ function renderChart() {
       <div class="tt-time">${esc(scopeName)} · ${fmtTs(found.ts * 1000)}</div>
       <div class="tt-row"><span class="tt-name">${esc(found.label)}</span></div>
       ${found.note ? `<div class="tt-row" style="white-space:pre-wrap"><span class="tt-name">${esc(found.note)}</span></div>` : ''}`;
-    tooltip.style.display = 'block';
-    tooltip.style.left = (rect.left - wr.left + 14) + 'px';
-    tooltip.style.top  = Math.max(0, rect.top  - wr.top  - 6) + 'px';
+    placeTooltip(tooltip, wrapEl, rect.left + rect.width / 2, rect.top + 20);
   });
   svgEl.addEventListener('mouseout', e => {
     if (e.target.closest('.ev-marker-hit')) tooltip.style.display = 'none';
@@ -6826,6 +7022,18 @@ async function excludeToggle(sensorId, ts, excluded, resolution) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+// The tooltip's heading: the time of the sample shown, at its resolution. A
+// daily point is that day's mean and an hourly point its hour's, so naming
+// the minute under the pointer ("Sep 7, 01:27 PM") misread them.
+function tooltipHeading(ms, resolution) {
+  const d = new Date(ms);
+  if (resolution === 'daily')
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) + ' · day avg';
+  if (resolution === 'hourly')
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric' }) + ' · hour avg';
+  return fmtTs(ms);
+}
 
 function fmtTs(ms) {
   return new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });

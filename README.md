@@ -173,7 +173,7 @@ To rotate a UI-managed token: Settings → Security → **Rotate token**. Existi
 | GET | `/` | sensors list (JSON) or Explorer UI (HTML); JSON response includes `oldestReadingTs` so the Stats YoY toggle knows whether ≥1y of data exists |
 | GET | `/gateways` | per-gateway status; optional `?range=Xd` adds uptime % + primary-sensor count |
 | GET | `/battery` | per-sensor battery voltage trend + projected days-until-replacement |
-| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `2h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg); optional `endTs` anchors the window for the YoY overlay. Each sample has `humidityRatio` (gr/lb) and `absHumidity` (g/m³) since 1.4.0 |
+| GET | `/:id/history?range=24h` | time series; ranges: `1h`, `2h`, `24h`, `7d`, `30d`, `90d`, `1yr` (h=raw, d=hourly avg, yr=daily avg); optional `endTs` anchors the window for the YoY overlay; optional `tz` (an IANA zone such as `America/New_York`) makes `yr` group by that zone's calendar days instead of UTC days (1.5.1). Each sample has `humidityRatio` (gr/lb) and `absHumidity` (g/m³) since 1.4.0 |
 | GET | `/:id/history/all?range=7d` | includes excluded points (data QA) |
 | GET | `/:id/history.csv?range=7d` | same data as `/history`, CSV with attachment disposition; `humidity_ratio_gr_lb` and `abs_humidity_g_m3` are the last two columns (1.4.0) |
 | GET | `/:id/gaps?range=7d` | missing windows + sparse hours + coverage %; each gap annotated with `gatewayOnline: true \| false \| null` |
